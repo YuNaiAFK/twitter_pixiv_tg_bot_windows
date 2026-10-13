@@ -1071,31 +1071,39 @@ git ls-files | findstr /I /R "^\.env$ cookies authorized parse_cache restart\.lo
 `.env.example`, which is a placeholder template and *should* be published. A check that
 cries wolf on a safe file is one people learn to ignore, which defeats it.
 
-#### The dead proxy, and why pushes fail with a connection error
+#### Why pushes fail, and the proxy that fixes them
 The global git config points at `http://127.0.0.1:10808`, a proxy that is **not
-running**, so git could not reach GitHub at all:
+running**:
 
 ```
 fatal: unable to access 'https://github.com/...': Failed to connect to github.com
 port 443 via 127.0.0.1 after 2058 ms: Could not connect to server
 ```
 
-Measured on this machine: direct connections work, `127.0.0.1:7897` works, and
-`:10808` and `:8080` do not. This repository therefore carries a **local** override
-that clears the proxy, so `git push` works without extra flags:
+Clearing it was the first fix, and it worked while GitHub was reachable directly. It is
+**not enough on this network**: GitHub is filtered too, and clearing the proxy simply
+moved the failure to `Failed to connect to github.com port 443` and
+`Recv failure: Connection was reset`.
+
+The host runs a **SOCKS5** proxy on `127.0.0.1:7897` (verified by its reply to a SOCKS5
+greeting, not assumed), so this repository points git at it:
 
 ```sh
-git config --local http.proxy ""
-git config --local https.proxy ""
+git config --local http.proxy "socks5h://127.0.0.1:7897"
+git config --local https.proxy "socks5h://127.0.0.1:7897"
 ```
 
-The global setting is deliberately left alone — other tools may depend on it. If git
-fails in a **different** repository with the same connection error, this is the cause:
+The `h` in `socks5h` is deliberate: it makes **DNS resolve through the proxy**, which is
+what a filtered network needs — `socks5://` would resolve locally and can then connect
+to an address that is blocked anyway.
 
-```sh
-git config --global --unset http.proxy
-git config --global --unset https.proxy
-```
+Both settings are **local to this repository**; the global one is deliberately left
+alone because other tools may depend on it. If git fails in a *different* repository
+with the same connection error, apply the same two lines there.
+
+Note that this proxy is SOCKS5, not HTTP. Setting an `http://` URL here produces
+`Get "http://...": server gave HTTP response to HTTPS client` or a bare
+`400 Bad Request`, which is a confusing way to discover the mismatch.
 
 ## Command-line helpers
 | Command | Purpose |
