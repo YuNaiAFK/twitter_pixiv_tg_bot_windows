@@ -2783,13 +2783,15 @@ async def edit_message_to_cover(status, gallery, caption: str,
 async def send_single_media(message, file_path: Path, source_url: str,
                             temp_dir: Path, extra: str = "",
                             prefer_original: bool = False,
-                            keyboard=None) -> bool:
+                            keyboard=None, caption=None) -> bool:
     """
     Send one media file. Returns success.
 
-    The source link is **not** a caption here. It travels as a url button when
-    ``keyboard`` is given, which keeps the link below the image without the extra
-    message a separate text link would cost.
+    ``caption`` carries the source link, which is what puts it **above** the image: a
+    single-photo caption is rendered above its media by Telegram. A url button is
+    attached alongside when ``keyboard`` is given, so the link stays reachable however
+    a client renders the caption. An earlier version used the button alone, which put
+    the link below the image.
 
     With ``prefer_original`` an image is sent as a document, which is the only
     way Telegram passes the file through untouched. ``reply_photo`` re-encodes
@@ -2814,13 +2816,16 @@ async def send_single_media(message, file_path: Path, source_url: str,
 
     suffix = file_path.suffix.lower()
     note = f"（{extra}）" if extra else None
+    # The source link wins over a per-file note when both are present: the link is what
+    # the caller asked to show, and the note is only a compression remark.
+    text = caption or note
 
     if suffix in VIDEO_EXTENSIONS:
         with file_path.open("rb") as media:
             await message.reply_video(
                 video=media,
                 filename=file_path.name,
-                caption=note,
+                caption=text,
                 supports_streaming=True,
                 reply_markup=keyboard,
             )
@@ -2831,7 +2836,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
             await message.reply_animation(
                 animation=media,
                 filename=file_path.name,
-                caption=note,
+                caption=text,
                 reply_markup=keyboard,
             )
         return True
@@ -2841,7 +2846,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
             # Sent as a document on purpose: the bytes reach Telegram unchanged.
             with file_path.open("rb") as media:
                 await message.reply_document(
-                    document=media, filename=file_path.name, caption=note,
+                    document=media, filename=file_path.name, caption=text,
                     reply_markup=keyboard,
                 )
             return True
@@ -2849,7 +2854,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
         if size <= PHOTO_LIMIT_BYTES:
             with file_path.open("rb") as media:
                 await message.reply_photo(
-                    photo=media, filename=file_path.name, caption=note,
+                    photo=media, filename=file_path.name, caption=text,
                     reply_markup=keyboard,
                 )
             return True
@@ -2857,40 +2862,56 @@ async def send_single_media(message, file_path: Path, source_url: str,
         # Too large for sendPhoto: try a downscaled copy, else send a document.
         smaller = await asyncio.to_thread(downscale_photo, file_path, temp_dir)
         if smaller is not None:
+            compress_note = "（原圖超過 10MB，已壓縮傳送）"
             with smaller.open("rb") as media:
                 await message.reply_photo(
                     photo=media,
                     filename=smaller.name,
-                    caption="（原圖超過 10MB，已壓縮傳送）",
+                    # The link still leads when the image had to be shrunk, so the
+                    # compression remark is appended rather than replacing it.
+                    caption=(f"{text}\n{compress_note}" if text else compress_note),
                     reply_markup=keyboard,
                 )
             return True
 
         with file_path.open("rb") as media:
             await message.reply_document(
-                document=media, filename=file_path.name, caption=note,
+                document=media, filename=file_path.name, caption=text,
                 reply_markup=keyboard,
             )
         return True
 
     with file_path.open("rb") as media:
         await message.reply_document(
-            document=media, filename=file_path.name, caption=note,
+            document=media, filename=file_path.name, caption=text,
             reply_markup=keyboard,
         )
     return True
 
 
 async def send_media_album(message, files: list[Path], source_url: str,
-                           as_document: bool = False, keyboard=None) -> bool:
+                           as_document: bool = False, keyboard=None,
+                           with_caption: bool = True) -> bool:
     """
-    Send 2..ALBUM_LIMIT files as one album. Raises TelegramError so the caller can
+    Send 2..ALBUM_LIMIT files as one album, with the source link as the **first**
+    item's caption so it reads above the images. Raises TelegramError so the caller can
     fall back to individual sends.
 
-    **No caption is attached.** An album's caption is placed against its media, which
-    put the source link in the middle of the chat with more pages below it - the
-    layout being fixed. The caller posts the source link as its own message *after*
-    the files instead, so it lands at the bottom.
+    Requested explicitly, after the alternatives were tried and rejected:
+
+    * A caption on the first item puts the link at the **top**. That is what a plain
+      text caption on a single photo does, so it matches the obvious expectation.
+    * A separate message for the link is guaranteed to be above the album, but costs a
+      second message - which was the earlier complaint.
+    * A url button on the album sits below the images and stays in one message. That is
+      the previous behaviour, and it is what this replaces.
+
+    **The position is Telegram's to decide, not ours.** An album caption is drawn by the
+    client against the media, which is why an earlier attempt at a caption landed the
+    link in the middle of the set when it was attached to a later item. Anchoring it to
+    the first item is the best that can be done from here; the button is still attached
+    as well, so the link remains reachable even if a client renders the caption
+    somewhere unexpected.
 
     ``as_document`` keeps an image byte-identical to the downloaded original. The
     filenames inside an album are not preserved by Telegram, which is a trade for
@@ -2907,34 +2928,35 @@ async def send_media_album(message, files: list[Path], source_url: str,
     page. The streams are closed in a ``finally``, so a failure part-way through does
     not leak handles on the files the caller is about to delete.
     """
+    caption = build_caption(source_url) if with_caption else None
     handles = []
     try:
         media = []
-        for file_path in files:
+        for index, file_path in enumerate(files):
             builder = InputMediaDocument if as_document else InputMediaPhoto
             handle = file_path.open("rb")
             handles.append(handle)
-            media.append(builder(media=handle))
+            # Only the first item carries text: Telegram rejects a media group whose
+            # items all have captions, and one link is what is wanted anyway.
+            media.append(builder(media=handle,
+                                 caption=caption if index == 0 else None))
 
         kind = "document" if as_document else "photo"
         try:
             await _reply_media_group(message, media, keyboard)
         except TelegramError as exc:
-            if keyboard is None:
-                logger.warning("相簿傳送失敗（%s × %s）：%s", kind, len(media), exc)
-                raise
-            # The button was refused. Retry without it rather than losing the album:
-            # one message without a button beats one message per page.
-            logger.warning("相簿加按鈕失敗，改為無按鈕重試：%s", exc)
-            keyboard = None
+            # The caption or the button was refused. Retry with neither rather than
+            # losing the album: one message of images with no link beats one message
+            # per page, and the caller still reports the source.
+            logger.warning("相簿加說明或按鈕失敗，改為純圖片重試：%s", exc)
             try:
-                await _reply_media_group(message, media, None)
+                await _reply_media_group(message, _strip_captions(media), None)
             except TelegramError as retry_exc:
                 logger.warning("相簿傳送失敗（%s × %s）：%s",
                                kind, len(media), retry_exc)
                 raise
         logger.info("已以單一相簿傳送 %s 個%s%s", len(media), kind,
-                    "（含原始連結按鈕）" if keyboard is not None else "")
+                    "（第一張帶原始連結）")
         return True
     finally:
         for handle in handles:
@@ -2942,6 +2964,22 @@ async def send_media_album(message, files: list[Path], source_url: str,
                 handle.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _strip_captions(media: list):
+    """
+    Rebuild album items without captions, reusing the already-open file handles.
+
+    Used only for the retry after Telegram refuses a captioned media group. The handles
+    belong to the caller, so they are passed through rather than reopened - reopening
+    would leak the originals and could fail on Windows, where a file open for reading
+    can still block a second open.
+    """
+    stripped = []
+    for item in media:
+        builder = type(item)
+        stripped.append(builder(media=item.media))
+    return stripped
 
 
 async def _reply_media_group(message, media, keyboard):
@@ -3013,11 +3051,13 @@ async def send_original_files(message, files: list[Path], source_url: str,
                               temp_dir: Path,
                               as_document: bool = True) -> tuple[int, str]:
     """
-    Send downloaded files, then the source link. Returns (sent, note).
+    Send downloaded files with the source link **above** them. Returns (sent, note).
 
-    The link goes out **last**, as its own message, so the result reads
-    files-then-source. Attaching it to a caption put it against the media, which left
-    it in the middle of the result with more pages below it.
+    The link travels inside the first message as its caption, so it reads above the
+    images, plus a url button on that same message so it stays reachable however the
+    client renders the caption. Requested explicitly after both alternatives were tried:
+    a separate message lands above but costs a second message, and a button alone sits
+    below the images.
 
     ``as_document`` (the default) sends images as documents, which is the only
     way Telegram passes a file through untouched; the Pixiv path relies on that
@@ -3029,12 +3069,15 @@ async def send_original_files(message, files: list[Path], source_url: str,
     the chat, and anything that is not a groupable image is sent on its own.
     Telegram caps an album at ALBUM_LIMIT items, so larger sets are split into
     several albums rather than dropped.
+
+    Only the **first** message carries the link, so a 30-page work does not repeat it
+    on all three of its albums.
     """
     sent = 0
     notes = []
-    # Whether the source link reached the chat as a button on a message. The button
-    # is what keeps the result to a single message per album, so a separate text
-    # message is only posted when nothing carried it.
+    # Whether the source link has already been carried by a sent message. The link is
+    # what makes the result self-describing, so it is attached to whichever message
+    # goes out first and never repeated.
     link_carried = False
 
     images = [path for path in files if path.suffix.lower() in IMAGE_EXTENSIONS]
@@ -3055,10 +3098,11 @@ async def send_original_files(message, files: list[Path], source_url: str,
             try:
                 await send_media_album(
                     message, chunk, source_url, as_document=as_document,
-                    # The button goes on the first album only, so a large work does
-                    # not carry the same link on every album message.
+                    # The button goes on the first album only, alongside the caption.
                     keyboard=None if link_carried
                     else build_source_keyboard(source_url),
+                    # Later albums get no caption, so the link is not repeated.
+                    with_caption=not link_carried,
                 )
                 sent += len(chunk)
                 link_carried = True
@@ -3073,6 +3117,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                     prefer_original=as_document,
                     keyboard=None if link_carried
                     else build_source_keyboard(source_url),
+                    caption=None if link_carried else build_caption(source_url),
                 ):
                     sent += 1
                     link_carried = True
@@ -3087,6 +3132,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 prefer_original=as_document,
                 keyboard=None if link_carried
                 else build_source_keyboard(source_url),
+                caption=None if link_carried else build_caption(source_url),
             ):
                 sent += 1
                 link_carried = True
@@ -3094,9 +3140,10 @@ async def send_original_files(message, files: list[Path], source_url: str,
             logger.exception("傳送失敗：%s", file_path.name)
             notes.append(f"{file_path.name} 傳送失敗")
 
-    # A text fallback only when no message could carry the button - for example a
-    # source URL that is not http(s), so build_source_keyboard returned None.
-    if not link_carried:
+    # Nothing carried the link only if there was nothing to send, or every send failed.
+    # The text message is still the honest fallback in that case, rather than leaving
+    # the user with images and no way back to the source.
+    if not link_carried and sent == 0:
         await send_source_link(message, build_caption(source_url))
 
     return sent, ("；".join(dict.fromkeys(notes)) if notes else "")

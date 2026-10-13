@@ -256,8 +256,31 @@ check("album items are opened as files, not passed as path strings",
       _album_src[:300])
 check("album streams are closed in a finally",
       "handle.close()" in _album_src and "finally:" in _album_src)
-check("a refused button retries the album without it",
-      "改為無按鈕重試" in _album_src, "a refused reply_markup would lose the album")
+check("a refused caption or button still retries the album",
+      "改為純圖片重試" in _album_src,
+      "a refused reply_markup or caption would lose the whole album")
+check("the retry strips captions rather than reopening the files",
+      "_strip_captions" in _album_src and "item.media" in inspect.getsource(
+          bot._strip_captions),
+      "reopening would leak the original handles and can fail on Windows")
+# Layout, requested explicitly: the source link is the FIRST item's caption, so it
+# reads above the images, with a url button alongside so it stays reachable.
+check("the link is the first album item's caption",
+      "caption if index == 0 else None" in _album_src, _album_src[:400])
+check("later albums do not repeat the link",
+      "with_caption" in inspect.signature(bot.send_media_album).parameters,
+      "a 30-page work would carry the same link on every album")
+check("a single send also carries the link as a caption",
+      "caption" in inspect.signature(bot.send_single_media).parameters,
+      "a single page would show no link above its image")
+check("single-send callers actually pass the caption",
+      "caption=None if link_carried else build_caption(source_url)"
+      in inspect.getsource(bot.send_original_files),
+      "the parameter would exist but never be used")
+check("no separate link message is posted when files were sent",
+      "if not link_carried and sent == 0" in inspect.getsource(
+          bot.send_original_files),
+      "the link would appear twice, in two messages")
 check("reply_markup is sent through api_kwargs",
       "api_kwargs" in "".join(inspect.getsource(bot._reply_media_group)),
       "PTB 22.8 has no reply_markup parameter on reply_media_group")

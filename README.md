@@ -297,30 +297,36 @@ buttons:
 Nothing is downloaded until a button is pressed, so a link you are only curious
 about costs one metadata request.
 
-### Layout: the source link is a button on the album
-A multi-page artwork is delivered as **one message**, with the source link as a url
-button attached to it:
+### Layout: the source link is the first item's caption
+A multi-page artwork is delivered as **one message**, with the source link as the
+**first item's caption**, so it reads above the images:
 
 ```
+[ 原始連結：https://www.pixiv.net/artworks/147895535 ]   ← caption on item 0
 [ 相簿：page0 · page1 · page2 ]
-[ 🔗 pixiv.net/artworks/147895535 ]   ← button, same message
+[ 🔗 pixiv.net/artworks/147895535 ]                      ← same message, button
 ```
 
-The link cannot be a **caption**. Telegram draws an album's caption *against the
-media*, so with more pages below it a plain link landed in the middle of the result
-— which is what the first attempt produced. Sending the link as a **separate
-message** put it at the bottom but cost a second message, which is the redundancy
-being removed.
+Requested explicitly, after both alternatives had been tried:
 
-A `url` button is part of the album's own message, so the link sits below the images
-**without** adding a message. `reply_markup` is not a parameter of
-`reply_media_group` in PTB 22.8, so it is passed through `api_kwargs`, which the
-library merges into the request body. If Telegram refuses it, the album is retried
-without the button, because one message without a button beats one message per page.
+| Approach | Where the link lands | Cost |
+| --- | --- | --- |
+| Caption on the first item | **above** the images | one message |
+| A separate message | above the album | **two** messages |
+| A url button alone | below the images | one message |
 
-The button goes on the **first** album only, so a 30-page work does not carry the
-same link on all three of its messages. A separate text message is now only a
-fallback for a source that is not an http(s) url.
+**Only the first item is captioned.** Telegram rejects a media group in which every
+item has one, and one link is what is wanted anyway. The url button is attached to the
+same message as well, so the link stays reachable however a client renders the caption.
+
+**The position is Telegram's to decide, not ours.** An album caption is drawn by the
+client *against the media*, which is why an earlier attempt landed the link in the
+middle of the set when it was attached to a later item. Anchoring it to the first item
+is the best that can be done from here.
+
+The caption and button go on the **first album only**, so a 30-page work does not carry
+the same link on all three of its messages. A separate text message is now only a
+fallback for the case where nothing was sent at all.
 
 ### One message per request, with the cover in it
 The gallery's cover becomes the body of the reply, so the result is **one message**:
