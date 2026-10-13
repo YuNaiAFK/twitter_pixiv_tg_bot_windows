@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 import shutil
 import sys
 import tempfile
@@ -426,6 +427,42 @@ check("the unwired transport still compiles and exposes its builder",
       (HERE / "socks5_transport.py").exists()
       and hasattr(__import__("socks5_transport"), "build_socks5_http_client"),
       "it is kept as a working reference, not dead weight")
+
+
+# gallery-dl does NOT read the Windows system proxy, and that made every Pixiv App API
+# call time out three times over: measured 115.7s before, 1.3s after HTTPS_PROXY was set.
+# Both gallery-dl call sites must pass it.
+check("gallery-dl is given the system proxy",
+      "system_proxy_url" in inspect.getsource(bot.gallery_dl_env)
+      and "HTTPS_PROXY" in inspect.getsource(bot.gallery_dl_env),
+      "gallery-dl would ignore the registry proxy and Pixiv would time out")
+check("both gallery-dl call sites use it",
+      inspect.getsource(bot.download_with_gallery_dl).count("gallery_dl_env(") == 1
+      and inspect.getsource(bot.download_gallery_media).count("gallery_dl_env(") == 1,
+      "fixing only one leaves the slow path untouched - which happened once already")
+check("the streaming call site passes a real env, not a bare Popen",
+      "env=gallery_dl_env(" in inspect.getsource(bot.download_gallery_media),
+      "the progress-streaming Popen builds its own command and needs its own env")
+_saved_proxy_env = {k: os.environ.get(k) for k in
+                    ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy")}
+try:
+    for _k in _saved_proxy_env:
+        os.environ.pop(_k, None)
+    os.environ["HTTPS_PROXY"] = "http://example.invalid:1"
+    check("an explicit environment variable wins over the registry",
+          bot.system_proxy_url() == "http://example.invalid:1",
+          f"got {bot.system_proxy_url()!r}")
+finally:
+    for _k, _v in _saved_proxy_env.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+check("system_proxy_url returns a usable URL or nothing",
+      bot.system_proxy_url() == "" or "://" in bot.system_proxy_url(),
+      f"got {bot.system_proxy_url()!r}")
 
 _saved_sleep = _time.sleep
 _time.sleep = lambda _s: None

@@ -1341,7 +1341,33 @@ python run_local_api.py --binary "C:\path\to\telegram-bot-api.exe"
 
 Build instructions: <https://tdlib.github.io/telegram-bot-api/build.html>.
 
-### e-hentai throttles and blocks this host — retry absorbs the short ones
+### gallery-dl ignores the Windows system proxy - pass it explicitly
+Pixiv downloads took **115.7 seconds and then failed** with
+``ConnectTimeoutError: Connection to app-api.pixiv.net timed out``. The same command with
+``HTTPS_PROXY`` set took **1.3 seconds**.
+
+The cause is that this machine routes through a **system proxy** held in the registry
+(``HKCU\\...\\Internet Settings``, ``ProxyEnable=1``, ``ProxyServer=127.0.0.1:7897``),
+and the two HTTP stacks disagree about it:
+
+| Client | Reads the system proxy? | Result to ``app-api.pixiv.net`` |
+| --- | --- | --- |
+| ``httpx`` (``trust_env``) | yes | 404 in 1.3s |
+| raw TCP connect | n/a | **timeout, every attempt** |
+| ``gallery-dl`` | **no** | three 30s timeouts, then failure |
+
+So the bot must pass the proxy itself. ``gallery_dl_env()`` does that, and **both**
+gallery-dl call sites use it.
+
+**Both** matters: there are two. ``download_with_gallery_dl`` runs a finished subprocess,
+and ``download_gallery_media`` builds its own ``Popen`` so it can stream progress. Fixing
+only the first had no effect on the slow path at all - the measured 115.7s was unchanged -
+which is worth remembering before concluding a fix works because the code looks right.
+
+An explicit ``HTTPS_PROXY`` in the environment wins over the registry, so this can be
+overridden or disabled without editing the registry.
+
+### e-hentai throttles and blocks this host - retry absorbs the short ones — retry absorbs the short ones
 e-hentai refuses requests from this IP in **two different ways**, needing different
 responses. Both were observed here, minutes apart, on the same URL:
 

@@ -2520,6 +2520,93 @@ def build_gallery_dl_command(url: str, output_dir: Path, platform: str | None) -
     return command
 
 
+def system_proxy_url() -> str:
+    """
+    The proxy this machine is configured to use, or "" for a direct connection.
+
+    This exists because **gallery-dl does not read the Windows system proxy**, and that
+    cost 115 seconds per Pixiv request. Measured on this machine: the proxy is set in the
+    registry (``HKCU\\...\\Internet Settings``, ``ProxyEnable=1``,
+    ``ProxyServer=127.0.0.1:7897``), and:
+
+    * ``httpx`` with ``trust_env`` honours it - a request to ``app-api.pixiv.net``
+      answers in 1.3s
+    * a raw TCP connect to the same address times out every time
+    * ``gallery-dl`` timed out on every Pixiv App API call, three 30-second attempts,
+      ending in ``ConnectTimeoutError``
+
+    Setting ``HTTPS_PROXY`` for the subprocess fixes it: the same command went from
+    **115.7s to 1.3s**. The variable is used rather than a command-line flag because both
+    ``requests`` and ``aiohttp`` - whichever gallery-dl reaches for - read it.
+
+    An explicit environment variable wins, so a user can override or disable this without
+    touching the registry.
+    """
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                 "ALL_PROXY", "all_proxy"):
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+
+    if os.name != "nt":
+        return ""
+
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if not enabled:
+                return ""
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+    except (OSError, ImportError, FileNotFoundError):
+        return ""
+
+    server = (server or "").strip()
+    if not server:
+        return ""
+    # ProxyServer may be "host:port" or a per-scheme list such as
+    # "http=host:port;https=host:port". Only the simple form is used here.
+    if "=" in server:
+        for part in server.split(";"):
+            scheme, _, target = part.partition("=")
+            if scheme.strip().lower() in {"https", "http"} and target.strip():
+                server = target.strip()
+                break
+        else:
+            return ""
+    if "://" not in server:
+        server = f"http://{server}"
+    return server
+
+
+def gallery_dl_env(platform: str | None = None) -> dict:
+    """
+    The environment to run gallery-dl in, with the system proxy passed explicitly.
+
+    gallery-dl **does not read the Windows system proxy**, so without this every Pixiv
+    App API call times out: measured at 115.7s before, 1.3s after setting ``HTTPS_PROXY``.
+    The variable is used rather than a flag because both ``requests`` and ``aiohttp`` -
+    whichever gallery-dl reaches for - read it.
+
+    Both gallery-dl call sites must use this. There are two - one here and one inside
+    ``download_gallery_media``, which builds its own Popen so it can stream progress -
+    and fixing only the first left the slow path untouched, which is exactly how this was
+    first "fixed" without any effect.
+    """
+    env = dict(os.environ)
+    proxy = system_proxy_url()
+    if proxy:
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            env[name] = proxy
+    elif platform == "pixiv":
+        # No proxy configured: the direct route to app-api.pixiv.net is blocked on some
+        # networks, and saying so beats a bare 115-second timeout.
+        logger.warning("沒有偵測到系統代理；Pixiv App API 可能需要代理才能連線。")
+    return env
+
+
 def download_with_gallery_dl(url: str, output_dir: Path, platform: str | None = None):
     """Run gallery-dl outside the event loop."""
     command = build_gallery_dl_command(url, output_dir, platform)
@@ -2531,6 +2618,7 @@ def download_with_gallery_dl(url: str, output_dir: Path, platform: str | None = 
         timeout=MAX_DOWNLOAD_SECONDS,
         check=False,
         shell=False,
+        env=gallery_dl_env(platform),
     )
 
     if result.returncode != 0:
@@ -3799,6 +3887,11 @@ def download_gallery_media(url: str, output_dir: Path, *, original: bool,
         command += ["--cookies", str(cookies_path)]
     command += ["--", url]
 
+    # Derived from the URL, not assumed: this function is generic - the exhentai `-o`
+    # above is simply ignored for other sites - and the warning about a missing proxy
+    # should only appear for Pixiv, which is the site that needs one.
+    platform = detect_media_platform(url)
+
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -3808,6 +3901,9 @@ def download_gallery_media(url: str, output_dir: Path, *, original: bool,
         # the process exits.
         bufsize=1,
         shell=False,
+        # Without this, gallery-dl ignores the system proxy and every Pixiv App API
+        # call times out three times over - 115 seconds - before failing.
+        env=gallery_dl_env(platform),
     )
     # The stop flag is deliberately NOT cleared here. It used to be, back when each
     # request spawned its own gallery-dl run and a flag left over from a previous
