@@ -1034,15 +1034,15 @@ git push
 ```
 
 **Verify the exclusions before every push that touches configuration.** The command
-below lists what would actually be published; if `.env`, `cookies/` or
-`authorized.json` ever appears, stop:
+below lists what would actually be published, and must print **`SAFE`**:
 
 ```sh
-git ls-files | findstr /I "env cookies authorized"
+git ls-files | findstr /I /R "^\.env$ cookies authorized parse_cache restart\.log"
 ```
 
-Before the first push that scan must print nothing. It is checked here rather than
-assumed, because a `.gitignore` line that looks right can still miss a path.
+`/R` with anchored patterns is deliberate: a plain `findstr /I "env"` also matches
+`.env.example`, which is a placeholder template and *should* be published. A check that
+cries wolf on a safe file is one people learn to ignore, which defeats it.
 
 #### The dead proxy, and why pushes fail with a connection error
 The global git config points at `http://127.0.0.1:10808`, a proxy that is **not
