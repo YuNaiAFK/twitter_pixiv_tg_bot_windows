@@ -458,6 +458,36 @@ check("the unknown case still offers the credential check",
       "oauth:pixiv" in _hint_unknown,
       "with no recognised cause the credential advice remains the useful default")
 
+# Reported: after a timeout the bot delivered the same Pixiv artwork two and three times.
+# A timed-out media group has very likely been accepted - with a self-hosted server the
+# upload to Telegram continues after the HTTP request ends - so retrying or degrading to
+# one message per file delivers duplicates. Both call sites must treat TimedOut as final.
+_album_src2 = inspect.getsource(bot.send_media_album)
+check("an album timeout is not retried",
+      "except TimedOut" in _album_src2
+      and _album_src2.index("except TimedOut") < _album_src2.index("except TelegramError"),
+      "TimedOut subclasses TelegramError, so order decides: retrying duplicates the album")
+_orig_src2 = inspect.getsource(bot.send_original_files)
+check("a timed-out album is not degraded to one message per file",
+      "except TimedOut" in _orig_src2
+      and "略過逐個傳送以免重複" in _orig_src2,
+      "splitting after a timeout is what produced 2-3 copies of the same work")
+check("a timed-out single send is not retried either",
+      _orig_src2.count("except TimedOut") >= 2,
+      "the same reasoning applies to a single file: a public bot can redeliver twice")
+# The underlying cause: PTB defaults are read/write 5s, pool 1s, media write 20s, and a
+# self-hosted server needs longer because it relays the upload to Telegram itself.
+_main_src = inspect.getsource(bot.main)
+check("the request timeouts are raised above PTB's 5s defaults",
+      "media_write_timeout" in _main_src and "TELEGRAM_TIMEOUT_SECONDS" in _main_src,
+      "a 5s read timeout is what fired in the first place")
+_httpx_sig = inspect.signature(__import__("telegram.request",
+                                          fromlist=["HTTPXRequest"]).HTTPXRequest.__init__)
+check("PTB really does default those timeouts low (pinned)",
+      _httpx_sig.parameters["read_timeout"].default == 5.0
+      and _httpx_sig.parameters["media_write_timeout"].default == 20.0,
+      "if this fails, PTB changed its defaults and the override may be unnecessary")
+
 # The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
 # generic "gallery deleted" message would be actively misleading.
 _REFUSAL = "Key missing, or incorrect key provided."

@@ -36,7 +36,8 @@ from telegram import (
     LinkPreviewOptions,
     Update,
 )
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, TelegramError, TimedOut
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -3120,6 +3121,18 @@ async def send_media_album(message, files: list[Path], source_url: str,
         kind = "document" if as_document else "photo"
         try:
             await _reply_media_group(message, media, keyboard)
+        except TimedOut:
+            # Deliberately NOT retried and NOT degraded to one message per file.
+            #
+            # A timeout here does not mean the album was rejected: the Bot API server may
+            # have accepted it and be uploading it to Telegram, with only the HTTP
+            # response late. Retrying or splitting then delivers the SAME pages two or
+            # three times, which is exactly what was reported. Saying so and stopping
+            # leaves at most one copy, and the caller reports the timeout.
+            logger.warning("相簿傳送逾時（%s × %s）：不再重試或分割，避免重複傳送。"
+                           "若相簿未出現，請調高 TELEGRAM_TIMEOUT_SECONDS 後再試。",
+                           kind, len(media))
+            raise
         except TelegramError as exc:
             # The caption or the button was refused. Retry with neither rather than
             # losing the album: one message of images with no link beats one message
@@ -3127,6 +3140,10 @@ async def send_media_album(message, files: list[Path], source_url: str,
             logger.warning("相簿加說明或按鈕失敗，改為純圖片重試：%s", exc)
             try:
                 await _reply_media_group(message, _strip_captions(media), None)
+            except TimedOut:
+                logger.warning("相簿重試逾時（%s × %s）：不再分割，避免重複傳送。",
+                               kind, len(media))
+                raise
             except TelegramError as retry_exc:
                 logger.warning("相簿傳送失敗（%s × %s）：%s",
                                kind, len(media), retry_exc)
@@ -3303,6 +3320,17 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 sent += len(chunk)
                 link_carried = True
                 continue
+            except TimedOut:
+                # NOT degraded to one message per file. The album was probably accepted
+                # and is still uploading; sending each page separately afterwards is what
+                # produced two and three copies of the same Pixiv artwork. The pages are
+                # counted as attempted so the summary is not misleadingly empty, and the
+                # note tells the operator what to change.
+                logger.warning("相簿逾時，略過逐個傳送以免重複：%s", [p.name for p in chunk])
+                sent += len(chunk)
+                link_carried = True
+                notes.append("相簿傳送逾時（可能已送達），未再逐個傳送以免重複")
+                continue
             except TelegramError:
                 logger.warning("相簿傳送失敗，改為逐個傳送", exc_info=True)
                 notes.append("相簿傳送失敗，已改為逐個傳送")
@@ -3316,6 +3344,11 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 ):
                     sent += 1
                     link_carried = True
+            except TimedOut:
+                # Never retried. A timed-out upload has very likely arrived, and this bot
+                # is reachable from anywhere, so a retry can deliver the same file twice.
+                logger.warning("傳送逾時，不重試以免重複：%s", file_path.name)
+                notes.append(f"{file_path.name} 傳送逾時（可能已送達）")
             except TelegramError:
                 logger.exception("傳送失敗：%s", file_path.name)
                 notes.append(f"{file_path.name} 傳送失敗")
@@ -3330,6 +3363,9 @@ async def send_original_files(message, files: list[Path], source_url: str,
             ):
                 sent += 1
                 link_carried = True
+        except TimedOut:
+            logger.warning("傳送逾時，不重試以免重複：%s", file_path.name)
+            notes.append(f"{file_path.name} 傳送逾時（可能已送達）")
         except TelegramError:
             logger.exception("傳送失敗：%s", file_path.name)
             notes.append(f"{file_path.name} 傳送失敗")
@@ -5704,6 +5740,38 @@ def main():
         # Points every request at the self-hosted server. api.telegram.org stays the
         # default when TELEGRAM_API_BASE is unset.
         builder = builder.base_url(telegram_base_url())
+
+    # Timeouts are raised well above PTB's defaults, which are 5.0s for read, write and
+    # connect, 1.0s for pool, and 20.0s for a media write.
+    #
+    # THIS IS THE FIX FOR A REPORTED DUPLICATION BUG. With a self-hosted server the
+    # upload does not finish when the HTTP request does: the server takes the file
+    # straight from disk and pushes it to Telegram itself, over MTProto - which on this
+    # network is relayed through a SOCKS5 proxy. A 5.5 MB album therefore needs several
+    # seconds of work upstream *after* the request body has been written, so the 5s
+    # read timeout fired, the send looked failed, and the fallback delivered the same
+    # artwork again.
+    #
+    # media_write_timeout is set separately and matters: PTB applies it to the upload
+    # itself and its default is 20s, which is already longer than read_timeout but still
+    # short for a large archive over a throttled relay.
+    #
+    # Raising the ceiling does not slow anything down: a timeout is an upper bound, and a
+    # normal send returns as soon as it is done.
+    request_timeout = max(1.0, float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "180") or 180))
+    request_kwargs = dict(
+        read_timeout=request_timeout,
+        write_timeout=request_timeout,
+        connect_timeout=min(request_timeout, 30.0),
+        pool_timeout=30.0,
+        media_write_timeout=request_timeout,
+    )
+    builder = builder.get_updates_request(
+        HTTPXRequest(**request_kwargs)
+    ).request(
+        HTTPXRequest(**request_kwargs)
+    )
+
     application = (
         builder
         .post_init(post_init)
