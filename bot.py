@@ -4864,14 +4864,20 @@ def bot_was_mentioned(update, context) -> bool:
     """
     Whether this message addresses the bot directly.
 
-    Used to decide whether a message with **no link** deserves a reply. Privacy mode
-    is off on this bot, so it receives every group message; answering all of them
-    would make it look like it was reading the conversation.
+    Only two things count: a reply to one of the bot's own messages, or an `@mention`
+    of **this bot's** username. Any other mention is somebody else being addressed - a
+    reply to a person, or a mention of another user.
 
-    Only two things count: a reply to one of the bot's own messages, or an
-    `@mention` of **this bot's** username. Any other mention is somebody else being
-    addressed - a reply to a person, or a mention of another user - and answering
-    that put the help text into unrelated conversations.
+    A reply is matched on the bot's **own user id** when that is known. Falling back to
+    "the sender is any bot" is broader than intended: it would treat a reply to a
+    *different* bot in the same group as addressing this one.
+
+    Retained for that meaning, but note that no caller acts on it any more:
+    ``handle_message`` returns on a link-less message without consulting this, because
+    replying to the bot made it answer with the help text and that was reported as the
+    bot reacting to someone else's conversation. It stays because it is the correct
+    test for "was I addressed", and the characterization suite pins its behaviour for
+    the day something needs it.
     """
     message = getattr(update, "effective_message", None)
     if message is None:
@@ -4881,8 +4887,16 @@ def bot_was_mentioned(update, context) -> bool:
     reply_to = getattr(message, "reply_to_message", None)
     if reply_to is not None:
         sender = getattr(reply_to, "from_user", None)
-        if sender is not None and getattr(sender, "is_bot", False):
-            return True
+        if sender is not None:
+            bot = getattr(context, "bot", None)
+            bot_id = getattr(bot, "id", None)
+            sender_id = getattr(sender, "id", None)
+            if bot_id is not None and sender_id is not None:
+                if sender_id == bot_id:
+                    return True
+            elif getattr(sender, "is_bot", False):
+                # No id to compare: the broader test is the only option left.
+                return True
 
     bot = getattr(context, "bot", None)
     bot_username = (getattr(bot, "username", "") or "").lstrip("@").lower()
@@ -4933,12 +4947,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # plain remark like "i send no link". The bot appeared to be reading other
     # people's conversations.
     urls = extract_urls(text)
-    mentioned = bot_was_mentioned(update, context)
     if not urls:
-        # Nothing to parse. Reply only when the bot was addressed directly, so an
-        # ordinary message never draws a response.
-        if mentioned:
-            await send_status(message, commands_hint())
+        # Nothing to parse, so nothing is said. This is deliberately unconditional.
+        #
+        # It used to answer a link-less message when the bot appeared to be addressed -
+        # a reply to one of its own messages, or an @mention of its username. That was
+        # reported as the bot being triggered by someone else: replying to a message the
+        # bot had sent earlier made it answer with the help text, which read as the bot
+        # reacting to an unrelated remark. Any heuristic here is a guess about intent,
+        # and a guess that is wrong is worse than silence.
+        #
+        # Being addressed with no link is still served by /help, which is explicit and
+        # cannot misfire. Silence costs nothing: a user who meant to ask something can
+        # send a link or the command.
         return
 
     # There is something to act on, so authorization is checked now - and only now.

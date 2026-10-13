@@ -1131,16 +1131,16 @@ readonly database* and both sites stop working. The file also carries
 
 ### With privacy mode off, only messages with a link are answered
 Privacy mode is off on this deployment (`can_read_all_group_messages: True`), so
-Telegram delivers **every** group message — including the ones with nothing to
-parse. Two rules keep that from turning into chatter:
+Telegram delivers **every** group message — including the ones with nothing to parse.
+Two rules keep that from turning into chatter:
 
-- **A message with no link is answered only when the bot was addressed directly** —
-  an `@mention` of **the bot's own username**, or a reply to one of its own messages.
-  Everything else is left alone, so the bot never looks like it is reading the
-  conversation. A mention of *anyone else* does not count: an entity of type
-  `mention` only tells you a username was written, not whose, and treating every one
-  as "addressed to me" put the help text into unrelated conversations (a reply to
-  `@shiroko9008` picked up the bot, whose username is `Shiroko9008_Parse_Link_bot`).
+- **A message with no link is never answered.** Unconditionally. It used to reply with
+  the help text when the bot *appeared* to be addressed — an `@mention` of its own
+  username, or a reply to one of its own messages — and that was reported as the bot
+  being **triggered by someone else**: replying to a photo the bot had posted earlier
+  made it answer a remark like *"如此巨乳!"* with the usage text.
+  Any such heuristic is a guess about intent, and a guess that is wrong is worse than
+  silence. `/help` covers the legitimate case explicitly and cannot misfire.
 - **Authorization is checked *after* a link is found.** It used to run first, which
   meant any message from a non-authorized user was answered with
   "此機器人目前不允許你的帳號使用" — even a plain remark like "i send no link". That
@@ -1149,6 +1149,11 @@ parse. Two rules keep that from turning into chatter:
 A refused user never reaches the cache, the downloader or Telegraph: the gate runs
 before all of them. A regression test primes a cache hit and asserts the lookup is
 never made for a refused user.
+
+`bot_was_mentioned` is kept and still answers "was I addressed" correctly — a reply is
+matched on the bot's **own user id** rather than "the sender is any bot", which was
+broader than intended — but **nothing consults it any more**. The characterization suite
+pins its behaviour for the day something needs it.
 
 ### One request at a time, not a waiting period
 A user may have **one** request in flight. A second one is refused with an

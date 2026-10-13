@@ -329,8 +329,26 @@ _urls_pos = _handle_src.index("extract_urls(text)")
 _auth_pos = _handle_src.index("user_is_allowed(")
 check("a link is looked for before authorization",
       _urls_pos < _auth_pos, "authorization would answer link-less messages")
-check("a link-less message returns before replying",
-      "if not urls:" in _handle_src and "return" in _handle_src.split("if not urls:")[1][:400])
+# Reported as the bot being triggered by someone else's conversation. The fix is that a
+# link-less message is now answered **unconditionally never** - no mention heuristic, no
+# reply-to-bot exception. Both of those were guesses about intent, and a wrong guess is
+# worse than silence; /help covers the legitimate case explicitly.
+check("a link-less message never draws a reply",
+      "if not urls:" in _handle_src
+      and "commands_hint()" not in _handle_src,
+      "a mention or reply-to-bot heuristic could still answer an unrelated message")
+_after_urls = _handle_src.split("if not urls:")[1]
+# The branch body is a comment block followed by a bare return, so the first statement
+# after the colon is the return - asserting on the raw slice would have matched the
+# comment instead and passed vacuously.
+_branch_body = [ln.strip() for ln in _after_urls.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+check("the link-less branch's first statement is a bare return",
+      _branch_body and _branch_body[0] == "return",
+      f"first statement is {_branch_body[0] if _branch_body else '(none)'}")
+check("no mention check gates a reply any more",
+      "bot_was_mentioned" not in _handle_src,
+      "a heuristic on 'was I addressed' can misfire, which is what was reported")
 
 # (c) Only the bot's OWN username counts as a mention. A mention entity alone says only
 #     that a username was written, so replying to @someone picked up the bot.
