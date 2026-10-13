@@ -275,59 +275,157 @@ def build_command(binary: Path, env: dict[str, str], port: int,
     ]
 
 
-def verify_credentials(api_id: str, api_hash: str) -> int:
+def credential_report(api_id: str, api_hash: str) -> tuple[bool, bool]:
     """
-    Check the **format** of api_id/api_hash and that Telegram is reachable.
+    Report the format of api_id/api_hash. Returns (format_ok, present).
 
-    This deliberately makes no claim that the pair is *valid*, because there is no
-    unauthenticated endpoint that would tell us. The obvious attempt - presenting the
-    pair where a bot token goes - does not work: Telegram answers "Unauthorized" for
-    any malformed token, so a correct pair and an invented one produce the **same**
-    reply. Using that as a pass would be false reassurance, and was measured to be
-    exactly that before this was rewritten.
-
-    The only real check is to start the server: it authenticates on startup and fails
-    loudly if the credentials are wrong. ``docker compose logs`` shows that.
-
-    Returns a process exit code: 0 when the format is plausible, 1 when it is not.
+    Split out from the live check so ``--check`` can report the format without starting
+    anything, while ``--verify-credentials`` goes on to ask the server for a verdict.
     """
-    import httpx
+    print("=== 1. 是否已取得（有沒有值）===")
+    present = bool(api_id and api_hash)
+    if not present:
+        print("  ✗ 尚未取得：.env 裡的 TELEGRAM_API_ID / TELEGRAM_API_HASH 還是空的。")
+        print("    沒有看到那兩個值，就代表申請沒有成功。")
+        return False, False
+    print("  ✓ 已填入兩個值")
 
-    print("=== 檢查 api_id / api_hash 格式 ===")
     print()
+    print("=== 2. 格式是否正確 ===")
     ok = True
-    if not api_id or not api_hash:
-        print("  ✗ 尚未填寫，請先在 .env 設定 TELEGRAM_API_ID 與 TELEGRAM_API_HASH。")
-        return 1
     if not api_id.strip().isdigit():
-        print(f"  ✗ api_id 應該是一串數字，目前是 {api_id!r}。")
+        print(f"  ✗ api_id 必須是純數字，目前是 {api_id!r}")
         ok = False
     else:
-        print(f"  ✓ api_id 格式正確（數字，{len(api_id.strip())} 位）")
+        print(f"  ✓ api_id 是數字（{len(api_id.strip())} 位）")
     if api_hash.strip().lower() != api_hash.strip():
-        print("  ⚠ api_hash 含有大寫；官方值是小寫十六進位，請確認沒有複製錯誤。")
+        print("  ⚠ api_hash 含有大寫字元；官方值是小寫十六進位，請確認沒有複製錯。")
     try:
         int(api_hash.strip(), 16)
         if len(api_hash.strip()) == 32:
-            print("  ✓ api_hash 格式正確（32 位十六進位）")
+            print("  ✓ api_hash 是 32 位十六進位")
         else:
-            print(f"  ⚠ api_hash 長度是 {len(api_hash.strip())}，通常是 32")
+            print(f"  ⚠ api_hash 長度 {len(api_hash.strip())}，通常是 32 位")
     except ValueError:
         print(f"  ✗ api_hash 不是十六進位：{api_hash!r}")
         ok = False
+    return ok, True
 
-    try:
-        httpx.get("https://api.telegram.org", timeout=20.0)
-        print("  ✓ 可以連線 api.telegram.org")
-    except Exception as exc:  # noqa: BLE001
-        print(f"  ✗ 無法連線 api.telegram.org：{type(exc).__name__}")
-        ok = False
+
+def verify_credentials_live(port: int = DEFAULT_PORT) -> int:
+    """
+    Ask a running server for the verdict on api_id/api_hash.
+
+    This is the **only** honest live check. There is no unauthenticated Telegram
+    endpoint that reports whether a pair is valid: presenting it where a bot token goes
+    answers "Unauthorized" for a valid pair and an invented one alike, so that was
+    measured to be false reassurance and removed.
+
+    A running Bot API server, by contrast, does authenticate upstream, and its answer is
+    unambiguous - a bad api_id produces an upstream failure while a good one lets
+    getMe through. So the check is: is the local server up, and does it relay a request
+    to Telegram successfully.
+
+    Returns 0 when the server confirmed the credentials, 1 otherwise.
+    """
+    import httpx
 
     print()
-    print("  注意：這只檢查格式，**無法**確認憑證是否真的有效 ——")
+    print("=== 3. 是否真的有效（由自架伺服器向 Telegram 確認）===")
+    if not server_answers(port):
+        print(f"  ✗ 127.0.0.1:{port} 沒有服務在跑，無法確認。")
+        print("    先啟動伺服器，再回來檢查：")
+        print("      python run_local_api.py")
+        print("      python run_local_api.py --verify-credentials")
+        return 1
+
+    token = (load_env(ENV_FILE).get("BOT_TOKEN")
+             or os.environ.get("BOT_TOKEN", "")).strip()
+    if not token:
+        print("  ✗ 缺少 BOT_TOKEN，無法透過伺服器發出請求。")
+        return 1
+
+    url = f"http://127.0.0.1:{port}/bot{token}/getMe"
+    try:
+        response = httpx.get(url, timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ✗ 無法連線本機伺服器：{type(exc).__name__}: {exc}")
+        return 1
+
+    print(f"  伺服器回應 HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001
+        # The local server answers a non-2xx with an empty body, so the *status* is the
+        # evidence. 502 is the Bot API server's own "I could not complete this upstream"
+        # and, with credentials as the only upstream dependency at this point, a wrong
+        # api_id/api_hash is by far the likeliest cause - so say that rather than
+        # blaming the server for an unparseable body, which sent the reader looking in
+        # the wrong place.
+        body = response.text.strip()[:160]
+        if body:
+            print(f"  回應內容：{body!r}")
+        if response.status_code == 502:
+            print("  ✗ 伺服器無法向 Telegram 認證 —— api_id/api_hash 很可能是錯的。")
+            print("    請再看啟動日誌確認： docker logs telegram-bot-api --tail 30")
+        elif response.status_code in (401, 403):
+            print("  ✗ 憑證被拒絕。")
+        else:
+            print("  ✗ 未能確認，請看伺服器日誌： docker logs telegram-bot-api --tail 30")
+        return 1
+
+    if payload.get("ok"):
+        who = (payload.get("result") or {}).get("username", "?")
+        print(f"  ✓ 憑證有效：伺服器成功向 Telegram 認證（@{who}）")
+        print()
+        print("  下一步：在 .env 設定")
+        print(f"    TELEGRAM_API_BASE=http://127.0.0.1:{port}")
+        print("    TELEGRAM_LOCAL=1")
+        print("  然後用 run.bat 重啟 bot。")
+        return 0
+
+    description = str(payload.get("description") or "")
+    print(f"  錯誤訊息：{description!r}")
+    if "Unauthorized" in description or response.status_code in (401, 403):
+        print("  ✗ 憑證無效：伺服器有回應，但 Telegram 拒絕了它。")
+    elif response.status_code == 502:
+        print("  ✗ 伺服器無法向 Telegram 認證 —— api_id/api_hash 很可能是錯的。")
+        print("    也可能是啟動時就失敗了，請看： docker compose logs --tail 30")
+    else:
+        print("  ✗ 未能確認，請看伺服器日誌： docker compose logs --tail 30")
+    return 1
+
+
+def verify_credentials(api_id: str, api_hash: str) -> int:
+    """
+    Report the presence and format of api_id/api_hash, then say how to confirm validity.
+
+    Format checking is all that can be done offline, and the reason is recorded rather
+    than glossed over: the obvious online attempt does not work, because Telegram
+    answers "Unauthorized" identically for a valid pair and an invented one. Only a
+    running server can answer, which is what ``--verify-credentials`` does when one is
+    already up.
+
+    Returns a process exit code: 0 when the format is plausible, 1 when it is not.
+    """
+    print("=== 檢查 api_id / api_hash ===")
+    print()
+    ok, present = credential_report(api_id, api_hash)
+    if not present:
+        return 1
+
+    # If a server is already running, settle the question now instead of asking the
+    # operator to interpret logs.
+    if server_answers(DEFAULT_PORT):
+        return verify_credentials_live(DEFAULT_PORT)
+
+    print()
+    print("  格式沒問題，但**這還不能證明它有效** ——")
     print("  Telegram 沒有提供未經驗證就能檢查 api_id/api_hash 的端點。")
-    print("  真正的驗證會在伺服器啟動時發生：")
-    print("    docker compose up -d && docker compose logs -f")
+    print("  唯一可靠的確認方式是啟動伺服器，讓它向 Telegram 認證：")
+    print()
+    print("    python run_local_api.py                    # 啟動")
+    print("    python run_local_api.py --verify-credentials   # 取得判定")
     return 0 if ok else 1
 
 
