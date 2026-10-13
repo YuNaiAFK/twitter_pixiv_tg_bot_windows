@@ -412,6 +412,52 @@ check("the button handler reuses the cached gallery",
       and "if gallery is None" in inspect.getsource(bot.run_gallery_action),
       "the gallery facts must come from cache when present, not a fresh fetch")
 
+# The operator hint used to be a fixed per-platform guess: "Pixiv needs a refresh-token"
+# for ANY empty result, including a deleted artwork. gallery-dl had already said which it
+# was and that answer was discarded with the captured output - so an operator was sent to
+# redo an OAuth flow that was never the problem.
+for _text, _expected in (
+        ("[pixiv][warning] 150822697: Deleted", "deleted"),
+        ("[twitter][error] 404 Not Found", "missing"),
+        ("[pixiv][error] AuthenticationError: refresh-token required", "auth"),
+        ("[twitter][error] rate limit exceeded 429", "rate_limit"),
+        ("[pixiv][error] this work is private", "private"),
+        ("[twitter][error] ConnectTimeoutError: timed out", "network"),
+        ("nothing recognisable here", ""),
+):
+    check(f"gallery-dl output classifies as {_expected or 'unknown'}",
+          bot.classify_download_output(_text) == _expected,
+          f"{_text[:44]!r} -> {bot.classify_download_output(_text)!r}")
+
+# A sticky reason would mislabel the NEXT unrelated failure as the previous one's cause.
+_prev_reason = bot.LAST_DOWNLOAD_REASON
+try:
+    bot.LAST_DOWNLOAD_REASON = "deleted"
+    bot.begin_download_diagnosis()
+    check("each download starts with no recorded reason",
+          bot.LAST_DOWNLOAD_REASON == "",
+          "a stale reason would be reported as this run's cause")
+    bot.record_download_output("[pixiv][warning] 1: Deleted")
+    check("a recognised reason is recorded",
+          bot.LAST_DOWNLOAD_REASON == "deleted", bot.LAST_DOWNLOAD_REASON)
+finally:
+    bot.LAST_DOWNLOAD_REASON = _prev_reason
+
+_saved_reason = bot.LAST_DOWNLOAD_REASON
+try:
+    bot.LAST_DOWNLOAD_REASON = "deleted"
+    _hint_deleted = bot.admin_hint("pixiv")
+    bot.LAST_DOWNLOAD_REASON = ""
+    _hint_unknown = bot.admin_hint("pixiv")
+finally:
+    bot.LAST_DOWNLOAD_REASON = _saved_reason
+check("the deleted hint does not send the operator to redo OAuth",
+      "被刪除" in _hint_deleted and "oauth:pixiv" not in _hint_deleted,
+      _hint_deleted[:70])
+check("the unknown case still offers the credential check",
+      "oauth:pixiv" in _hint_unknown,
+      "with no recognised cause the credential advice remains the useful default")
+
 # The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
 # generic "gallery deleted" message would be actively misleading.
 _REFUSAL = "Key missing, or incorrect key provided."

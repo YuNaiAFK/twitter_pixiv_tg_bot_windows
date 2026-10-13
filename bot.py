@@ -1681,11 +1681,36 @@ def admin_hint(platform: str | None = None) -> str:
 
     Contains file names and command lines, so it must never be part of a reply to
     an ordinary visitor.
+
+    The cause comes from gallery-dl's own output via ``LAST_DOWNLOAD_REASON`` when one
+    was recognised. This used to be a fixed guess per platform - "Pixiv needs a
+    refresh-token" for *any* empty result - which was printed for a deleted artwork, a
+    private one, and a rate limit alike. gallery-dl had already said which it was and
+    that answer was being discarded, so an operator chasing a deleted work was sent to
+    re-do an OAuth flow that was never the problem.
     """
     command = ".venv\\Scripts\\python.exe bot.py --check"
+
+    # A cause gallery-dl named itself. The credential advice is not repeated for these,
+    # because none of them is a credential problem.
+    if LAST_DOWNLOAD_REASON == "deleted":
+        return "作品已被刪除（gallery-dl 回報 Deleted）。這不是憑證問題，無需重新登入。"
+    if LAST_DOWNLOAD_REASON == "missing":
+        return ("作品不存在或連結已失效（gallery-dl 回報 not found）。"
+                "這不是憑證問題。")
+    if LAST_DOWNLOAD_REASON == "rate_limit":
+        return ("被平台限流（gallery-dl 回報 rate limit）。請稍後再試，"
+                "不是憑證問題。")
+    if LAST_DOWNLOAD_REASON == "private":
+        return ("作品是私人的或受保護（gallery-dl 回報 private/protected）。"
+                f"需要該帳號的 Cookie；用 {command} 檢查目前憑證。")
+    if LAST_DOWNLOAD_REASON == "network":
+        return ("連線逾時或中斷（gallery-dl 回報 timeout/connection）。"
+                "多半是暫時性的，請稍後再試。")
+
     if platform == "pixiv":
         return (
-            "Pixiv 需要 refresh-token（Cookie 不足）：\n"
+            "Pixiv 取不到內容，且 gallery-dl 未回報明確原因。可能是憑證問題：\n"
             "1) 執行 .venv\\Scripts\\gallery-dl.exe oauth:pixiv\n"
             "2) 把瀏覽器網址列裡 code= 之後的值填入 .env 的 PIXIV_REFRESH_TOKEN\n"
             f"3) 執行 {command} 驗證"
@@ -2607,8 +2632,63 @@ def gallery_dl_env(platform: str | None = None) -> dict:
     return env
 
 
+# Why the most recent gallery-dl run produced nothing. Set by
+# ``record_download_output`` and read by ``admin_hint``.
+#
+# This exists because the operator's diagnosis used to be a fixed guess: "Pixiv needs a
+# refresh-token" was printed for *any* empty result, including a deleted artwork, a
+# private one, and a rate limit. gallery-dl had already said which it was, and that
+# answer was being thrown away with the captured output.
+LAST_DOWNLOAD_REASON = ""
+
+
+def classify_download_output(text: str) -> str:
+    """
+    The specific reason a gallery-dl run returned no media, from its own output.
+
+    Ordered most-specific first, because gallery-dl prints several lines and the generic
+    ones are always present. Returns "" when nothing recognisable is there, so callers
+    can fall back to a generic message rather than inventing a cause.
+    """
+    lowered = (text or "").lower()
+    if "deleted" in lowered:
+        return "deleted"
+    if "does not exist" in lowered or "not found" in lowered or "404" in lowered:
+        return "missing"
+    if "login" in lowered or "authentication" in lowered or "refresh-token" in lowered:
+        return "auth"
+    if "rate limit" in lowered or "429" in lowered or "too many" in lowered:
+        return "rate_limit"
+    if "private" in lowered or "protected" in lowered or "sensitive" in lowered:
+        return "private"
+    if "timed out" in lowered or "connection" in lowered or "timeout" in lowered:
+        return "network"
+    return ""
+
+
+def begin_download_diagnosis() -> None:
+    """
+    Clear the recorded reason before a run.
+
+    Without this the reason is sticky: one deleted artwork would leave "deleted" set, and
+    the *next* failure for an unrelated reason would be reported as a deletion. Each run
+    starts from "unknown" so the hint can only ever describe the run that just happened.
+    """
+    global LAST_DOWNLOAD_REASON
+    LAST_DOWNLOAD_REASON = ""
+
+
+def record_download_output(text: str) -> None:
+    """Remember why a run came back empty, for the log hint that follows."""
+    global LAST_DOWNLOAD_REASON
+    reason = classify_download_output(text)
+    if reason:
+        LAST_DOWNLOAD_REASON = reason
+
+
 def download_with_gallery_dl(url: str, output_dir: Path, platform: str | None = None):
     """Run gallery-dl outside the event loop."""
+    begin_download_diagnosis()
     command = build_gallery_dl_command(url, output_dir, platform)
 
     result = subprocess.run(
@@ -2624,6 +2704,10 @@ def download_with_gallery_dl(url: str, output_dir: Path, platform: str | None = 
     if result.returncode != 0:
         details = (result.stderr or result.stdout or "没有详细错误信息").strip()
         raise RuntimeError(details[-1200:])
+
+    # A deleted or private item exits 0 with no files, so the reason is only in the
+    # output. Recording it here is what lets the log hint name the real cause.
+    record_download_output((result.stderr or "") + (result.stdout or ""))
 
 
 def collect_media_files(temp_dir: Path) -> list[Path]:
@@ -3871,6 +3955,9 @@ def download_gallery_media(url: str, output_dir: Path, *, original: bool,
     # then tries to resolve it as a field name.
     marker = "PROGRESS EVENT"
 
+    # Cleared per run so the diagnosis can only describe this attempt.
+    begin_download_diagnosis()
+
     command = [
         find_executable(),
         "--no-mtime",
@@ -3970,6 +4057,11 @@ def download_gallery_media(url: str, output_dir: Path, *, original: bool,
     if process.returncode != 0:
         details = "".join(stderr_chunks).strip() or "沒有詳細錯誤資訊"
         raise ehentai.EhentaiError(details[-400:])
+
+    # Exit 0 with no files is how a deleted or private item comes back, and the reason
+    # is only in stderr - gallery-dl writes to stdout only the progress markers that
+    # read_progress consumes. Recorded so the log hint can name it instead of guessing.
+    record_download_output("".join(stderr_chunks))
     return True
 
 
