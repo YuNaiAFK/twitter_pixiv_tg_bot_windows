@@ -104,6 +104,38 @@ def missing_build_tools() -> list[str]:
     return [tool for tool in ("cmake", "git") if shutil.which(tool) is None]
 
 
+def find_docker() -> Path | None:
+    """
+    Locate the Docker CLI, including where Docker Desktop installs by default.
+
+    ``shutil.which("docker")`` alone is not enough on Windows: Docker Desktop can be
+    installed **per user** under ``%LOCALAPPDATA%\\Programs\\DockerDesktop``, which does
+    not put ``docker`` on ``PATH``. On this machine that is exactly the case, so the
+    earlier version reported "docker compose 不可用" while Docker was installed, running,
+    and had the image pulled - a misleading answer that would send someone off to
+    reinstall something they already had.
+    """
+    found = shutil.which("docker")
+    if found:
+        return Path(found)
+
+    candidates = []
+    for root in (os.environ.get("LOCALAPPDATA"), os.environ.get("ProgramFiles"),
+                 os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramData")):
+        if not root:
+            continue
+        candidates += [
+            Path(root) / "Programs" / "DockerDesktop" / "resources" / "bin" / "docker.exe",
+            Path(root) / "Docker" / "Docker" / "resources" / "bin" / "docker.exe",
+        ]
+    # The CLI also ships as docker-compose only in older installs; the plugin form
+    # below needs the docker binary, so that is what is searched for.
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def docker_command() -> list[str] | None:
     """
     The Docker CLI and its compose subcommand, or None.
@@ -111,15 +143,15 @@ def docker_command() -> list[str] | None:
     ``docker compose`` (v2, a plugin) is preferred over the legacy ``docker-compose``
     standalone, because the v2 form is what current Docker Desktop ships.
     """
-    cli = shutil.which("docker")
-    if not cli:
+    cli = find_docker()
+    if cli is None:
         return None
     try:
-        probe = subprocess.run([cli, "compose", "version"], capture_output=True,
+        probe = subprocess.run([str(cli), "compose", "version"], capture_output=True,
                                text=True, timeout=20)
     except (OSError, subprocess.SubprocessError):
         return None
-    return [cli, "compose"] if probe.returncode == 0 else None
+    return [str(cli), "compose"] if probe.returncode == 0 else None
 
 
 def docker_running(compose: list[str]) -> bool:
