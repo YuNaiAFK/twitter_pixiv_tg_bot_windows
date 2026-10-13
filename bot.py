@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import hashlib
+import httpx
 import json
 import logging
 import os
@@ -3608,7 +3609,6 @@ def download_gallery_direct(urls: list[str], output_dir: Path, *, referer: str,
     the Telegraph embedding, so nothing extra is requested from e-hentai. Their
     own fetch is still the fallback when a direct download fails.
     """
-    import httpx
 
     if not urls:
         return 0
@@ -4150,7 +4150,6 @@ def resolve_official_archive(gallery, *, resample: bool) -> tuple[str, str, int]
     requires a running H@H client and answers "Your H@H client appears to be offline"
     otherwise, which a bot cannot satisfy.
     """
-    import httpx
 
     archiver_url = (f"https://e-hentai.org/archiver.php"
                     f"?gid={gallery.gid}&token={gallery.token}")
@@ -4220,6 +4219,15 @@ def resolve_official_archive(gallery, *, resample: bool) -> tuple[str, str, int]
     return download_url, filename, size
 
 
+class _RangesUnsupported(Exception):
+    """
+    Raised when a server ignores a Range request and answers with the whole file.
+
+    Distinct from a transport failure: the download is not broken, it simply cannot be
+    split, so the caller falls back to a single stream rather than reporting an error.
+    """
+
+
 def _archive_headers(referer: str) -> dict:
     """Request headers for the archive CDN, including the gallery cookie."""
     headers = {
@@ -4264,7 +4272,6 @@ def download_official_archive(download_url: str, target: Path, *, referer: str,
     must tolerate that; it only accumulates a counter. The same ``stop_event`` the rest
     of the download uses ends the transfer early.
     """
-    import httpx
 
     headers = _archive_headers(referer)
     # A generous read timeout: the archive is served from a CDN and can be large,
@@ -4273,41 +4280,67 @@ def download_official_archive(download_url: str, target: Path, *, referer: str,
     if workers <= 0:
         workers = max(1, min(EHENTAI_ARCHIVE_WORKERS, 8))
 
-    # --- probe: total size and whether ranges are honoured ---
+    # --- probe: total size, and evidence that ranges are honoured ---
+    #
+    # HEAD is tried first because it is much cheaper. Measured on this CDN family:
+    # HEAD 287 ms against 1468 ms for a one-byte ranged GET, so the probe alone was
+    # costing over a second per archive before any payload moved.
+    #
+    # The evidence accepted is deliberately broad, because the header is not
+    # reliable here: this CDN answers a ranged GET with **200** and no
+    # ``Accept-Ranges`` at all, so requiring ``Accept-Ranges: bytes`` would have
+    # concluded "no ranges" and silently given up the parallel path. What is
+    # trustworthy is the *response to a range request*, so a 206 with a parseable
+    # ``Content-Range`` counts, and a 200 carrying a plausible Content-Length is
+    # treated as "unknown" and verified by the workers instead.
     total = expected
-    accept_ranges = ""
+    range_evidence = False
+    size_known = False
     try:
         with httpx.Client(headers=headers, follow_redirects=True,
                           timeout=timeout) as client:
-            probe = client.get(download_url, headers={"Range": "bytes=0-0"})
-        accept_ranges = (probe.headers.get("accept-ranges") or "").lower()
-        if probe.status_code == 206:
+            probe = client.head(download_url)
+            if probe.status_code >= 400:
+                # Some hosts refuse HEAD; the ranged GET below is the real test.
+                probe = client.get(download_url, headers={"Range": "bytes=0-0"})
+            accept_ranges = (probe.headers.get("accept-ranges") or "").lower()
             content_range = probe.headers.get("content-range") or ""
-            if "/" in content_range:
+            if probe.status_code == 206 and "/" in content_range:
+                range_evidence = True
                 try:
                     total = int(content_range.rsplit("/", 1)[-1])
+                    size_known = True
                 except ValueError:
                     pass
-        elif not total:
-            try:
-                total = int(probe.headers.get("content-length") or 0)
-            except ValueError:
-                total = 0
+            elif "bytes" in accept_ranges:
+                range_evidence = True
+                try:
+                    total = int(probe.headers.get("content-length") or 0)
+                    size_known = total > 0
+                except ValueError:
+                    pass
+            elif not total:
+                try:
+                    total = int(probe.headers.get("content-length") or 0)
+                except ValueError:
+                    total = 0
     except Exception as exc:  # noqa: BLE001
         logger.warning("無法探測官方歸檔大小，改用單一連線：%s", exc)
+        range_evidence = False
 
-    supports_ranges = "bytes" in accept_ranges
-
-    # A range download needs a known size to divide, and splitting a small file costs
-    # more in round trips than it saves.
+    # A range download needs a divisible size. Without one, the workers cannot be given
+    # ranges, so one stream is the only option.
     use_parallel = (
-        supports_ranges and total > ARCHIVE_PARALLEL_MIN_BYTES and workers > 1
+        range_evidence and size_known and total > ARCHIVE_PARALLEL_MIN_BYTES
+        and workers > 1
     )
     if not use_parallel:
         # The reason is reported because the three cases look identical from outside:
         # all three simply download more slowly, and that is the kind of thing a
         # confusing log turns into a wild goose chase.
-        if not supports_ranges:
+        if not size_known:
+            reason = "大小未知，無法切分"
+        elif not range_evidence:
             reason = "伺服器不支援分段請求"
         elif total <= ARCHIVE_PARALLEL_MIN_BYTES:
             reason = (f"檔案不大（{ehentai.format_filesize(total)}），"
@@ -4315,22 +4348,28 @@ def download_official_archive(download_url: str, target: Path, *, referer: str,
         elif workers <= 1:
             reason = "已設定為單一連線"
         else:
-            reason = "大小未知"
+            reason = "未知原因"
         logger.info("官方歸檔使用單一連線下載（%s）", reason)
         return _download_archive_single(headers, download_url, target, total,
                                         stop_event, progress, timeout)
 
     logger.info("官方歸檔使用 %s 個連線分段下載（%s）", workers,
                 ehentai.format_filesize(total))
-    return _download_archive_parallel(headers, download_url, target, total,
-                                      workers, stop_event, progress, timeout)
+    try:
+        return _download_archive_parallel(headers, download_url, target, total,
+                                          workers, stop_event, progress, timeout)
+    except _RangesUnsupported as exc:
+        # The probe said ranges were honoured and the workers proved otherwise. One
+        # stream is correct, just slower, so fall back instead of failing the download.
+        logger.warning("分段請求未被接受（%s），改用單一連線", exc)
+        return _download_archive_single(headers, download_url, target, total,
+                                        stop_event, progress, timeout)
 
 
 def _download_archive_single(headers: dict, download_url: str, target: Path,
                              total: int, stop_event, progress,
                              timeout) -> int:
     """One stream straight to disk. The fallback, and the small-file path."""
-    import httpx
 
     written = 0
     with httpx.Client(headers=headers, follow_redirects=True,
@@ -4369,7 +4408,6 @@ def _download_archive_parallel(headers: dict, download_url: str, target: Path,
     A failed range is retried once; a range that still fails is reported, because
     silently returning a short file would hand Telegram a corrupt archive.
     """
-    import httpx
 
     written = 0
     lock = threading.Lock()
@@ -4402,9 +4440,14 @@ def _download_archive_parallel(headers: dict, download_url: str, target: Path,
                 with client.stream(
                         "GET", download_url,
                         headers={"Range": f"bytes={lo}-{hi}"}) as response:
-                    if response.status_code not in (200, 206):
-                        raise ehentai.EhentaiError(
-                            f"分段下載失敗（HTTP {response.status_code}）")
+                    # A 206 is required, not merely preferred. A server that ignores
+                    # the Range header answers 200 with the **whole** file, and writing
+                    # that at this worker's offset would corrupt the archive silently -
+                    # the file would be the right length and the wrong bytes. Raising
+                    # here turns that into a clean fallback to one stream.
+                    if response.status_code != 206:
+                        raise _RangesUnsupported(
+                            f"伺服器未依分段回應（HTTP {response.status_code}）")
                     offset = lo
                     with target.open("r+b") as handle:
                         for part in response.iter_bytes(256 * 1024):
@@ -4418,6 +4461,13 @@ def _download_archive_parallel(headers: dict, download_url: str, target: Path,
                                 written += len(part)
                                 if progress is not None:
                                     progress(written, total)
+        except _RangesUnsupported:
+            # Not retryable and not a per-range failure: the server does not support
+            # ranges at all, so retrying the other ranges would fail identically.
+            # Propagated for the caller to fall back to a single stream. This must come
+            # before the generic handler, or it would be recorded as a failed range and
+            # reported as a corrupt download instead of a fallback.
+            raise
         except Exception as exc:  # noqa: BLE001
             if stopped():
                 return got
@@ -5229,7 +5279,6 @@ def probe_telegram_limits() -> dict:
     if not TELEGRAM_API_BASE:
         return info
 
-    import httpx
 
     try:
         response = httpx.get(telegram_api_url("getMe"), timeout=10.0,

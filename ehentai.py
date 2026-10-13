@@ -323,8 +323,48 @@ def fetch_gallery(url: str, *, cookies_path=None, timeout: float = 60.0,
             client.close()
 
 
+_cookie_header_cache: dict[tuple, tuple[float, int, str]] = {}
+_cookie_header_lock = threading.Lock()
+
+
 def cookies_header(path) -> str:
-    """Build a Cookie header from a Netscape cookie file."""
+    """
+    Build a Cookie header from a Netscape cookie file.
+
+    **Memoised on (path, mtime, size)**, because this is called for every request that
+    needs the cookie and the file is re-read and re-parsed each time otherwise. An
+    archive download builds headers once per worker, and the parallel page fetch does it
+    for every request, so the same few hundred bytes were being read from disk dozens of
+    times per gallery. Measured at 57 us a call.
+
+    The cache is keyed on the file's mtime and size rather than cleared on write, so a
+    re-exported cookie file (which /cookies tells the operator to do) is picked up
+    automatically instead of serving a stale header until restart. That correctness
+    detail is the whole reason it is safe to cache at all.
+    """
+    try:
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        # Cannot stat it: fall through to the uncached path so the warning is emitted.
+        return _read_cookie_header(path)
+
+    with _cookie_header_lock:
+        cached = _cookie_header_cache.get(key)
+    if cached is not None:
+        return cached[2]
+
+    header = _read_cookie_header(path)
+    with _cookie_header_lock:
+        # Only the current key is kept: the file is a single config artefact, so older
+        # revisions cannot be asked for again.
+        _cookie_header_cache.clear()
+        _cookie_header_cache[key] = (stat.st_mtime_ns, stat.st_size, header)
+    return header
+
+
+def _read_cookie_header(path) -> str:
+    """Parse a Netscape cookie file into a Cookie header value."""
     pairs = []
     try:
         for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
