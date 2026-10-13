@@ -5333,9 +5333,41 @@ def run_self_check():
     return 0
 
 
+def telegram_server_root() -> str:
+    """
+    Scheme and host of the Bot API server, with **no** trailing path.
+
+    This is the raw form, for code that builds a full URL itself. Do not hand it to
+    ``Application.builder().base_url()`` - see ``telegram_base_url`` for why.
+    """
+    return TELEGRAM_API_BASE.rstrip("/")
+
+
 def telegram_base_url() -> str:
-    """The Bot API base URL, or "" to use the public api.telegram.org."""
-    return TELEGRAM_API_BASE
+    """
+    The value ``base_url()`` needs: the server root **plus ``/bot``**.
+
+    The trailing ``/bot`` is not decoration and is easy to get wrong. python-telegram-bot
+    parses this with:
+
+        def _parse_base_url(value, token):
+            ...
+            return value + token
+
+    It **appends the token** rather than inserting it into a ``{token}`` placeholder, so
+    the value must already end with ``/bot``. The library's own default is
+    ``"https://api.telegram.org/bot"``, which is the hint.
+
+    Passing the bare root produced exactly this, and it is worth recording because the
+    message points nowhere near the cause:
+
+        InvalidURL: Invalid port: '80818693732536:AAEDcYYcEbQ08xurHFD_jFzGV311JsivHag'
+
+    The token was concatenated onto the port, so httpx read it as part of the port
+    number and the bot died during bootstrap.
+    """
+    root = telegram_server_root()
+    return f"{root}/bot" if root else ""
 
 
 def telegram_api_url(method: str) -> str:
@@ -5345,8 +5377,8 @@ def telegram_api_url(method: str) -> str:
     A self-hosted server serves the bot's methods under ``/bot<token>/<method>``
     exactly as the public API does, so only the host part changes.
     """
-    base = TELEGRAM_API_BASE or "https://api.telegram.org"
-    return f"{base}/bot{BOT_TOKEN}/{method}"
+    root = telegram_server_root() or "https://api.telegram.org"
+    return f"{root}/bot{BOT_TOKEN}/{method}"
 
 
 def probe_telegram_limits() -> dict:

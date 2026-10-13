@@ -1341,60 +1341,60 @@ python run_local_api.py --binary "C:\path\to\telegram-bot-api.exe"
 
 Build instructions: <https://tdlib.github.io/telegram-bot-api/build.html>.
 
-### Blocked on networks that filter Telegram's MTProto
-**The Bot API server cannot be used on this network.** The server speaks MTProto to
-Telegram, and these hosts are unreachable from a container here:
+### `base_url` must end with `/bot` — the token is appended, not inserted
+Pointing the bot at a self-hosted server is one line, and getting it subtly wrong kills
+the bot during bootstrap:
 
-```
-149.154.167.50:443   BLOCKED
-149.154.175.50:443   BLOCKED
-91.108.56.130:443    BLOCKED
+```python
+builder.base_url(telegram_base_url())   # must end with "/bot"
 ```
 
-The symptom is deceptive: the server starts, the container is healthy, `getMe` **hangs**
-and eventually times out, and the log stays silent. It looks like a bad `api_id`, and it
-is not.
+python-telegram-bot parses that value like this:
 
-**`--proxy` does not help, and cannot.** Its own help text says so:
-
-```
---proxy=<arg>   HTTP proxy server for outgoing webhook requests in the format http://host:port
+```python
+def _parse_base_url(value, token):
+    ...
+    return value + token          # APPENDS the token
 ```
 
-That is **webhooks only** — it does not proxy TDLib's MTProto connection, so no value
-here can route the login. `docker-compose.yml` therefore carries `TELEGRAM_PROXY` with a
-comment recording this, rather than leaving the impression that it is a working lever.
+It does **not** substitute a `{token}` placeholder, so the value must already end with
+`/bot` — which is why the library's own default is `"https://api.telegram.org/bot"`.
+Passing the bare server root produced a URL with the token glued onto the port:
 
-Two things were genuinely wrong and are fixed, in case this is retried on a network that
-does allow MTProto:
+```
+Bot.base_url = 'http://127.0.0.1:80818693732536:AAEDcYYcEbQ08xurHFD_jFzGV311JsivHag'
+httpx.InvalidURL: Invalid port: '80818693732536:AAEDcYYcEbQ08xurHFD_jFzGV311JsivHag'
+```
 
-| Fault | Effect | Fix |
+That message points nowhere near the cause — it reads like a malformed token or a bad
+port, not a missing `/bot`. Hence the module exposes **two** helpers, which must not be
+swapped:
+
+| Helper | Shape | For |
 | --- | --- | --- |
-| The work dir was a **Windows bind mount** (9p/drvfs) | TDLib's binlog rename failed, `Signal: 6`, the server crash-looped and answered 502 to everything — indistinguishable from bad credentials | a **named volume**, which is ext4 |
-| A stale volume from a failed run | TDLib never got past initialisation | wipe the volume, not just the container |
+| `telegram_server_root()` | `http://127.0.0.1:8081` | building a URL yourself |
+| `telegram_base_url()` | `http://127.0.0.1:8081/bot` | PTB's `base_url()` |
 
-To find out whether a network is suitable **before** wiring anything up:
+`telegram_base_url()` also returns `""` when no local server is set, so `main()` can test
+it for truthiness and skip `base_url()` entirely. A characterization check pins PTB's
+actual behaviour, so a release that switches to a `{token}` placeholder fails loudly at
+that point rather than at the next boot.
 
-```sh
-docker run --rm alpine:latest sh -c '
-for ip in 149.154.167.50 149.154.175.50 91.108.56.130; do
-  timeout 6 sh -c "echo > /dev/tcp/$ip/443" 2>/dev/null \
-    && echo "$ip OPEN" || echo "$ip BLOCKED"
-done'
-```
+### Filtered networks: the server needs MTProto through a proxy
+Telegram's MTProto hosts are **partly filtered** on this network. Measured:
 
-All three must be `OPEN`. If they are not, the public API is the only option, and the
-bot's own HTTP calls need a proxy instead — which is a different problem, and one the
-host proxy on `127.0.0.1:7897` already solves when `socksio` is installed
-(`pip install "python-telegram-bot[socks]"`).
+| From | Result |
+| --- | --- |
+| host, direct | some addresses open (`91.108.4.204`), others blocked (`149.154.167.50`) |
+| container, direct | **all** blocked — Docker is filtered harder than the host |
+| either, through the host SOCKS5 | **all** open |
 
-### Making it work on a filtered network (transparent SOCKS5)
-Where Telegram's MTProto hosts are filtered, the upstream image cannot log in: it starts,
-looks healthy, and hangs on `getMe` with an empty log — easily mistaken for a wrong
-`api_id`. `TDLib` **ignores proxy environment variables**, and the server's own
-`--proxy` is webhook-only, so no configuration of the upstream image fixes it.
+So the upstream image cannot log in unaided. It starts, looks healthy, and hangs on
+`getMe` with an empty log — easily mistaken for a wrong `api_id`. `TDLib` **ignores proxy
+environment variables**, and the server's own `--proxy` is webhook-only, so no
+configuration of that image fixes it.
 
-`Dockerfile.bot-api-proxy` wraps that image and adds the one thing that works:
+`Dockerfile.bot-api-proxy` wraps the image and adds the one thing that works:
 
 | Piece | Role |
 | --- | --- |
@@ -1407,26 +1407,25 @@ current data-centre addresses at runtime and keeps discovering more — a list w
 until it silently did not. `NET_ADMIN` is required and is the only added capability.
 
 ```ini
-TELEGRAM_MT_PROXY=socks5://<host-ip>:17900
+TELEGRAM_MT_PROXY=socks5://192.168.65.254:17900
 ```
 
-**The host proxy must be reachable from a container**, and that is the part that trips
-people up. This proxy binds to `127.0.0.1` only, so a container cannot use it, and
+**The host proxy must be reachable from a container**, which is the part that trips
+people up. It binds to `127.0.0.1` only, so a container cannot use it, and
 `host.docker.internal` does not help — it resolves to the Docker VM's address, where
-nothing listens. `host_proxy_relay.py` bridges that: it accepts on every interface and
-forwards the bytes to the loopback proxy, unchanged.
+nothing listens. `host_proxy_relay.py` bridges that:
 
 ```sh
 python host_proxy_relay.py            # 0.0.0.0:17900 -> 127.0.0.1:7897
+python host_proxy_relay.py --selftest # prove the whole chain (run inside the container)
 ```
 
 It is a **TCP relay, not a proxy** — the client still performs the SOCKS5 handshake — and
-it needs no dependencies.
+it has no dependencies.
 
-**An inbound firewall rule is required**, because the relay must accept connections from
-the container and Windows blocks them by default. Without it the container reports the
-relay as unreachable while the relay works perfectly from the host, which is a
-confusing pair of facts to hold at once:
+**An inbound firewall rule is required**, because Windows blocks connections from the
+container by default. Without it the relay works perfectly from the host while the
+container reports it as unreachable, which is a confusing pair of facts to hold at once:
 
 ```powershell
 # Administrator PowerShell, once:
@@ -1434,13 +1433,25 @@ New-NetFirewallRule -DisplayName "bot-api relay" -Direction Inbound `
   -Protocol TCP -LocalPort 17900 -Action Allow
 ```
 
-Diagnose the three layers separately, in this order:
+**The relay must be running whenever the bot is.** The server cannot reach Telegram
+without it, so it belongs in startup rather than a terminal. Diagnose the three layers
+separately, in this order:
 
 ```sh
 # 1. relay works locally?      (host)      -> SOCKS5 CONNECT ok
-# 2. container reaches relay?  (container) -> /dev/tcp/<host-ip>/17900
+# 2. container reaches relay?  (container) -> --selftest reports CONNECT ok
 # 3. server logs in?           (host)      -> getMe returns 200
 ```
+
+### Historical note: what the network looked like before the proxy
+The two faults below were real and are fixed, but the *symptom* they shared — a healthy
+container that hangs on `getMe` — is the same one the missing proxy produces. Check the
+three layers above before suspecting either.
+
+| Fault | Effect | Fix |
+| --- | --- | --- |
+| The work dir was a **Windows bind mount** (9p/drvfs) | TDLib's binlog rename failed, `Signal: 6`, the server crash-looped and answered 502 to everything — indistinguishable from bad credentials | a **named volume**, which is ext4 |
+| A stale volume from a failed run | TDLib never got past initialisation, log silent | wipe the volume, not just the container |
 
 ### `--local` is the flag that matters
 Without it the server still enforces the public 50 MB limit, so switching gains

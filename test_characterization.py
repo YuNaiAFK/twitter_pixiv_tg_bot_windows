@@ -318,6 +318,51 @@ check("the unused keyboard is documented as intentionally unused",
 check("the keyboard still builds correctly if reattached",
       bot.build_source_keyboard("https://x.com/a/status/2") is not None and
       bot.build_source_keyboard("nope") is None)
+
+
+def _local_server_urls(monkeypatch_base: str):
+    """Evaluate the two URL helpers as if TELEGRAM_API_BASE were the given value."""
+    saved = bot.TELEGRAM_API_BASE
+    try:
+        bot.TELEGRAM_API_BASE = monkeypatch_base
+        return bot.telegram_server_root(), bot.telegram_base_url(), \
+            bot.telegram_api_url("getMe")
+    finally:
+        bot.TELEGRAM_API_BASE = saved
+
+
+# Reported from a real boot: passing the bare server root to PTB produced
+#   InvalidURL: Invalid port: '80818693732536:AAEDcYYcEbQ08xurHFD_jFzGV311JsivHag'
+# because python-telegram-bot parses base_url with `return value + token` - it APPENDS
+# the token, so the value must already end with "/bot". The token was concatenated onto
+# the port, so httpx read it as part of the port number.
+_root, _base, _api = _local_server_urls("http://127.0.0.1:8081")
+check("base_url ends with /bot, which PTB requires",
+      _base == "http://127.0.0.1:8081/bot",
+      f"PTB appends the token, so this must end with /bot; got {_base!r}")
+check("the raw root carries no /bot of its own",
+      _root == "http://127.0.0.1:8081",
+      "a caller building its own URL would then double the /bot segment")
+check("the method URL has exactly one /bot segment",
+      _api == f"http://127.0.0.1:8081/bot{bot.BOT_TOKEN}/getMe",
+      _api.replace(bot.BOT_TOKEN, "<TOKEN>"))
+check("a trailing slash in the setting cannot break the /bot suffix",
+      _local_server_urls("http://127.0.0.1:8081/")[1] == "http://127.0.0.1:8081/bot",
+      "a trailing slash would give //bot and a wrong path")
+check("no local server configured still means the public API",
+      _local_server_urls("")[1] == "",
+      "base_url() must stay falsy so main() does not call base_url('')")
+
+# Pinned against the installed library: PTB parses base_url with `value + token`, so a
+# future release that switches to a {token} placeholder would make the "/bot" suffix
+# wrong. This fails loudly at that point instead of at the next boot.
+from telegram import Bot as _Bot  # noqa: E402
+
+check("PTB really does append the token to base_url",
+      _Bot(bot.BOT_TOKEN, base_url="http://127.0.0.1:9999/bot").base_url
+      == f"http://127.0.0.1:9999/bot{bot.BOT_TOKEN}",
+      "if this fails, PTB changed how base_url is parsed and the /bot suffix must change "
+      "with it")
 check("reply_markup is sent through api_kwargs",
       "api_kwargs" in "".join(inspect.getsource(bot._reply_media_group)),
       "PTB 22.8 has no reply_markup parameter on reply_media_group")
