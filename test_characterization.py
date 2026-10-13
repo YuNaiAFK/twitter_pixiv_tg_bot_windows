@@ -25,12 +25,9 @@ from __future__ import annotations
 
 import ast
 import inspect
-import json
 import shutil
 import sys
 import tempfile
-import threading
-import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -122,7 +119,6 @@ EXPECTED_SIGNATURES = {
     "build_source_keyboard": ["source_url"],
     "bot_was_mentioned": ["update", "context"],
     "commands_hint": [],
-    "build_source_keyboard": ["source_url"],
 }
 for _name, _params in EXPECTED_SIGNATURES.items():
     _fn = getattr(bot, _name, None)
