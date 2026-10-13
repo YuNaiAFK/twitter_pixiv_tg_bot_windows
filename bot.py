@@ -942,6 +942,8 @@ async def send_cached_media(message, status, url: str, payload: dict,
             # source link. Replaying a cached Pixiv link must not grow a link that the
             # original send did not have.
             attach_link=(platform != "pixiv"),
+            # Blur adult works. The rating is cached, so a replay costs nothing extra.
+            spoiler=detect_spoiler(url, platform),
         )
     except TelegramError as exc:
         logger.warning("從快取傳送失敗，將重新下載：%s", exc)
@@ -1674,6 +1676,143 @@ def commands_hint() -> str:
         "連結可以寫在文字裡，也可以寫在圖片的說明文字裡。\n"
         f"{SUPPORTED_SITES_NOTICE}"
     )
+
+
+def media_is_adult(platform: str | None, url: str, metadata: dict | None = None) -> bool:
+    """
+    Whether this work is adult content, for Telegram's spoiler blur.
+
+    Requested: adult works should arrive blurred. Telegram's ``has_spoiler`` does that
+    for photos, videos and animations.
+
+    **Pixiv** is read from the work's own rating, which gallery-dl already reports in the
+    metadata it fetches for the download:
+
+        "rating": "R-18", "x_restrict": 1
+
+    ``x_restrict`` is the reliable field and is checked first; ``rating`` is the readable
+    fallback. Both come from the same response, so no extra request is involved. Measured
+    on this machine: a daily-ranking work reports ``"General"``/``0`` while the reported
+    adult work reports ``"R-18"``/``1``, so the field does distinguish them.
+
+    **e-hentai** already classifies every gallery - ``is_adult`` is what decides whether a
+    Telegraph page may be built at all - so the gallery object is consulted directly.
+
+    Returns False when the rating cannot be determined. Unknown content is **not**
+    blurred: a false positive blurs every ordinary artwork, which is worse than a missed
+    blur, and the classification is not always available.
+    """
+    if metadata:
+        restrict = metadata.get("x_restrict")
+        if restrict is not None:
+            try:
+                if int(restrict) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        rating = str(metadata.get("rating") or "").strip().lower()
+        if rating:
+            return rating.startswith("r-18")
+
+    # A rating recorded by an earlier request. This is what makes a repeat cost nothing:
+    # without it every send re-ran gallery-dl to re-read the same answer, which was
+    # measured at about a second per call.
+    cached_rating = PARSE_CACHE.lookup(url, kind="rating")
+    if cached_rating is not None and "adult" in cached_rating:
+        return bool(cached_rating["adult"])
+
+    if platform == "ehentai":
+        cached = PARSE_CACHE.lookup(url, kind="gallery")
+        gallery = gallery_from_payload(cached) if cached else None
+        if gallery is not None:
+            return bool(getattr(gallery, "is_adult", False))
+    return False
+
+
+def fetch_media_metadata(url: str, platform: str | None) -> dict:
+    """
+    The metadata dictionary gallery-dl reports for this URL, or {}.
+
+    Used only to read the age rating. gallery-dl prints one JSON array of entries per
+    post and the artwork's own fields are in the entry carrying an ``"id"``, so that is
+    the entry returned. Any failure returns {} rather than raising: a missing rating means
+    "do not blur", which must never take a working download down with it.
+    """
+    # Built in order rather than by splicing into a list. The first version inserted
+    # --cookies at a fixed index, which landed it between --config and its value, so
+    # gallery-dl read the config path as the cookie file, exited 2 with a usage error,
+    # and the rating silently came back unknown - which looked like "not adult".
+    command = [find_executable()]
+    config_path = gallery_dl_config_path()
+    if config_path is not None:
+        command += ["--config", str(config_path)]
+    cookies_path = resolve_cookie_file(platform) if platform else None
+    if cookies_path is not None:
+        command += ["--cookies", str(cookies_path)]
+    command += ["-j", "--", url]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=min(90.0, float(MAX_DOWNLOAD_SECONDS)),
+            check=False,
+            shell=False,
+            env=gallery_dl_env(platform),
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("讀取作品分級失敗（%s）：%s", url, exc)
+        return {}
+
+    if result.returncode != 0:
+        return {}
+    try:
+        entries = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return {}
+    for entry in entries if isinstance(entries, list) else []:
+        if (isinstance(entry, list) and len(entry) >= 3
+                and isinstance(entry[2], dict) and "id" in entry[2]):
+            return entry[2]
+    return {}
+
+
+def detect_spoiler(url: str, platform: str | None) -> bool:
+    """
+    Whether this request's media should be sent blurred.
+
+    The rating is looked for in the parse cache first, so a repeat of a known work costs
+    no extra request. On a miss the metadata is fetched once per request and stored back
+    into the cache, so it is paid for once per work rather than once per send - which
+    matters because one request sends several messages.
+
+    e-hentai needs no fetch: its gallery object already carries the classification, and
+    that is cached separately under ``kind="gallery"``.
+    """
+    try:
+        if media_is_adult(platform, url):
+            return True
+        if platform == "ehentai":
+            return False
+
+        metadata = fetch_media_metadata(url, platform)
+        if not metadata:
+            return False
+
+        adult = media_is_adult(platform, url, metadata)
+        # Remember the rating for next time. Stored as its own entry so it survives
+        # independently of the media cache, which is pruned and may hold no files yet.
+        try:
+            PARSE_CACHE.store(url, "rating", {"adult": adult})
+            PARSE_CACHE.save()
+        except (OSError, ValueError) as exc:  # pragma: no cover - cache is best effort
+            logger.debug("無法快取分級：%s", exc)
+        return adult
+    except Exception:  # noqa: BLE001
+        # Blurring is cosmetic. A failure here must never stop the media being sent.
+        logger.warning("判斷成人內容失敗，將不加模糊：%s", url, exc_info=True)
+        return False
 
 
 def admin_hint(platform: str | None = None) -> str:
@@ -2960,7 +3099,7 @@ async def edit_message_to_cover(status, gallery, caption: str,
 async def send_single_media(message, file_path: Path, source_url: str,
                             temp_dir: Path, extra: str = "",
                             prefer_original: bool = False,
-                            keyboard=None, caption=None) -> bool:
+                            keyboard=None, caption=None, spoiler: bool = False) -> bool:
     """
     Send one media file. Returns success.
 
@@ -3005,6 +3144,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
                 caption=text,
                 supports_streaming=True,
                 reply_markup=keyboard,
+                has_spoiler=spoiler,
             )
         return True
 
@@ -3015,6 +3155,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
                 filename=file_path.name,
                 caption=text,
                 reply_markup=keyboard,
+                has_spoiler=spoiler,
             )
         return True
 
@@ -3024,7 +3165,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
             with file_path.open("rb") as media:
                 await message.reply_document(
                     document=media, filename=file_path.name, caption=text,
-                    reply_markup=keyboard,
+                    reply_markup=keyboard, has_spoiler=spoiler,
                 )
             return True
 
@@ -3032,7 +3173,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
             with file_path.open("rb") as media:
                 await message.reply_photo(
                     photo=media, filename=file_path.name, caption=text,
-                    reply_markup=keyboard,
+                    reply_markup=keyboard, has_spoiler=spoiler,
                 )
             return True
 
@@ -3047,14 +3188,14 @@ async def send_single_media(message, file_path: Path, source_url: str,
                     # The link still leads when the image had to be shrunk, so the
                     # compression remark is appended rather than replacing it.
                     caption=(f"{text}\n{compress_note}" if text else compress_note),
-                    reply_markup=keyboard,
+                    reply_markup=keyboard, has_spoiler=spoiler,
                 )
             return True
 
         with file_path.open("rb") as media:
             await message.reply_document(
                 document=media, filename=file_path.name, caption=text,
-                reply_markup=keyboard,
+                reply_markup=keyboard, has_spoiler=spoiler,
             )
         return True
 
@@ -3068,7 +3209,8 @@ async def send_single_media(message, file_path: Path, source_url: str,
 
 async def send_media_album(message, files: list[Path], source_url: str,
                            as_document: bool = False, keyboard=None,
-                           with_caption: bool = True) -> bool:
+                           with_caption: bool = True,
+                           spoiler: bool = False) -> bool:
     """
     Send 2..ALBUM_LIMIT files as one album, with the source link as the **first**
     item's caption so it reads above the images. Raises TelegramError so the caller can
@@ -3115,8 +3257,21 @@ async def send_media_album(message, files: list[Path], source_url: str,
             handles.append(handle)
             # Only the first item carries text: Telegram rejects a media group whose
             # items all have captions, and one link is what is wanted anyway.
-            media.append(builder(media=handle,
-                                 caption=caption if index == 0 else None))
+            item_kwargs = {"media": handle,
+                           "caption": caption if index == 0 else None}
+            if spoiler and not as_document:
+                # InputMediaPhoto declares has_spoiler, so it is a named argument and
+                # PTB serialises it itself.
+                item_kwargs["has_spoiler"] = True
+            if spoiler and as_document:
+                # InputMediaDocument does NOT declare has_spoiler - only api_kwargs,
+                # which PTB forwards verbatim. Telegram's Bot API does document the
+                # field on InputMediaDocument, so this is the only way to ask for a blur
+                # on a document album. Note that Telegram does not blur documents in the
+                # clients, so a blurred Pixiv album still shows its files unblurred;
+                # the per-file path uses reply_document, which does accept has_spoiler.
+                item_kwargs["api_kwargs"] = {"has_spoiler": True}
+            media.append(builder(**item_kwargs))
 
         kind = "document" if as_document else "photo"
         try:
@@ -3250,7 +3405,8 @@ async def send_source_link(message, source_note: str):
 async def send_original_files(message, files: list[Path], source_url: str,
                               temp_dir: Path,
                               as_document: bool = True,
-                              attach_link: bool = True) -> tuple[int, str]:
+                              attach_link: bool = True,
+                              spoiler: bool = False) -> tuple[int, str]:
     """
     Send downloaded files, optionally with the source link above them.
     Returns (sent, note).
@@ -3316,6 +3472,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                     keyboard=None,
                     # Later albums get no caption, so the link is not repeated.
                     with_caption=not link_carried,
+                    spoiler=spoiler,
                 )
                 sent += len(chunk)
                 link_carried = True
@@ -3341,6 +3498,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                     prefer_original=as_document,
                     keyboard=None,
                     caption=None if link_carried else caption,
+                    spoiler=spoiler,
                 ):
                     sent += 1
                     link_carried = True
@@ -3360,6 +3518,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 prefer_original=as_document,
                 keyboard=None,
                 caption=None if link_carried else caption,
+                spoiler=spoiler,
             ):
                 sent += 1
                 link_carried = True
@@ -5308,6 +5467,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Computed once per request, before any send, so every message of a multi-album
+        # work gets the same treatment. On a first request this costs one metadata read;
+        # afterwards the rating is cached and it costs nothing. Failure returns False -
+        # an unblurred ordinary artwork is a better outcome than a failed send.
+        spoiler = await asyncio.to_thread(detect_spoiler, media_url, platform)
+        if spoiler:
+            logger.info("成人內容，將加上模糊：%s", media_url)
+
         if platform == "pixiv":
             # Sending the artwork as-is: one message per album, original files.
             # A ZIP is deliberately not used, and no image is downscaled, so the
@@ -5317,6 +5484,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Requested: Pixiv sends the images alone, with no source link and no
                 # button. Only X/Twitter carries the link.
                 attach_link=False,
+                # Requested: adult works arrive blurred. Read from the work's own
+                # rating, which was fetched above and cached on a previous request.
+                spoiler=spoiler,
             )
 
             summary = f"Pixiv 解析完成，已傳送原圖 {sent_count}/{len(media_files)} 個檔案。"
@@ -5339,6 +5509,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message, media_files, media_url, temp_dir, as_document=False,
             # Requested: X/Twitter shows the source link, Pixiv does not.
             attach_link=True,
+            # X marks adult media itself; its posts carry no rating field, so this is
+            # False unless a future extractor starts reporting one.
+            spoiler=spoiler,
         )
 
         summary = f"X/Twitter 解析完成，已傳送 {sent_count}/{len(media_files)} 個檔案。"

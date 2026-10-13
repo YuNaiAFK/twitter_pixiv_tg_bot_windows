@@ -502,6 +502,51 @@ check("the cached-send timeout handler comes before the generic one",
       _cache_block.index("except TimedOut") < _cache_block.index("except TelegramError"),
       "TimedOut subclasses TelegramError, so order decides this")
 
+# Requested: adult works arrive blurred. Pixiv's rating comes from the metadata
+# gallery-dl already fetches ("x_restrict": 1 / "rating": "R-18"); e-hentai already has
+# is_adult. Unknown content is NOT blurred - a false positive blurs everything.
+_adult_cases = [
+    ({"x_restrict": 1, "rating": "R-18"}, True, "x_restrict"),
+    ({"x_restrict": 0, "rating": "General"}, False, "general"),
+    ({"rating": "R-18"}, True, "rating only"),
+    ({"x_restrict": "0"}, False, "string zero"),
+    ({}, False, "empty metadata"),
+    (None, False, "no metadata"),
+]
+for _meta, _want, _label in _adult_cases:
+    check(f"adult detection: {_label}",
+          bot.media_is_adult("pixiv", "https://www.pixiv.net/artworks/1", _meta) is _want,
+          f"{_meta} -> {bot.media_is_adult('pixiv', 'https://www.pixiv.net/artworks/1', _meta)}")
+check("unknown content is not blurred",
+      bot.media_is_adult("pixiv", "https://www.pixiv.net/artworks/1", None) is False,
+      "a false positive would blur every ordinary artwork")
+_reads_rating = 'kind="rating"' in inspect.getsource(bot.media_is_adult)
+_stores_rating = 'PARSE_CACHE.store(url, "rating"' in inspect.getsource(bot.detect_spoiler)
+check("the rating is cached so a repeat costs nothing",
+      _reads_rating and _stores_rating,
+      f"read={_reads_rating} store={_stores_rating}; without both, every send re-ran "
+      f"gallery-dl for the same answer")
+check("a failure to classify never blocks the send",
+      "except Exception" in inspect.getsource(bot.detect_spoiler)
+      and "return False" in inspect.getsource(bot.detect_spoiler),
+      "blurring is cosmetic; it must not break delivery")
+# InputMediaDocument has no has_spoiler parameter, so it must go through api_kwargs,
+# while InputMediaPhoto declares it. Verified by serialisation, not by assumption.
+from telegram import InputMediaDocument as _IMD, InputMediaPhoto as _IMP  # noqa: E402
+
+check("InputMediaPhoto serialises has_spoiler",
+      _IMP(media="x", has_spoiler=True).to_dict().get("has_spoiler") is True)
+check("InputMediaDocument needs api_kwargs for has_spoiler",
+      "has_spoiler" not in inspect.signature(_IMD.__init__).parameters
+      and _IMD(media="x", api_kwargs={"has_spoiler": True}).to_dict()
+      .get("has_spoiler") is True,
+      "it has no named parameter, so api_kwargs is the only route")
+_album_src3 = inspect.getsource(bot.send_media_album)
+check("the album uses the right channel per media type",
+      'item_kwargs["has_spoiler"] = True' in _album_src3
+      and 'item_kwargs["api_kwargs"] = {"has_spoiler": True}' in _album_src3,
+      "using one channel for both would silently drop the flag")
+
 # The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
 # generic "gallery deleted" message would be actively misleading.
 _REFUSAL = "Key missing, or incorrect key provided."
