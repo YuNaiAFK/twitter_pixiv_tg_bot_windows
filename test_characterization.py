@@ -488,6 +488,20 @@ check("PTB really does default those timeouts low (pinned)",
       and _httpx_sig.parameters["media_write_timeout"].default == 20.0,
       "if this fails, PTB changed its defaults and the override may be unnecessary")
 
+# A second duplication path, in the cache branch: falling through after a failed cached
+# send downloads the artwork again and delivers it a second time.
+_handle_src2 = inspect.getsource(bot.handle_message)
+_cache_block = _handle_src2[_handle_src2.index("if cached_media is not None"):]
+_cache_block = _cache_block[:_cache_block.index("logger.info(\"快取無法使用")]
+check("a timed-out cached send does not fall through to re-download",
+      "except TimedOut" in _cache_block
+      and "return" in _cache_block.split("except TimedOut")[1]
+                                .split("except TelegramError")[0],
+      "falling through downloads the same work again and sends it twice")
+check("the cached-send timeout handler comes before the generic one",
+      _cache_block.index("except TimedOut") < _cache_block.index("except TelegramError"),
+      "TimedOut subclasses TelegramError, so order decides this")
+
 # The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
 # generic "gallery deleted" message would be actively misleading.
 _REFUSAL = "Key missing, or incorrect key provided."

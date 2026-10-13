@@ -5269,6 +5269,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # downloading did - the opposite of the point.
                 await cleanup_request_messages(status, message)
                 return
+        except TimedOut:
+            # NOT re-downloaded and NOT re-sent. This is the second duplication path:
+            # the cached send very likely arrived, and falling through would download the
+            # same artwork again and deliver it a second time. Observed as two or three
+            # copies of one Pixiv work after a timeout.
+            logger.warning("快取傳送逾時，不再重新下載或重送以免重複：%s", media_url)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            await status.edit_text(
+                "傳送逾時，可能已經送達（請先確認）。若沒有收到，可能是網路較慢，"
+                "請稍後再試。",
+                link_preview_options=source_link_options(),
+            )
+            return
         except TelegramError:
             logger.warning("快取傳送發生錯誤，改為重新下載", exc_info=True)
         logger.info("快取無法使用，重新下載：%s", media_url)
