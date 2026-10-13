@@ -1137,10 +1137,22 @@ an *application*, and Telegram ties them to your account.
    international format (e.g. `+886912345678`). Telegram sends a login code — look for
    it in the **Telegram app**, in the chat from *Telegram* (not by SMS).
 2. Go to **API development tools** (<https://my.telegram.org/apps>).
-3. If no app exists, fill in the short form. Any values will do; nothing is reviewed:
-   - **App title** / **Short name** — anything, e.g. `BotAPI` / `botapi`
-   - **URL** — may be left empty
-   - **Platform** — *Desktop*, *Other*, whatever fits
+3. If no app exists, fill in the short form. Nothing is reviewed, but the fields **are**
+   validated, and a rejected field shows only a generic `ERROR` dialog — so get these
+   right the first time rather than burning attempts:
+
+   | Field | Rule | Example |
+   | --- | --- | --- |
+   | **App title** | up to 64 chars; no `@`, `#` or other symbols; avoid the reserved word *telegram* | `shiroko9008parselinkbot` |
+   | **Short name** | **lowercase letters and digits only**, 5–32 chars, no spaces or hyphens | `skr9008plbot` |
+   | **URL** | may be left empty | |
+   | **Platform** | pick one, e.g. *Desktop* | |
+
+   **The short name is lowercase-only**, which is the rule most easily missed: the page's
+   own hint says only *"alphanumeric, 5–32 characters"* and does **not** mention case, so
+   `skr9008PLBot` looks valid and is refused. The submission then sits on *Saving…* and
+   raises `my.telegram.org 顯示 ERROR`.
+
 4. Submit. The page then shows:
    - **App api_id** — a number, e.g. `1234567`
    - **App api_hash** — 32 hex characters, e.g. `0123456789abcdef0123456789abcdef`
