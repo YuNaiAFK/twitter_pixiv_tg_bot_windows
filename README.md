@@ -1388,6 +1388,60 @@ bot's own HTTP calls need a proxy instead — which is a different problem, and 
 host proxy on `127.0.0.1:7897` already solves when `socksio` is installed
 (`pip install "python-telegram-bot[socks]"`).
 
+### Making it work on a filtered network (transparent SOCKS5)
+Where Telegram's MTProto hosts are filtered, the upstream image cannot log in: it starts,
+looks healthy, and hangs on `getMe` with an empty log — easily mistaken for a wrong
+`api_id`. `TDLib` **ignores proxy environment variables**, and the server's own
+`--proxy` is webhook-only, so no configuration of the upstream image fixes it.
+
+`Dockerfile.bot-api-proxy` wraps that image and adds the one thing that works:
+
+| Piece | Role |
+| --- | --- |
+| `redsocks` | listens locally, relays through an upstream SOCKS5 proxy |
+| `iptables` NAT rules | send everything bound for Telegram's ranges to redsocks |
+
+TDLib is never told anything, so there is nothing for it to ignore. The Telegram
+**ranges** are redirected whole rather than by address list, because TDLib fetches the
+current data-centre addresses at runtime and keeps discovering more — a list would work
+until it silently did not. `NET_ADMIN` is required and is the only added capability.
+
+```ini
+TELEGRAM_MT_PROXY=socks5://<host-ip>:17900
+```
+
+**The host proxy must be reachable from a container**, and that is the part that trips
+people up. This proxy binds to `127.0.0.1` only, so a container cannot use it, and
+`host.docker.internal` does not help — it resolves to the Docker VM's address, where
+nothing listens. `host_proxy_relay.py` bridges that: it accepts on every interface and
+forwards the bytes to the loopback proxy, unchanged.
+
+```sh
+python host_proxy_relay.py            # 0.0.0.0:17900 -> 127.0.0.1:7897
+```
+
+It is a **TCP relay, not a proxy** — the client still performs the SOCKS5 handshake — and
+it needs no dependencies.
+
+**An inbound firewall rule is required**, because the relay must accept connections from
+the container and Windows blocks them by default. Without it the container reports the
+relay as unreachable while the relay works perfectly from the host, which is a
+confusing pair of facts to hold at once:
+
+```powershell
+# Administrator PowerShell, once:
+New-NetFirewallRule -DisplayName "bot-api relay" -Direction Inbound `
+  -Protocol TCP -LocalPort 17900 -Action Allow
+```
+
+Diagnose the three layers separately, in this order:
+
+```sh
+# 1. relay works locally?      (host)      -> SOCKS5 CONNECT ok
+# 2. container reaches relay?  (container) -> /dev/tcp/<host-ip>/17900
+# 3. server logs in?           (host)      -> getMe returns 200
+```
+
 ### `--local` is the flag that matters
 Without it the server still enforces the public 50 MB limit, so switching gains
 nothing. `TELEGRAM_LOCAL=1` is the bot's own statement that the server runs that way —

@@ -27,9 +27,22 @@
 
 services:
   telegram-bot-api:
-    image: aiogram/telegram-bot-api:latest
+    # Built locally from Dockerfile.bot-api-proxy, which wraps the upstream image and
+    # adds transparent SOCKS5 redirection for TDLib's MTProto traffic. The upstream
+    # image alone cannot reach Telegram on this network, and no amount of configuration
+    # fixes that: TDLib ignores proxy environment variables and --proxy is webhook-only.
+    build:
+      context: .
+      dockerfile: Dockerfile.bot-api-proxy
+      # The base images are already local; asking the registry for metadata fails here
+      # because Docker Hub is filtered too.
+      pull: false
+    image: telegram-bot-api-proxied:local
     container_name: telegram-bot-api
     restart: unless-stopped
+    # iptables needs this, and only this, to install the redirect rules.
+    cap_add:
+      - NET_ADMIN
     # Host networking is not used: the port is published instead, so the bot on this
     # Windows host reaches the server at 127.0.0.1:8081 like any other local service.
     ports:
@@ -44,18 +57,18 @@ services:
       TELEGRAM_WORK_DIR: /var/lib/telegram-bot-api
       TELEGRAM_TEMP_DIR: /tmp/telegram-bot-api
       TELEGRAM_VERBOSITY: "1"
-      # The Bot API server speaks MTProto to Telegram, and on this network plain
-      # api.telegram.org works while MTProto does not - the container had full egress
-      # and still hung for minutes on login. The host already runs a proxy for exactly
-      # that reason, so the server is pointed at it.
+      # Where the transparent redirection sends Telegram traffic. Read by
+      # proxy-entrypoint.sh, which relays it with redsocks and NAT rules.
       #
-      # The image maps this onto --proxy, and supports http, socks5 and mtproxy URLs.
       # `host.docker.internal` is how a container reaches the host on Docker Desktop;
       # 127.0.0.1 inside the container would be the container itself.
       #
-      # Leave it empty if your network does not need a proxy, and note the value is
-      # interpolated from .env so no address is hardcoded here.
-      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
+      # Leave empty to connect directly - correct on a network that does not filter
+      # Telegram, and the container will then start normally.
+      #
+      # Note this is deliberately NOT the server's own --proxy flag: that one is
+      # webhook-only and cannot route the MTProto login.
+      TELEGRAM_MT_PROXY: ${TELEGRAM_MT_PROXY:-}
     volumes:
       # A **named volume**, not a bind mount to a Windows directory.
       #

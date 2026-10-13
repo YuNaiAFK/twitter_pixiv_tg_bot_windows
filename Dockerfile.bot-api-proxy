@@ -1,0 +1,64 @@
+# The Bot API server, plus transparent SOCKS5 redirection for its MTProto traffic.
+#
+# Why this exists
+# ---------------
+# The upstream image cannot reach Telegram on a filtered network. TDLib speaks MTProto
+# directly to Telegram's data centres and **ignores proxy environment variables**, and
+# the server's own --proxy flag is documented as webhook-only:
+#
+#     --proxy=<arg>   HTTP proxy server for outgoing webhook requests
+#
+# So on a network that filters Telegram - which is why the host already runs a proxy -
+# the server starts, looks healthy, and then hangs on login with a silent log. That
+# reads as bad credentials and is not.
+#
+# What this adds
+# --------------
+# `redsocks` plus a NAT rule: anything the container sends to Telegram's address ranges
+# is redirected to a local port that relays it through a SOCKS5 proxy. TDLib needs no
+# knowledge of any of it, so there is nothing for it to ignore.
+#
+# The Telegram ranges are redirected **whole** rather than by an address list, because
+# TDLib fetches the current data-centre addresses at runtime and keeps discovering more -
+# a fixed list would work until the moment it did not.
+#
+# The binary is copied from the upstream image, so this adds tooling around the same
+# server rather than replacing it.
+
+FROM aiogram/telegram-bot-api:latest AS upstream
+
+# `alpine:latest` rather than a pinned tag on purpose: this build runs on a network that
+# filters Docker Hub, and the pinned tag needs a metadata lookup for an image that is not
+# cached. The local tag is already present, so the build proceeds offline for the base.
+FROM alpine:latest
+
+# redsocks does the transparent-to-SOCKS5 relay. libstdc++ and libgcc are not optional:
+# the server binary is linked against the C++ runtime, and without them it fails at
+# startup with a wall of
+#
+#   Error relocating /usr/local/bin/telegram-bot-api: _ZSt...: symbol not found
+#
+# which reads like a corrupt build and is only a missing library.
+RUN apk add --no-cache \
+        iptables \
+        redsocks \
+        ca-certificates \
+        tzdata \
+        libstdc++ \
+        libgcc \
+    && addgroup -g 101 -S telegram-bot-api \
+    && adduser -S -D -H -u 101 -h /var/lib/telegram-bot-api \
+               -s /sbin/nologin -G telegram-bot-api telegram-bot-api
+
+COPY --from=upstream /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+# The upstream entrypoint is copied too, because it is what translates TELEGRAM_LOCAL
+# into --local and the rest of the documented environment contract. Re-implementing that
+# here would mean the wrapper drifts from the image it wraps.
+COPY --from=upstream /docker-entrypoint.sh /docker-entrypoint.sh
+COPY proxy-entrypoint.sh /proxy-entrypoint.sh
+RUN chmod +x /proxy-entrypoint.sh /docker-entrypoint.sh
+
+# Ports the upstream image exposes: 8081 is the API, 8082 statistics.
+EXPOSE 8081 8082
+
+ENTRYPOINT ["/proxy-entrypoint.sh"]
