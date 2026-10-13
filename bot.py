@@ -1815,6 +1815,44 @@ def detect_spoiler(url: str, platform: str | None) -> bool:
         return False
 
 
+def media_delivery(file_path: Path, *, prefer_original: bool,
+                   adult: bool) -> tuple[bool, bool]:
+    """
+    How one file should be sent. Returns ``(as_document, spoiler)``.
+
+    Requested policy: **an ordinary work goes as a document so the original is
+    preserved, and an adult work goes as a photo so Telegram will blur it.**
+
+    That combination is not a preference - it is forced by Telegram:
+
+    * ``has_spoiler`` **blurs photos**, and Telegram's clients do not blur documents.
+      A document album added unblurred earlier for exactly this reason.
+    * ``reply_photo`` re-encodes the image and renames it ``.jpg``, so a photo upload is
+      never byte-identical to the original. Sending an ordinary work as a photo would
+      therefore silently break the "original files" guarantee that was asked for first.
+    * ``reply_photo`` is capped at ``PHOTO_LIMIT_BYTES`` (10 MB) regardless of the
+      self-hosted server's 2000 MB ceiling, because that limit is Telegram's, not the
+      server's.
+
+    So an adult work larger than the photo limit **cannot** be blurred. It is sent as a
+    document instead of being dropped or shrunk: the artwork still arrives, and the
+    caller notes why it is unblurred. Failing the request to protect the blur would be
+    the wrong trade.
+    """
+    suffix = file_path.suffix.lower()
+    if suffix not in IMAGE_EXTENSIONS:
+        # Not an image: no blur concept applies, and the original is all that matters.
+        return True, False
+    if not adult:
+        # Ordinary work: the original file, untouched.
+        return prefer_original, False
+    if file_path.stat().st_size <= PHOTO_LIMIT_BYTES:
+        # Adult and small enough: send as a photo so the blur applies.
+        return False, True
+    # Adult but too large for a photo: deliver it, unblurred, rather than lose it.
+    return True, False
+
+
 def admin_hint(platform: str | None = None) -> str:
     """
     Operator-facing diagnosis, shown only when an administrator asks.
@@ -3252,28 +3290,40 @@ async def send_media_album(message, files: list[Path], source_url: str,
     try:
         media = []
         for index, file_path in enumerate(files):
-            builder = InputMediaDocument if as_document else InputMediaPhoto
+            # Per-item, because the policy is per file: an adult work needs a photo for
+            # the blur to apply, an ordinary one needs a document to stay original.
+            item_is_document, item_spoiler = media_delivery(
+                file_path, prefer_original=as_document, adult=spoiler)
+            builder = InputMediaDocument if item_is_document else InputMediaPhoto
             handle = file_path.open("rb")
             handles.append(handle)
             # Only the first item carries text: Telegram rejects a media group whose
             # items all have captions, and one link is what is wanted anyway.
             item_kwargs = {"media": handle,
                            "caption": caption if index == 0 else None}
-            if spoiler and not as_document:
+            if item_spoiler and not item_is_document:
                 # InputMediaPhoto declares has_spoiler, so it is a named argument and
                 # PTB serialises it itself.
                 item_kwargs["has_spoiler"] = True
-            if spoiler and as_document:
-                # InputMediaDocument does NOT declare has_spoiler - only api_kwargs,
-                # which PTB forwards verbatim. Telegram's Bot API does document the
-                # field on InputMediaDocument, so this is the only way to ask for a blur
-                # on a document album. Note that Telegram does not blur documents in the
-                # clients, so a blurred Pixiv album still shows its files unblurred;
-                # the per-file path uses reply_document, which does accept has_spoiler.
+            elif item_spoiler and item_is_document:
+                # Unreachable through media_delivery, which never pairs a document with
+                # a blur - Telegram does not blur documents. Kept as a guard so a future
+                # change cannot silently send an unblurred "blurred" album item.
                 item_kwargs["api_kwargs"] = {"has_spoiler": True}
             media.append(builder(**item_kwargs))
+        if len({type(item).__name__ for item in media}) > 1:
+            # A media group must be all photos or all documents. media_delivery can mix
+            # them when only some pages of adult work fit the photo limit, so say so
+            # rather than let Telegram reject the album.
+            raise TelegramError(
+                "相簿中的項目類型不一致（photo 與 document 混用），改為逐個傳送。")
 
-        kind = "document" if as_document else "photo"
+        # Read off the built items rather than from as_document: the per-file policy can
+        # turn an adult album into photos even though the work is sent "as original", and
+        # a log that said "document" there would misreport what actually went out.
+        kind = "photo" if media and isinstance(media[0], InputMediaPhoto) else "document"
+        blurred = "（已加模糊）" if any(
+            getattr(item, "has_spoiler", False) for item in media) else ""
         try:
             await _reply_media_group(message, media, keyboard)
         except TimedOut:
@@ -3303,7 +3353,7 @@ async def send_media_album(message, files: list[Path], source_url: str,
                 logger.warning("相簿傳送失敗（%s × %s）：%s",
                                kind, len(media), retry_exc)
                 raise
-        logger.info("已以單一相簿傳送 %s 個%s%s", len(media), kind,
+        logger.info("已以單一相簿傳送 %s 個%s%s%s", len(media), kind, blurred,
                     "（第一張帶原始連結）" if caption else "")
         return True
     finally:
@@ -3493,12 +3543,14 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 notes.append("相簿傳送失敗，已改為逐個傳送")
         for file_path in chunk:
             try:
+                as_doc, item_spoiler = media_delivery(
+                    file_path, prefer_original=as_document, adult=spoiler)
                 if await send_single_media(
                     message, file_path, source_url, temp_dir,
-                    prefer_original=as_document,
+                    prefer_original=as_doc,
                     keyboard=None,
                     caption=None if link_carried else caption,
-                    spoiler=spoiler,
+                    spoiler=item_spoiler,
                 ):
                     sent += 1
                     link_carried = True
@@ -3513,12 +3565,14 @@ async def send_original_files(message, files: list[Path], source_url: str,
 
     for file_path in oversized + others:
         try:
+            as_doc, item_spoiler = media_delivery(
+                file_path, prefer_original=as_document, adult=spoiler)
             if await send_single_media(
                 message, file_path, source_url, temp_dir,
-                prefer_original=as_document,
+                prefer_original=as_doc,
                 keyboard=None,
                 caption=None if link_carried else caption,
-                spoiler=spoiler,
+                spoiler=item_spoiler,
             ):
                 sent += 1
                 link_carried = True

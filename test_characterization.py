@@ -547,6 +547,42 @@ check("the album uses the right channel per media type",
       and 'item_kwargs["api_kwargs"] = {"has_spoiler": True}' in _album_src3,
       "using one channel for both would silently drop the flag")
 
+# Requested policy: an ordinary work goes as a document so the original is preserved,
+# an adult one goes as a photo so Telegram will blur it. Forced by Telegram - has_spoiler
+# blurs photos only, and reply_photo re-encodes, so an ordinary work sent as a photo
+# would quietly stop being the original.
+_delivery_work = Path(tempfile.mkdtemp(prefix="dsh-delivery-"))
+try:
+    _small = _delivery_work / "s_p0.png"
+    _small.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 5_000_000)
+    _big = _delivery_work / "b_p0.png"
+    _big.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 12_000_000)
+    _vid = _delivery_work / "v_p0.mp4"
+    _vid.write_bytes(b"x" * 1000)
+
+    for _path, _pref, _adult, _want, _label in (
+            (_small, True, False, (True, False), "ordinary keeps the original document"),
+            (_small, True, True, (False, True), "adult becomes a photo, blurred"),
+            (_big, True, True, (True, False),
+             "adult over the 10 MB photo limit still arrives, unblurred"),
+            (_vid, True, True, (True, False), "a video has no blur and stays original"),
+    ):
+        check(f"delivery: {_label}",
+              bot.media_delivery(_path, prefer_original=_pref, adult=_adult) == _want,
+              f"got {bot.media_delivery(_path, prefer_original=_pref, adult=_adult)}")
+finally:
+    shutil.rmtree(_delivery_work, ignore_errors=True)
+
+check("the photo limit is Telegram's 10 MB, not the server's",
+      bot.PHOTO_LIMIT_BYTES == 10 * 1024 * 1024,
+      "the self-hosted server's 2000 MB does not apply to reply_photo")
+check("a mixed album is refused rather than sent",
+      "項目類型不一致" in _album_src3,
+      "a media group must be all photos or all documents")
+check("the album log reads the real kind, not the request",
+      "isinstance(media[0], InputMediaPhoto)" in _album_src3,
+      "an adult album is photos even though the work is sent as original")
+
 # The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
 # generic "gallery deleted" message would be actively misleading.
 _REFUSAL = "Key missing, or incorrect key provided."
