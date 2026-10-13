@@ -1,0 +1,50 @@
+# Self-hosted Telegram Bot API server, via the aiogram image.
+#
+#   https://hub.docker.com/r/aiogram/telegram-bot-api
+#
+# This is what raises the bot's upload ceiling from 50 MB to 2000 MB and lets it send
+# by local path, so an e-hentai original archive (~148 MB and up) can actually arrive.
+#
+# The environment variables below are the ones the image's own entrypoint translates
+# into command-line arguments - they are not guesses. In particular TELEGRAM_LOCAL,
+# when set to anything non-empty, is passed through as --local:
+#
+#     append_flag_from_env "TELEGRAM_LOCAL" "--local"
+#
+# --local is the flag that matters. Without it the server still enforces the public
+# 50 MB limit and refuses local paths, so switching would gain nothing.
+#
+# Usage:
+#   1. Put TELEGRAM_API_ID and TELEGRAM_API_HASH in .env (see .env.example).
+#      These come from https://my.telegram.org -> API development tools, and are the
+#      application's credentials - not the bot token.
+#   2. docker compose up -d
+#   3. Point the bot at it in .env:  TELEGRAM_API_BASE=http://127.0.0.1:8081
+#                                    TELEGRAM_LOCAL=1
+#   4. Restart the bot with run.bat.
+#
+# Verify with:  docker compose logs -f
+
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    # Host networking is not used: the port is published instead, so the bot on this
+    # Windows host reaches the server at 127.0.0.1:8081 like any other local service.
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID in .env}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH in .env}
+      # Any non-empty value becomes --local. This is the whole point of the switch.
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_HTTP_PORT: "8081"
+      # The image defaults these; stated explicitly so the volume below matches.
+      TELEGRAM_WORK_DIR: /var/lib/telegram-bot-api
+      TELEGRAM_TEMP_DIR: /tmp/telegram-bot-api
+      TELEGRAM_VERBOSITY: "1"
+    volumes:
+      # Keeps the server's state across restarts, so the bot does not have to re-login
+      # every time the container is recreated.
+      - ./bot-api-data:/var/lib/telegram-bot-api
