@@ -937,6 +937,10 @@ async def send_cached_media(message, status, url: str, payload: dict,
         sent, note = await send_original_files(
             message, files, url, scratch,
             as_document=(platform == "pixiv"),
+            # The same platform split as a fresh download: only X/Twitter carries the
+            # source link. Replaying a cached Pixiv link must not grow a link that the
+            # original send did not have.
+            attach_link=(platform != "pixiv"),
         )
     except TelegramError as exc:
         logger.warning("從快取傳送失敗，將重新下載：%s", exc)
@@ -2956,7 +2960,7 @@ async def send_media_album(message, files: list[Path], source_url: str,
                                kind, len(media), retry_exc)
                 raise
         logger.info("已以單一相簿傳送 %s 個%s%s", len(media), kind,
-                    "（第一張帶原始連結）")
+                    "（第一張帶原始連結）" if caption else "")
         return True
     finally:
         for handle in handles:
@@ -3049,15 +3053,23 @@ async def send_source_link(message, source_note: str):
 
 async def send_original_files(message, files: list[Path], source_url: str,
                               temp_dir: Path,
-                              as_document: bool = True) -> tuple[int, str]:
+                              as_document: bool = True,
+                              attach_link: bool = True) -> tuple[int, str]:
     """
-    Send downloaded files with the source link **above** them. Returns (sent, note).
+    Send downloaded files, optionally with the source link above them.
+    Returns (sent, note).
 
-    The link travels inside the first message as its caption, so it reads above the
-    images, plus a url button on that same message so it stays reachable however the
-    client renders the caption. Requested explicitly after both alternatives were tried:
-    a separate message lands above but costs a second message, and a button alone sits
-    below the images.
+    When ``attach_link`` is set, the link travels inside the first message as its
+    caption, so it reads above the images, plus a url button on that same message so it
+    stays reachable however the client renders the caption. Requested explicitly after
+    both alternatives were tried: a separate message lands above but costs a second
+    message, and a button alone sits below the images.
+
+    ``attach_link=False`` sends the media with **no** link and no button. Requested for
+    Pixiv specifically: only X/Twitter should carry the source link. That is why this is
+    a parameter rather than a global - the two platforms are configured differently, and
+    the cached replay path has to respect the same split, or a repeat of a cached Pixiv
+    link would suddenly grow a link that a fresh download does not have.
 
     ``as_document`` (the default) sends images as documents, which is the only
     way Telegram passes a file through untouched; the Pixiv path relies on that
@@ -3077,8 +3089,10 @@ async def send_original_files(message, files: list[Path], source_url: str,
     notes = []
     # Whether the source link has already been carried by a sent message. The link is
     # what makes the result self-describing, so it is attached to whichever message
-    # goes out first and never repeated.
-    link_carried = False
+    # goes out first and never repeated. With attach_link off this stays False and
+    # nothing is attached anywhere.
+    link_carried = not attach_link
+    caption = build_caption(source_url) if attach_link else None
 
     images = [path for path in files if path.suffix.lower() in IMAGE_EXTENSIONS]
     others = [path for path in files if path.suffix.lower() not in IMAGE_EXTENSIONS]
@@ -3117,7 +3131,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                     prefer_original=as_document,
                     keyboard=None if link_carried
                     else build_source_keyboard(source_url),
-                    caption=None if link_carried else build_caption(source_url),
+                    caption=None if link_carried else caption,
                 ):
                     sent += 1
                     link_carried = True
@@ -3132,7 +3146,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 prefer_original=as_document,
                 keyboard=None if link_carried
                 else build_source_keyboard(source_url),
-                caption=None if link_carried else build_caption(source_url),
+                caption=None if link_carried else caption,
             ):
                 sent += 1
                 link_carried = True
@@ -3143,8 +3157,8 @@ async def send_original_files(message, files: list[Path], source_url: str,
     # Nothing carried the link only if there was nothing to send, or every send failed.
     # The text message is still the honest fallback in that case, rather than leaving
     # the user with images and no way back to the source.
-    if not link_carried and sent == 0:
-        await send_source_link(message, build_caption(source_url))
+    if attach_link and not link_carried and sent == 0:
+        await send_source_link(message, caption or build_caption(source_url))
 
     return sent, ("；".join(dict.fromkeys(notes)) if notes else "")
 
@@ -5030,7 +5044,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # A ZIP is deliberately not used, and no image is downscaled, so the
             # bytes the recipient gets match what gallery-dl downloaded.
             sent_count, album_note = await send_original_files(
-                message, media_files, media_url, temp_dir
+                message, media_files, media_url, temp_dir,
+                # Requested: Pixiv sends the images alone, with no source link and no
+                # button. Only X/Twitter carries the link.
+                attach_link=False,
             )
 
             summary = f"Pixiv 解析完成，已傳送原圖 {sent_count}/{len(media_files)} 個檔案。"
@@ -5050,7 +5067,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # is re-encoded, which is what users expect from a post preview; the
         # byte-exact "original" path is reserved for Pixiv artwork. ---
         sent_count, album_note = await send_original_files(
-            message, media_files, media_url, temp_dir, as_document=False
+            message, media_files, media_url, temp_dir, as_document=False,
+            # Requested: X/Twitter shows the source link, Pixiv does not.
+            attach_link=True,
         )
 
         summary = f"X/Twitter 解析完成，已傳送 {sent_count}/{len(media_files)} 個檔案。"

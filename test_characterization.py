@@ -274,13 +274,33 @@ check("a single send also carries the link as a caption",
       "caption" in inspect.signature(bot.send_single_media).parameters,
       "a single page would show no link above its image")
 check("single-send callers actually pass the caption",
-      "caption=None if link_carried else build_caption(source_url)"
+      "caption=None if link_carried else caption"
       in inspect.getsource(bot.send_original_files),
       "the parameter would exist but never be used")
 check("no separate link message is posted when files were sent",
-      "if not link_carried and sent == 0" in inspect.getsource(
+      "if attach_link and not link_carried and sent == 0" in inspect.getsource(
           bot.send_original_files),
       "the link would appear twice, in two messages")
+
+# Requested: only X/Twitter carries the source link; Pixiv shows the images alone.
+_attach = inspect.signature(bot.send_original_files).parameters
+check("attach_link is a per-call option, not a global",
+      "attach_link" in _attach,
+      "the two platforms could not be configured differently")
+_pixiv_src = inspect.getsource(bot.handle_message)
+check("the Pixiv branch sends no link",
+      "attach_link=False" in _pixiv_src, _pixiv_src[-600:])
+check("the X/Twitter branch sends the link",
+      "attach_link=True" in _pixiv_src, _pixiv_src[-600:])
+# The cached replay must follow the same split, or a repeat of a cached Pixiv link
+# would grow a link the original send did not have.
+_cache_src = inspect.getsource(bot.send_cached_media)
+check("the cached replay splits by platform too",
+      'attach_link=(platform != "pixiv")' in _cache_src, _cache_src[:400])
+check("attaching nothing suppresses the button as well",
+      "link_carried = not attach_link" in inspect.getsource(
+          bot.send_original_files),
+      "a link-less send would still carry a source button")
 check("reply_markup is sent through api_kwargs",
       "api_kwargs" in "".join(inspect.getsource(bot._reply_media_group)),
       "PTB 22.8 has no reply_markup parameter on reply_media_group")

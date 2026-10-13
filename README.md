@@ -298,16 +298,25 @@ Nothing is downloaded until a button is pressed, so a link you are only curious
 about costs one metadata request.
 
 ### Layout: the source link is the first item's caption
-A multi-page artwork is delivered as **one message**, with the source link as the
-**first item's caption**, so it reads above the images:
+**Only X/Twitter carries the source link. Pixiv sends the images alone.** Requested
+explicitly, and it is a per-call option (`attach_link`) rather than a global, because
+the two platforms are configured differently.
+
+X/Twitter — the link is the **first item's caption**, so it reads above the images:
 
 ```
-[ 原始連結：https://www.pixiv.net/artworks/147895535 ]   ← caption on item 0
+[ 原始連結：https://x.com/pohitashi/status/... ]   ← caption on item 0
 [ 相簿：page0 · page1 · page2 ]
-[ 🔗 pixiv.net/artworks/147895535 ]                      ← same message, button
+[ 🔗 x.com/pohitashi/status/... ]                  ← same message, button
 ```
 
-Requested explicitly, after both alternatives had been tried:
+Pixiv — no caption, no button:
+
+```
+[ 相簿：page0 · page1 · page2 ]
+```
+
+The three layouts that were tried, and why this one:
 
 | Approach | Where the link lands | Cost |
 | --- | --- | --- |
@@ -327,6 +336,10 @@ is the best that can be done from here.
 The caption and button go on the **first album only**, so a 30-page work does not carry
 the same link on all three of its messages. A separate text message is now only a
 fallback for the case where nothing was sent at all.
+
+**The cached replay follows the same split.** `send_cached_media` passes
+`attach_link=(platform != "pixiv")`, so a repeat of a cached Pixiv link does not grow a
+link that the original send did not have.
 
 ### One message per request, with the cover in it
 The gallery's cover becomes the body of the reply, so the result is **one message**:
