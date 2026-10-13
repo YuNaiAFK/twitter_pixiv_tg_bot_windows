@@ -1397,6 +1397,53 @@ The helper returns the proxy in `http://host:port` form even though the port spe
 as well: httpx needs the `socksio` extra for `socks5://`, and HTTP CONNECT works here
 without that dependency.
 
+### The viewer-link pattern was hard-coded to e-hentai.org
+`_VIEWER_LINK_RE` matched only `https://e-hentai.org/s/...`, so **every exhentai gallery
+had zero viewer links** and the feature failed there with "讀不到畫廊的圖片清單。連結可能有誤，
+或畫廊已被刪除。" - a message that sends the user looking for a broken link when the page
+was fine:
+
+    e-hentai.org   https://e-hentai.org/s/...   -> 27 matches
+    exhentai.org   https://exhentai.org/s/...   ->  0 matches
+
+The pattern now accepts both hosts. A test pins both, and that an unrelated host is not
+mistaken for one.
+
+### exhentai paginates at 20 - and 20 happened to equal MAX_FILES
+exhentai shows 20 images per page ("Showing 1 - 20 of 27 images") while e-hentai returns
+the whole gallery at once. The cap was applied **inside** the paging loop:
+
+    for page_index in range(1, pages):
+        if len(links) >= max_images:
+            break
+
+Since `max_images` is `MAX_FILES` and exhentai's page size is exactly 20, the first page
+filled the budget and the loop broke immediately. **The pagination code was dead on
+arrival** and a 27-image gallery stayed at 20. The cap is now applied after paging.
+
+A gallery larger than the cap is also **reported** rather than silently shortened - the
+progress message keeps "（作品共 27 張，單次最多 20 張）" on its final edit, which matters
+because that is the copy the user actually reads. Before, the truncation was invisible;
+use `歸檔` for the complete set.
+
+### urllib does not read the Windows registry proxy either
+The live credential check used `urllib.request.urlopen`, which honours only the
+`http_proxy` environment variables - not the registry. Every check therefore failed with
+"URLError: handshake operation timed out" and reported **valid credentials as
+unverifiable**: measured 30.4s with X/Twitter and Pixiv both "無法連線" while the same
+cookies downloaded perfectly. It now uses the same proxied httpx client as everything
+else, and reports in 2.8s with all three checks passing.
+
+The same omission was in `probe_telegram_limits`, whose `httpx.get` had no proxy: the
+probe failed, was reported as "using the public API", and silently dropped the upload
+ceiling from 2000 MB back to 50 MB.
+
+### A note on diagnosing this class of problem
+Every one of the failures above was originally blamed on the remote site. The check that
+settled each one was **comparing our own request against a known-good one** - a browser,
+or the same call with `proxy=` passed explicitly. When a site works in a browser and not
+from code, suspect the client's configuration before the site's policies.
+
 ### e-hentai's 39-byte refusal is a real answer, not a timeout
 Separately from the proxy problem, e-hentai answers some requests with **HTTP 200** and a
 39-byte body:

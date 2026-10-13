@@ -552,20 +552,59 @@ def _read_cookie_header(path) -> str:
 
 # -------------------- viewer pages (image URLs) --------------------
 
-_VIEWER_LINK_RE = re.compile(r'<a href="(https://e-hentai\.org/s/[^"]+)"')
+# Both hosts, because the domain used to be hard-coded to e-hentai.org and that made the
+# whole viewer-page feature silently dead on exhentai (the 裡站):
+#
+#   e-hentai.org   https://e-hentai.org/s/...  -> 27 matches
+#   exhentai.org   https://exhentai.org/s/...  ->  0 matches
+#
+# The failure surfaced as "讀不到畫廊的圖片清單。連結可能有誤，或畫廊已被刪除。" - the page
+# was fine, the pattern simply never matched it.
+_VIEWER_LINK_RE = re.compile(
+    r'<a href="(https://(?:e-hentai\.org|exhentai\.org)/s/[^"]+)"')
 _VIEWER_IMG_RE = re.compile(r'<img id="img" src="([^"]+)"')
 _VIEWER_ORIGINAL_RE = re.compile(r'href="(https://[^"]*fullimg[^"]*)"')
+# "Showing 1 - 20 of 27 images" - exhentai paginates at 20 per page while e-hentai
+# returns everything at once, so the total has to be read and further pages followed or
+# a 27-page gallery silently yields only 20.
+_SHOWING_RE = re.compile(r"Showing\s+\d+\s*-\s*\d+\s+of\s+(\d+)", re.I)
 
 
 def gallery_viewer_links(page_html: str) -> list[str]:
     """
     Every viewer-page link on a gallery page, in page order.
 
-    e-hentai lists the whole grid on one page even for a 53-page gallery, so no
-    paging requests are needed. The order matters: it is the gallery's own page
-    order.
+    The order matters: it is the gallery's own page order.
+
+    **A gallery may be paginated, and this only reads the page it is given.**
+    ``gallery_page_count`` reports how many pages the site says there are, and the caller
+    follows the rest with ``?p=N``. e-hentai serves its whole grid in one response even
+    for a 53-page gallery, but exhentai shows 20 at a time - so reading only the first
+    page turned a 27-image gallery into a 20-image Telegraph page, silently.
     """
     return list(dict.fromkeys(_VIEWER_LINK_RE.findall(page_html)))
+
+
+def gallery_page_count(page_html: str, links_on_this_page: int) -> int:
+    """
+    How many gallery pages the site says this gallery has, at least 1.
+
+    Read from "Showing 1 - 20 of 27 images". Returns 1 when the text is absent or does not
+    exceed what this page already holds, so a single-page gallery needs no extra request.
+    """
+    match = _SHOWING_RE.search(page_html or "")
+    if not match:
+        return 1
+    try:
+        total = int(match.group(1))
+    except (TypeError, ValueError):
+        return 1
+    if total <= links_on_this_page:
+        return 1
+    # 20 per page as observed; derive it from this page rather than hard-coding, so a
+    # different page size still divides correctly.
+    per_page = max(1, links_on_this_page)
+    return (total + per_page - 1) // per_page
 
 
 def fetch_gallery_images(
@@ -619,6 +658,47 @@ def fetch_gallery_images(
             raise EhentaiError(
                 "讀不到畫廊的圖片清單。連結可能有誤，或畫廊已被刪除。"
             )
+
+        # Follow ?p=1.. when the site says there are more pages than this one holds.
+        # exhentai paginates at 20 while e-hentai returns everything at once.
+        #
+        # The cap is NOT applied while paging. Doing so looked equivalent and was not:
+        # exhentai's page size is exactly 20, which is exactly MAX_FILES, so the first
+        # page filled the budget and the loop broke immediately - the pagination code was
+        # dead on arrival and a 27-image gallery stayed 20. Collect everything, then cap.
+        pages = gallery_page_count(response.text, len(links))
+        total_available = len(links)
+        for page_index in range(1, pages):
+            try:
+                more = client.get(f"{url}?p={page_index}", headers=headers)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("讀取畫廊第 %s 頁失敗：%s", page_index + 1, exc)
+                break
+            if more.status_code >= 400:
+                logger.warning("畫廊第 %s 頁回應 HTTP %s", page_index + 1, more.status_code)
+                break
+            extra = [link for link in gallery_viewer_links(more.text) if link not in links]
+            if not extra:
+                # Nothing new: stop rather than loop over identical pages.
+                break
+            links.extend(extra)
+            logger.info("畫廊分頁：第 %s 頁補上 %s 張（共 %s）",
+                        page_index + 1, len(extra), len(links))
+
+        total_available = max(total_available, len(links))
+        if total_available > max_images:
+            # Say so rather than silently shipping a short gallery. Before this, a
+            # 27-image gallery produced a 20-image Telegraph page and nothing anywhere
+            # said 7 were missing.
+            logger.warning("畫廊共 %s 張，超過單次上限 %s 張，只處理前 %s 張",
+                           total_available, max_images, max_images)
+            if progress is not None:
+                try:
+                    progress(0, max_images, total_available)
+                except TypeError:
+                    # Older callers take (done, total) only.
+                    progress(0, max_images)
+
         links = links[:max_images]
 
         # Collected per page first, then aligned, so a page without an original

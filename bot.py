@@ -1406,9 +1406,18 @@ def verify_credentials_live(timeout: float = 30.0) -> list[tuple[str, bool | Non
       returns real data for this session. Note this proves the *session*, not that
       X will serve tweet content - X withholds that separately.
     * Pixiv: /ajax/user/extra uses PHPSESSID and returns the account's own counts.
+
+    **The proxy is passed explicitly, and that is the difference between this working and
+    lying.** It used urllib, which reads only the ``http_proxy`` environment variables and
+    NOT the Windows registry, so on this machine every check failed with
+    "URLError: handshake operation timed out" and reported **valid credentials as
+    unverifiable**. Measured before the fix: X/Twitter and Pixiv both "無法連線" after 30s,
+    while the same cookies downloaded perfectly through the proxy.
+
+    httpx is used now, for the same reason the rest of the code does: it takes ``proxy=``
+    explicitly, so the check tests the credential instead of the network.
     """
-    import urllib.error
-    import urllib.request
+    import httpx
 
     results = []
     user_agent = (
@@ -1421,12 +1430,12 @@ def verify_credentials_live(timeout: float = 30.0) -> list[tuple[str, bool | Non
     )
 
     def fetch(url, headers):
-        request = urllib.request.Request(url, headers=headers)
+        # httpx rather than urllib, with the proxy passed explicitly: urllib reads only
+        # the http_proxy environment variables, so it never reached these hosts here.
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, response.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read().decode("utf-8", "replace")[:200]
+            with httpx.Client(**ehentai.http_client_kwargs(timeout)) as client:
+                response = client.get(url, headers=headers)
+            return response.status_code, response.text
         except Exception as exc:  # noqa: BLE001
             return None, f"{type(exc).__name__}: {exc}"
 
@@ -5067,13 +5076,22 @@ async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
     queue: asyncio.Queue = asyncio.Queue()
     seen_progress = False
 
-    def report(done, observed_total):
+    def report(done, observed_total, available=None):
         # Called from a worker thread, so the queue must not block it.
-        loop.call_soon_threadsafe(queue.put_nowait, (done, observed_total or total))
+        #
+        # ``available`` is the gallery's real page count when the caller capped its work
+        # below it, so the bar can say "20/20 of 27" instead of implying the gallery has
+        # only 20 pages. Optional: most workers never send it.
+        loop.call_soon_threadsafe(queue.put_nowait,
+                                  (done, observed_total or total, available))
 
-    def render(done, observed):
-        return (f"{prefix}\n{progress_bar(done, observed or total)}\n"
-                "（可按「停止」中止）")
+    def render(done, observed, available=None):
+        text = f"{prefix}\n{progress_bar(done, observed or total)}\n"
+        if available and available > (observed or total):
+            # The gallery has more pages than this run will process, and saying so is the
+            # difference between "done" and "you got 20 of 27".
+            text += f"（作品共 {available} 張，單次最多 {observed or total} 張）\n"
+        return text + "（可按「停止」中止）"
 
     # Before the work starts, so the bar and the stop button appear at once.
     try:
@@ -5111,7 +5129,7 @@ async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
                     last_edit = now
                     try:
                         await status.edit_text(
-                            render(latest[0], latest[1]),
+                            render(latest[0], latest[1], latest[2] if len(latest) > 2 else None),
                             link_preview_options=source_link_options(),
                             reply_markup=stop_keyboard(gid, token),
                         )
@@ -5132,7 +5150,10 @@ async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
     if seen_progress:
         try:
             await status.edit_text(
-                render(latest[0], latest[1]),
+                # latest[2] carries "the gallery really has N pages" when the caller
+                # capped its work. Dropping it here erased the notice on the final edit,
+                # which is the one the user actually reads.
+                render(latest[0], latest[1], latest[2] if len(latest) > 2 else None),
                 link_preview_options=source_link_options(),
                 reply_markup=stop_keyboard(gid, token),
             )
@@ -5753,8 +5774,13 @@ def probe_telegram_limits() -> dict:
 
 
     try:
-        response = httpx.get(telegram_api_url("getMe"), timeout=10.0,
-                             follow_redirects=True)
+        # The proxy is set explicitly even for the self-hosted server, because the
+        # same call is used against api.telegram.org when no local server is configured
+        # - and there it needs one. Leaving it out made this probe fail, which was
+        # reported as "using the public API" and silently dropped the upload ceiling
+        # from 2000 MB back to 50 MB.
+        with httpx.Client(**ehentai.http_client_kwargs(10.0)) as client:
+            response = client.get(telegram_api_url("getMe"))
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:  # noqa: BLE001

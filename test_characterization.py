@@ -459,6 +459,46 @@ check("the gallery fetch uses the proxied client",
       "http_client_kwargs" in inspect.getsource(ehentai.fetch_gallery),
       "this is the first request of every gallery action")
 
+# The viewer-link pattern was hard-coded to e-hentai.org, so it matched nothing on
+# exhentai (the 裡站) and the whole feature was dead there:
+#   e-hentai.org  -> 27 matches
+#   exhentai.org  ->  0 matches, reported as "連結可能有誤，或畫廊已被刪除"
+_VIEW_HTML = (
+    '<a href="https://e-hentai.org/s/aaa/1-1">x</a>'
+    '<a href="https://exhentai.org/s/bbb/1-2">x</a>'
+    '<a href="https://example.com/s/ccc/1-3">x</a>'
+)
+_links = ehentai.gallery_viewer_links(_VIEW_HTML)
+check("viewer links match on e-hentai.org",
+      any("e-hentai.org/s/aaa" in l for l in _links), _links)
+check("viewer links match on exhentai.org",
+      any("exhentai.org/s/bbb" in l for l in _links),
+      f"the 裡站 was unsupported: {_links}")
+check("an unrelated host is not treated as a viewer link",
+      not any("example.com" in l for l in _links), _links)
+check("duplicate viewer links are collapsed",
+      len(ehentai.gallery_viewer_links(_VIEW_HTML + _VIEW_HTML)) == 2)
+
+# exhentai paginates at 20 per page while e-hentai returns everything at once. The cap
+# was applied while paging, and 20 happens to equal MAX_FILES, so the first page filled
+# the budget and the loop broke immediately - a 27-image gallery stayed 20, silently.
+check("the gallery page count is read from the page",
+      ehentai.gallery_page_count("Showing 1 - 20 of 27 images", 20) == 2,
+      ehentai.gallery_page_count("Showing 1 - 20 of 27 images", 20))
+check("a single-page gallery needs no extra request",
+      ehentai.gallery_page_count("Showing 1 - 20 of 20 images", 20) == 1
+      and ehentai.gallery_page_count("", 20) == 1,
+      "an absent or complete count must not trigger paging")
+check("paging is not capped mid-loop",
+      "if len(links) >= max_images" not in inspect.getsource(ehentai.fetch_gallery_images),
+      "the cap must apply after paging, or 20-per-page hosts never page")
+check("the cap is reported rather than applied silently",
+      "超過單次上限" in inspect.getsource(ehentai.fetch_gallery_images),
+      "a truncated gallery must say so")
+check("the progress notice survives the final edit",
+      "render(latest[0], latest[1], latest[2]" in inspect.getsource(bot.run_with_progress),
+      "the closing edit is the message the user keeps, so it must not drop the notice")
+
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
 # handed to e-hentai. Measured before the fix: 1707 chars, 8 foreign cookies.
