@@ -4431,7 +4431,6 @@ def _download_archive_parallel(headers: dict, download_url: str, target: Path,
         return got
 
     failed_ranges: list[tuple[int, int]] = []
-    failed_ranges: list[tuple[int, int]] = []
     with target.open("wb") as handle:
         # Pre-size so concurrent offset writes never race to extend the file.
         handle.truncate(total)
@@ -4439,6 +4438,14 @@ def _download_archive_parallel(headers: dict, download_url: str, target: Path,
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(fetch_range, enumerate(ranges, 1)))
 
+    # Checked before the stop test on purpose. A genuine stop leaves a partial file,
+    # which the caller discards - but **nothing at all** written is not a partial
+    # download, it is a failed one, and reporting it as a short read would let the
+    # caller send a 0-byte archive. That is what happened when an expired archive URL
+    # made every range fail while a stop was arriving.
+    if written == 0:
+        raise ehentai.EhentaiError(
+            "官方歸檔沒有任何分段下載成功（下載連結可能已過期，請重新取得）。")
     if stopped():
         return written
     if failed_ranges:
@@ -4614,21 +4621,45 @@ async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
     """
     Run a blocking callable on a worker thread while showing its progress.
 
-    ``work`` is called as ``work(queue)`` and is expected to put ``(done, total)``
-    tuples on that queue. The queue is the hand-off from the worker thread to this
-    event loop, which is the only side allowed to edit a Telegram message.
+    ``work`` is called as ``work(report)`` and is expected to call ``report(done,
+    total)`` as it goes. Those calls come from worker threads, so they are handed to
+    the event loop through a queue - only the loop may edit a Telegram message.
 
     Edits are throttled: Telegram rate-limits message edits, and a page-per-second
-    gallery would otherwise be throttled into failures. The last observed value is
-    always written once the work finishes, so the message never stops short of
-    100%.
+    gallery would otherwise be throttled into failures.
+
+    **A bar is shown immediately, at 0%**, before any work has reported anything. Two
+    reasons, both learned from a real download: the stop button belongs on screen from
+    the start, and a large archive can take many seconds to produce its first byte, so
+    waiting for the first report left the message looking frozen.
+
+    **Completion is only claimed when progress was actually observed.** The final edit
+    used to be ``latest[0] or total``, which printed a full 100% bar when the work had
+    reported nothing at all - so a download that failed instantly was displayed as
+    finished. A caller that gets nothing back now finds the message unedited rather
+    than falsely complete, and reports its own failure.
     """
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
+    seen_progress = False
 
     def report(done, observed_total):
-        # Called from the worker thread, so the queue must not block it.
+        # Called from a worker thread, so the queue must not block it.
         loop.call_soon_threadsafe(queue.put_nowait, (done, observed_total or total))
+
+    def render(done, observed):
+        return (f"{prefix}\n{progress_bar(done, observed or total)}\n"
+                "（可按「停止」中止）")
+
+    # Before the work starts, so the bar and the stop button appear at once.
+    try:
+        await status.edit_text(
+            render(0, total),
+            link_preview_options=source_link_options(),
+            reply_markup=stop_keyboard(gid, token),
+        )
+    except TelegramError:
+        logger.debug("無法顯示初始進度，繼續下載", exc_info=True)
 
     task = asyncio.create_task(asyncio.to_thread(work, report))
 
@@ -4648,6 +4679,7 @@ async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
             while not queue.empty():
                 latest = queue.get_nowait()
                 progressed = True
+                seen_progress = True
 
             if progressed:
                 now = time.monotonic()
@@ -4655,8 +4687,7 @@ async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
                     last_edit = now
                     try:
                         await status.edit_text(
-                            f"{prefix}\n{progress_bar(latest[0], latest[1] or total)}\n"
-                            "（可按「停止」中止）",
+                            render(latest[0], latest[1]),
                             link_preview_options=source_link_options(),
                             reply_markup=stop_keyboard(gid, token),
                         )
@@ -4671,15 +4702,20 @@ async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
     finally:
         result = await task
 
-    try:
-        await status.edit_text(
-            f"{prefix}\n{progress_bar(latest[0] or total, latest[1] or total)}\n"
-            "（可按「停止」中止）",
-            link_preview_options=source_link_options(),
-            reply_markup=stop_keyboard(gid, token),
-        )
-    except TelegramError:
-        pass
+    # Only a run that reported something gets a closing bar. Without progress there is
+    # nothing truthful to say about completion, and saying "100%" would be a lie the
+    # caller cannot correct - its own failure message would arrive after this one.
+    if seen_progress:
+        try:
+            await status.edit_text(
+                render(latest[0], latest[1]),
+                link_preview_options=source_link_options(),
+                reply_markup=stop_keyboard(gid, token),
+            )
+        except TelegramError:
+            pass
+    else:
+        logger.warning("下載過程沒有回報任何進度（%s），不顯示完成進度", prefix)
     return result
 
 
