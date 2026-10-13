@@ -44,7 +44,35 @@ services:
       TELEGRAM_WORK_DIR: /var/lib/telegram-bot-api
       TELEGRAM_TEMP_DIR: /tmp/telegram-bot-api
       TELEGRAM_VERBOSITY: "1"
+      # The Bot API server speaks MTProto to Telegram, and on this network plain
+      # api.telegram.org works while MTProto does not - the container had full egress
+      # and still hung for minutes on login. The host already runs a proxy for exactly
+      # that reason, so the server is pointed at it.
+      #
+      # The image maps this onto --proxy, and supports http, socks5 and mtproxy URLs.
+      # `host.docker.internal` is how a container reaches the host on Docker Desktop;
+      # 127.0.0.1 inside the container would be the container itself.
+      #
+      # Leave it empty if your network does not need a proxy, and note the value is
+      # interpolated from .env so no address is hardcoded here.
+      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
     volumes:
-      # Keeps the server's state across restarts, so the bot does not have to re-login
-      # every time the container is recreated.
-      - ./bot-api-data:/var/lib/telegram-bot-api
+      # A **named volume**, not a bind mount to a Windows directory.
+      #
+      # This is not a preference. With `./bot-api-data:/var/lib/telegram-bot-api` the
+      # path is served through 9p (drvfs), and TDLib's binlog append-and-rename does not
+      # survive it:
+      #
+      #   Failed to rename binlog of size 128 to .../td.binlog:
+      #   [PosixError : No such file or directory : 2 : Stat for file ... failed]
+      #   [pid 1] Signal: 6
+      #
+      # The server then crash-loops on every start and answers 502 to every request -
+      # which looks exactly like bad credentials and is not. A named volume lives on the
+      # Docker VM's own filesystem, where TDLib works normally.
+      #
+      # Inspect it with: docker volume inspect twitter_pixiv_tg_bot_windows_bot-api-data
+      - bot-api-data:/var/lib/telegram-bot-api
+
+volumes:
+  bot-api-data:

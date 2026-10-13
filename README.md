@@ -1333,6 +1333,53 @@ python run_local_api.py --binary "C:\path\to\telegram-bot-api.exe"
 
 Build instructions: <https://tdlib.github.io/telegram-bot-api/build.html>.
 
+### Blocked on networks that filter Telegram's MTProto
+**The Bot API server cannot be used on this network.** The server speaks MTProto to
+Telegram, and these hosts are unreachable from a container here:
+
+```
+149.154.167.50:443   BLOCKED
+149.154.175.50:443   BLOCKED
+91.108.56.130:443    BLOCKED
+```
+
+The symptom is deceptive: the server starts, the container is healthy, `getMe` **hangs**
+and eventually times out, and the log stays silent. It looks like a bad `api_id`, and it
+is not.
+
+**`--proxy` does not help, and cannot.** Its own help text says so:
+
+```
+--proxy=<arg>   HTTP proxy server for outgoing webhook requests in the format http://host:port
+```
+
+That is **webhooks only** — it does not proxy TDLib's MTProto connection, so no value
+here can route the login. `docker-compose.yml` therefore carries `TELEGRAM_PROXY` with a
+comment recording this, rather than leaving the impression that it is a working lever.
+
+Two things were genuinely wrong and are fixed, in case this is retried on a network that
+does allow MTProto:
+
+| Fault | Effect | Fix |
+| --- | --- | --- |
+| The work dir was a **Windows bind mount** (9p/drvfs) | TDLib's binlog rename failed, `Signal: 6`, the server crash-looped and answered 502 to everything — indistinguishable from bad credentials | a **named volume**, which is ext4 |
+| A stale volume from a failed run | TDLib never got past initialisation | wipe the volume, not just the container |
+
+To find out whether a network is suitable **before** wiring anything up:
+
+```sh
+docker run --rm alpine:latest sh -c '
+for ip in 149.154.167.50 149.154.175.50 91.108.56.130; do
+  timeout 6 sh -c "echo > /dev/tcp/$ip/443" 2>/dev/null \
+    && echo "$ip OPEN" || echo "$ip BLOCKED"
+done'
+```
+
+All three must be `OPEN`. If they are not, the public API is the only option, and the
+bot's own HTTP calls need a proxy instead — which is a different problem, and one the
+host proxy on `127.0.0.1:7897` already solves when `socksio` is installed
+(`pip install "python-telegram-bot[socks]"`).
+
 ### `--local` is the flag that matters
 Without it the server still enforces the public 50 MB limit, so switching gains
 nothing. `TELEGRAM_LOCAL=1` is the bot's own statement that the server runs that way —
