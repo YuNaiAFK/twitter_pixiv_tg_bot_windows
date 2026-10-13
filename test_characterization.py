@@ -596,6 +596,56 @@ check("PTB drops the filename named parameter (pinned)",
 check("api_kwargs is the route that survives serialisation",
       _IMD2(media="x", api_kwargs={"filename": "n.png"}).to_dict().get("filename") == "n.png")
 
+# Requested: an adult work too large for a blurred photo is delivered as a ZIP. The
+# all-or-nothing rule matters - a partial split would send one work twice, in two forms.
+_arch_work = Path(tempfile.mkdtemp(prefix="dsh-archive-"))
+try:
+    def _mk(name, megabytes):
+        p = _arch_work / name
+        p.write_bytes(b"x" * int(megabytes * 1024 * 1024))
+        return p
+
+    _over1, _over2 = _mk("o_p0.png", 12), _mk("o_p1.png", 12)
+    _under = _mk("u_p0.png", 5)
+    _clip = _mk("c_p0.mp4", 12)
+
+    for _files, _adult, _want, _label in (
+            ([_over1, _over2], True, True, "adult, all oversize -> archive"),
+            ([_over1, _under], True, False, "adult, mixed sizes -> no split"),
+            ([_under, _under], True, False, "adult, all under -> album"),
+            ([_over1, _over2], False, False, "ordinary oversize -> original document"),
+            ([_over1, _clip], True, False, "a video is not archived"),
+    ):
+        check(f"archive decision: {_label}",
+              bot.needs_archive_delivery(_files, adult=_adult) is _want,
+              f"got {bot.needs_archive_delivery(_files, adult=_adult)}")
+
+    # The archive must carry the originals byte-for-byte: it exists precisely so nothing
+    # is re-encoded.
+    import hashlib as _hashlib
+    import zipfile as _zipfile
+
+    _arc = bot.zip_files([_over1, _under], _arch_work, "pixiv_1.zip")
+    with _zipfile.ZipFile(_arc) as _zf:
+        check("the archive holds the original bytes",
+              _hashlib.sha256(_zf.read("o_p0.png")).hexdigest()
+              == _hashlib.sha256(_over1.read_bytes()).hexdigest(),
+              "a re-encoded archive would defeat the point of sending one")
+        check("the archive keeps the real filenames",
+              set(_zf.namelist()) == {"o_p0.png", "u_p0.png"}, _zf.namelist())
+        check("the archive is not corrupt", _zf.testzip() is None)
+finally:
+    shutil.rmtree(_arch_work, ignore_errors=True)
+
+_handle_src3 = inspect.getsource(bot.handle_message)
+check("the archive path explains itself to the user",
+      "超過 Telegram 單張圖片 10 MB 的上限" in _handle_src3
+      and "請下載後解壓縮查看" in _handle_src3,
+      "a silent archive would look like a failure")
+check("the archive is sent as a document, not a photo",
+      "prefer_original=True" in _handle_src3,
+      "a photo upload would re-encode and might exceed the 10 MB photo limit")
+
 # The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
 # generic "gallery deleted" message would be actively misleading.
 _REFUSAL = "Key missing, or incorrect key provided."

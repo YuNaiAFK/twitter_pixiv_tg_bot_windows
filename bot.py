@@ -1853,6 +1853,53 @@ def media_delivery(file_path: Path, *, prefer_original: bool,
     return True, False
 
 
+def needs_archive_delivery(files: list[Path], *, adult: bool) -> bool:
+    """
+    Whether this work must be delivered as a ZIP rather than as images.
+
+    True only when **every** image is adult and larger than ``PHOTO_LIMIT_BYTES``.
+
+    The all-or-nothing rule is deliberate. A partial split - some pages as a blurred
+    album, the rest in an archive - would send the same work twice in two forms, which is
+    the duplication bug that was reported earlier. One work, one delivery.
+    """
+    if not adult or not files:
+        return False
+    return all(f.suffix.lower() in IMAGE_EXTENSIONS
+               and f.stat().st_size > PHOTO_LIMIT_BYTES for f in files)
+
+
+def zip_files(files: list[Path], temp_dir: Path, archive_name: str) -> Path:
+    """
+    Put ``files`` into one ZIP inside ``temp_dir`` and return its path.
+
+    Requested for the case this exists for: an adult work whose images are too large
+    for ``reply_photo`` (Telegram's 10 MB ceiling) cannot be sent as a blurred photo.
+    Bundling them into an archive delivers the bytes **exactly as downloaded** - a ZIP
+    preserves the originals, so nothing is re-encoded - and sidesteps the photo size
+    limit entirely, because the archive travels as a document.
+
+    Compression is worth having on top of that: PNG artwork often shrinks noticeably,
+    and ``ZIP_DEFLATED`` costs a little CPU for it. It is not the reason for the
+    archive, though - keeping the originals is.
+    """
+    archive_path = temp_dir / sanitize_filename(archive_name, "pixiv.zip")
+    # Store relative names only, so extracting does not recreate a temp directory tree.
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        used: set[str] = set()
+        for item in files:
+            name = item.name
+            # A duplicate name would silently overwrite the earlier entry.
+            stem, dot, suffix = name.rpartition(".")
+            counter = 1
+            while name in used:
+                name = f"{stem}_{counter}{dot}{suffix}" if dot else f"{name}_{counter}"
+                counter += 1
+            used.add(name)
+            archive.write(item, arcname=name)
+    return archive_path
+
+
 def admin_hint(platform: str | None = None) -> str:
     """
     Operator-facing diagnosis, shown only when an administrator asks.
@@ -5538,9 +5585,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("成人內容，將加上模糊：%s", media_url)
 
         if platform == "pixiv":
+            # Requested: an adult work whose images are too big for a blurred photo is
+            # delivered as a ZIP instead.
+            #
+            # The reason is a genuine dead end rather than a preference: has_spoiler only
+            # blurs photos, reply_photo caps at Telegram's 10 MB, and an unblurred
+            # document would show the artwork openly. An archive keeps the originals
+            # byte-for-byte, travels as a document so the 10 MB photo ceiling does not
+            # apply, and is not rendered inline - so nothing is exposed.
+            #
+            # Never cut a work in half. This only applies when EVERY image is adult and
+            # oversize; a partial split would send the same work partially as a blurred
+            # album AND as an archive, which is the duplication that was reported before.
+            if needs_archive_delivery(media_files, adult=spoiler):
+                oversized_mb = sum(f.stat().st_size for f in media_files) / 1048576
+                archive = await asyncio.to_thread(
+                    zip_files, media_files, temp_dir, f"pixiv_{Path(media_url).name}.zip")
+                # Tell the user why, and what to expect. A silent archive would look like
+                # the bot had failed to send the artwork.
+                await status.edit_text(
+                    f"這個作品是成人內容，共 {len(media_files)} 張、約 {oversized_mb:.1f} MB，"
+                    f"超過 Telegram 單張圖片 10 MB 的上限，無法加上模糊後傳送。\n\n"
+                    f"已改為壓縮成 ZIP 傳送原檔（不重新編碼，畫質不變）。"
+                    f"請下載後解壓縮查看，檔案較大請稍等。",
+                    link_preview_options=source_link_options(),
+                )
+                # Sent directly rather than through send_original_files: that helper's
+                # job is albums and the adult/photo policy, and this archive is neither.
+                # A single document, with the source link left to the caller.
+                await send_single_media(
+                    message, archive, media_url, temp_dir,
+                    prefer_original=True,   # a document: the ZIP is the payload
+                    extra="", caption=None,
+                )
+                await cleanup_request_messages(status, message)
+                await asyncio.to_thread(remember_media_parse, media_url, media_files)
+                succeeded = True
+                return
+
             # Sending the artwork as-is: one message per album, original files.
-            # A ZIP is deliberately not used, and no image is downscaled, so the
-            # bytes the recipient gets match what gallery-dl downloaded.
+            # No image is downscaled, so the bytes the recipient gets match what
+            # gallery-dl downloaded. (A ZIP is used only for the adult-and-oversize
+            # case handled above, where a blurred photo is impossible.)
             sent_count, album_note = await send_original_files(
                 message, media_files, media_url, temp_dir,
                 # Requested: Pixiv sends the images alone, with no source link and no
