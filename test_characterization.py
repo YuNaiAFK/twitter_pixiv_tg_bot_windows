@@ -389,13 +389,28 @@ check("there is exactly one retry implementation",
       not hasattr(bot, "_archiver_request")
       and hasattr(ehentai, "request_with_retry"),
       "two copies of the retry policy would drift apart")
-# Sized against the measured throttle window: 5 attempts at 2/4/8/16s is ~30s. Three
-# attempts (~6s) was tried and still failed every time, so a shorter schedule silently
-# regresses to "always fails under throttling".
+# Retrying harder made things worse in practice: five attempts with doubling backoff
+# reached roughly 120 requests against e-hentai during testing, after which the host
+# began refusing gallery paths entirely. The count is pinned low deliberately.
 _retry_params = inspect.signature(ehentai.request_with_retry).parameters
-check("the retry window is wide enough to outlast a throttle",
-      _retry_params["attempts"].default >= 5,
-      f"attempts={_retry_params['attempts'].default} is too few for a ~30s window")
+check("e-hentai retries stay light",
+      2 <= _retry_params["attempts"].default <= 3,
+      f"attempts={_retry_params['attempts'].default}; heavy retrying worsened the block")
+check("e-hentai retries use a fixed delay, not doubling backoff",
+      "delay *= 2" not in inspect.getsource(ehentai.request_with_retry),
+      "doubling backoff multiplied load on an already-unhappy host")
+# e-hentai polices gallery-page access hard, so an archive click must not spend a /g/
+# request: the gid and token it needs are already in the cached gallery. Measured: with a
+# warm cache the only request is POST archiver.php?gid=..&token=.., and fetch_gallery is
+# never called.
+check("an archive click does not re-fetch the gallery page",
+      "resolve_official_archive" in inspect.getsource(bot.run_gallery_archive)
+      and "fetch_gallery" not in inspect.getsource(bot.run_gallery_archive),
+      "a /g/ request per archive click is exactly what e-hentai polices")
+check("the button handler reuses the cached gallery",
+      "PARSE_CACHE.lookup(gallery_url" in inspect.getsource(bot.run_gallery_action)
+      and "if gallery is None" in inspect.getsource(bot.run_gallery_action),
+      "the gallery facts must come from cache when present, not a fresh fetch")
 
 # The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
 # generic "gallery deleted" message would be actively misleading.

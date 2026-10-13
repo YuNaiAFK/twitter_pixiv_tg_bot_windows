@@ -301,37 +301,40 @@ def parse_gallery_page(text: str, url: str) -> EhentaiGallery:
     )
 
 
-def request_with_retry(client, method: str, url: str, *, attempts: int = 5,
-                       base_delay: float = 2.0, **kwargs):
+def request_with_retry(client, method: str, url: str, *, attempts: int = 3,
+                       delay: float = 3.0, **kwargs):
     """
-    One e-hentai request, retried on transient connection failures.
+    One e-hentai request, retried **lightly** on transient connection failures.
 
-    This exists because e-hentai **throttles this host at the IP level, at the TCP
-    layer**. Measured directly: six consecutive requests to one gallery all raised
-    ``ConnectTimeout [WinError 10060]`` - the SYN was dropped, not answered - and the
-    same URL answered 200 in 1.7s after a pause, with no code change. The front page can
-    succeed while gallery paths time out, so the throttle is per-connection rather than
-    per-URL.
+    This handles a bare
 
-    Without this a single failure surfaced as "處理時發生錯誤，請稍後再試" with a
-    traceback for something that clears on its own.
+        httpx.ConnectTimeout: [WinError 10060]
 
-    **The retry window is sized to outlast the throttle, not to look reasonable.**
-    Five attempts at 2s, 4s, 8s, 16s cumulatively wait about 30s, which is the order of
-    the observed window; a shorter schedule just burns every attempt inside one window
-    and fails exactly as before. That was a real mistake here: three attempts (~6s)
-    still failed on every try.
+    which is not a wrong URL, a missing cookie, or a deleted gallery, and used to surface
+    as "處理時發生錯誤，請稍後再試" with a traceback for something retrying fixes.
+
+    **The retry count is deliberately low, and this was learned the hard way.** An
+    earlier version used five attempts with doubling backoff. Because the *whole reply*
+    is not refused - the front page kept answering 200 while gallery paths were refused -
+    those retries piled onto a host that was already unhappy. During testing that reached
+    roughly 120 requests against e-hentai, and the host then started refusing gallery
+    paths with
+
+        HTTP 200, 39 bytes: "Key missing, or incorrect key provided."
+
+    which persisted afterwards. **Retrying harder made the block worse, not better.**
+    Three attempts with a short fixed delay is a compromise: enough to ride out a dropped
+    connection, not enough to look like a flood.
 
     Only connection-level failures are retried. An HTTP status is a considered answer -
-    404 means the gallery really is gone - and retrying it would repeat the refusal
-    while making the user wait.
+    404 means the gallery really is gone - and retrying it would repeat the refusal while
+    making the user wait.
 
-    Raises EhentaiError once the attempts are exhausted, so every caller reports the
-    same thing rather than leaking httpx exception types to the user.
+    Raises EhentaiError once the attempts are exhausted, so every caller reports the same
+    thing rather than leaking httpx exception types to the user.
     """
     import httpx
 
-    delay = base_delay
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
@@ -341,10 +344,9 @@ def request_with_retry(client, method: str, url: str, *, attempts: int = 5,
             last_exc = exc
             if attempt >= attempts:
                 break
-            logger.warning("e-hentai 請求失敗（第 %s/%s 次，%s），%.1f 秒後重試：%s",
+            logger.warning("e-hentai 請求失敗（第 %s/%s 次，%s），%.0f 秒後重試：%s",
                            attempt, attempts, type(exc).__name__, delay, url)
             time.sleep(delay)
-            delay *= 2
     raise EhentaiError(
         f"連線 e-hentai 逾時或中斷（已重試 {attempts} 次）："
         f"{type(last_exc).__name__}。e-hentai 有時會暫時限制連線，請稍後再試。"
