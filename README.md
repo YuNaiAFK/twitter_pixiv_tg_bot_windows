@@ -990,6 +990,37 @@ The same feature had a second, worse failure: once the flag was in the right pla
 directory, so a link that had worked returned "沒有找到可傳送的圖片或影片". It has
 been removed entirely — see the caching section.
 
+## Version control
+This project is a git repository. **Commit before making sweeping changes** — that is
+not ceremony. A stray cleanup command once removed `test_bot_features.py` (733 tests)
+and there was no history, no `.pyc`, no backup and no shadow copy to recover it from,
+so it was gone.
+
+```sh
+git status           # what is uncommitted
+git add -A
+git commit -m "..."  # commit early, commit often
+git log --oneline    # what changed
+```
+
+`.gitignore` deliberately excludes everything secret or generated, and this was
+verified rather than assumed:
+
+| Ignored | Why |
+| --- | --- |
+| `.env` | bot token, api id/hash, refresh token |
+| `cookies/` | Twitter, Pixiv and e-hentai session cookies |
+| `authorized.json` | the users, groups and admins lists |
+| `parse_cache.json`, `.cache/` | the parse cache and its files |
+| `restart.log*`, `bot_console.log` | runtime logs |
+| `gallery-dl.conf`, `.gallery-dl-cache/` | generated from `.env` |
+| `.venv/`, `vendor/`, `__pycache__/` | environments and dev-only tools |
+| `bot-api-data/`, `telegram-bot-api*` | self-hosted server state and binary |
+
+`git check-ignore -v <path>` confirms any individual path. Twelve files are tracked:
+the four Python modules, the two runner scripts, `docker-compose.yml`, `run.bat`,
+`requirements.txt`, `README.md`, `.gitignore` and `.env.example`.
+
 ## Command-line helpers
 | Command | Purpose |
 | --- | --- |
