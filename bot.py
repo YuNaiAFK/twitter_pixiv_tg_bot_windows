@@ -3301,6 +3301,14 @@ async def send_media_album(message, files: list[Path], source_url: str,
             # items all have captions, and one link is what is wanted anyway.
             item_kwargs = {"media": handle,
                            "caption": caption if index == 0 else None}
+            if item_is_document:
+                # Send the real filename, so an original does not arrive as
+                # "file_0.dat". It MUST go through api_kwargs: PTB's `filename=`
+                # parameter is deprecated and is dropped by to_dict(), which was
+                # measured - InputMediaDocument(media=..., filename="x.png") serialises
+                # to {"media": ..., "type": "document"} with no filename at all. Passing
+                # it as a keyword looked correct and did nothing.
+                item_kwargs["api_kwargs"] = {"filename": file_path.name}
             if item_spoiler and not item_is_document:
                 # InputMediaPhoto declares has_spoiler, so it is a named argument and
                 # PTB serialises it itself.
@@ -3309,7 +3317,7 @@ async def send_media_album(message, files: list[Path], source_url: str,
                 # Unreachable through media_delivery, which never pairs a document with
                 # a blur - Telegram does not blur documents. Kept as a guard so a future
                 # change cannot silently send an unblurred "blurred" album item.
-                item_kwargs["api_kwargs"] = {"has_spoiler": True}
+                item_kwargs.setdefault("api_kwargs", {})["has_spoiler"] = True
             media.append(builder(**item_kwargs))
         if len({type(item).__name__ for item in media}) > 1:
             # A media group must be all photos or all documents. media_delivery can mix

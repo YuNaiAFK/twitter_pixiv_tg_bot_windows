@@ -532,19 +532,19 @@ check("a failure to classify never blocks the send",
       "blurring is cosmetic; it must not break delivery")
 # InputMediaDocument has no has_spoiler parameter, so it must go through api_kwargs,
 # while InputMediaPhoto declares it. Verified by serialisation, not by assumption.
-from telegram import InputMediaDocument as _IMD, InputMediaPhoto as _IMP  # noqa: E402
+from telegram import InputMediaDocument as _IMD2, InputMediaPhoto as _IMP  # noqa: E402
 
 check("InputMediaPhoto serialises has_spoiler",
       _IMP(media="x", has_spoiler=True).to_dict().get("has_spoiler") is True)
 check("InputMediaDocument needs api_kwargs for has_spoiler",
-      "has_spoiler" not in inspect.signature(_IMD.__init__).parameters
-      and _IMD(media="x", api_kwargs={"has_spoiler": True}).to_dict()
+      "has_spoiler" not in inspect.signature(_IMD2.__init__).parameters
+      and _IMD2(media="x", api_kwargs={"has_spoiler": True}).to_dict()
       .get("has_spoiler") is True,
       "it has no named parameter, so api_kwargs is the only route")
 _album_src3 = inspect.getsource(bot.send_media_album)
 check("the album uses the right channel per media type",
       'item_kwargs["has_spoiler"] = True' in _album_src3
-      and 'item_kwargs["api_kwargs"] = {"has_spoiler": True}' in _album_src3,
+      and 'item_kwargs.setdefault("api_kwargs", {})["has_spoiler"] = True' in _album_src3,
       "using one channel for both would silently drop the flag")
 
 # Requested policy: an ordinary work goes as a document so the original is preserved,
@@ -582,6 +582,19 @@ check("a mixed album is refused rather than sent",
 check("the album log reads the real kind, not the request",
       "isinstance(media[0], InputMediaPhoto)" in _album_src3,
       "an adult album is photos even though the work is sent as original")
+
+# The album sent every document with filename=None, so a Pixiv original arrived as
+# "file_0.dat" instead of 150824857_p0.png. PTB's filename= parameter is deprecated and
+# dropped by to_dict(), so it has to go through api_kwargs - proven by serialising, since
+# passing it as a keyword looks correct and does nothing.
+check("album documents carry their real filename via api_kwargs",
+      'item_kwargs["api_kwargs"] = {"filename": file_path.name}' in _album_src3,
+      "a document album would deliver originals under a generic name")
+check("PTB drops the filename named parameter (pinned)",
+      "filename" not in _IMD2(media="x", filename="n.png").to_dict(),
+      "if PTB starts honouring filename=, api_kwargs need not carry it")
+check("api_kwargs is the route that survives serialisation",
+      _IMD2(media="x", api_kwargs={"filename": "n.png"}).to_dict().get("filename") == "n.png")
 
 # The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
 # generic "gallery deleted" message would be actively misleading.
