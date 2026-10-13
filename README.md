@@ -1021,6 +1021,55 @@ verified rather than assumed:
 the four Python modules, the two runner scripts, `docker-compose.yml`, `run.bat`,
 `requirements.txt`, `README.md`, `.gitignore` and `.env.example`.
 
+### Pushing an update to GitHub
+The remote is <https://github.com/YuNaiAFK/twitter_pixiv_tg_bot_windows> (public), and
+`main` tracks `origin/main`. Whenever the bot changes, push it — that is the off-site
+copy, and its absence is what made the loss of the test suite unrecoverable.
+
+```sh
+git status                              # see what changed
+git add -A
+git commit -m "what changed and why"
+git push
+```
+
+**Verify the exclusions before every push that touches configuration.** The command
+below lists what would actually be published; if `.env`, `cookies/` or
+`authorized.json` ever appears, stop:
+
+```sh
+git ls-files | findstr /I "env cookies authorized"
+```
+
+Before the first push that scan must print nothing. It is checked here rather than
+assumed, because a `.gitignore` line that looks right can still miss a path.
+
+#### The dead proxy, and why pushes fail with a connection error
+The global git config points at `http://127.0.0.1:10808`, a proxy that is **not
+running**, so git could not reach GitHub at all:
+
+```
+fatal: unable to access 'https://github.com/...': Failed to connect to github.com
+port 443 via 127.0.0.1 after 2058 ms: Could not connect to server
+```
+
+Measured on this machine: direct connections work, `127.0.0.1:7897` works, and
+`:10808` and `:8080` do not. This repository therefore carries a **local** override
+that clears the proxy, so `git push` works without extra flags:
+
+```sh
+git config --local http.proxy ""
+git config --local https.proxy ""
+```
+
+The global setting is deliberately left alone — other tools may depend on it. If git
+fails in a **different** repository with the same connection error, this is the cause:
+
+```sh
+git config --global --unset http.proxy
+git config --global --unset https.proxy
+```
+
 ## Command-line helpers
 | Command | Purpose |
 | --- | --- |
