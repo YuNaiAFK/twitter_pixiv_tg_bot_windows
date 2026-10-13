@@ -301,6 +301,23 @@ check("attaching nothing suppresses the button as well",
       "link_carried = not attach_link" in inspect.getsource(
           bot.send_original_files),
       "a link-less send would still carry a source button")
+
+# Reported as redundant: the link showed twice, as caption text and as a url button
+# pointing at the same address. Only the caption remains.
+_orig_src = inspect.getsource(bot.send_original_files)
+check("no keyboard is attached to any media message",
+      "keyboard=None," in _orig_src and "build_source_keyboard" not in _orig_src,
+      "the button would duplicate the caption link")
+check("the source-link keyboard has no caller",
+      _SOURCE.count("build_source_keyboard(") == 1,
+      "a caller was reattached; that duplicates the caption link unless the caption "
+      "is removed at the same time")
+check("the unused keyboard is documented as intentionally unused",
+      "currently unused" in inspect.getsource(bot.build_source_keyboard),
+      "a future reader would treat it as an oversight")
+check("the keyboard still builds correctly if reattached",
+      bot.build_source_keyboard("https://x.com/a/status/2") is not None and
+      bot.build_source_keyboard("nope") is None)
 check("reply_markup is sent through api_kwargs",
       "api_kwargs" in "".join(inspect.getsource(bot._reply_media_group)),
       "PTB 22.8 has no reply_markup parameter on reply_media_group")

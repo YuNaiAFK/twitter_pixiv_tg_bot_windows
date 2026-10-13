@@ -307,35 +307,43 @@ X/Twitter — the link is the **first item's caption**, so it reads above the im
 ```
 [ 原始連結：https://x.com/pohitashi/status/... ]   ← caption on item 0
 [ 相簿：page0 · page1 · page2 ]
-[ 🔗 x.com/pohitashi/status/... ]                  ← same message, button
 ```
 
-Pixiv — no caption, no button:
+Pixiv — no caption at all:
 
 ```
 [ 相簿：page0 · page1 · page2 ]
 ```
 
-The three layouts that were tried, and why this one:
+The layouts that were tried, and why this one:
 
 | Approach | Where the link lands | Cost |
 | --- | --- | --- |
 | Caption on the first item | **above** the images | one message |
 | A separate message | above the album | **two** messages |
 | A url button alone | below the images | one message |
+| Caption **and** button | above, then again below | one message, **link shown twice** |
+
+**The url button is no longer attached.** It was introduced when the link could only be
+a caption drawn against the media, so it acted as the guaranteed-reachable copy. With
+the link in the caption on a message that itself survives cleanup, a button pointing at
+the same address printed the link a second time — reported as redundant.
+`build_source_keyboard` is kept and documented as intentionally unused, because it is
+the only place that keyboard exists and reattaching it should be a one-line change if a
+client is ever found to render the caption somewhere unreachable. Reattaching it
+**without** removing the caption link would restore the duplication.
 
 **Only the first item is captioned.** Telegram rejects a media group in which every
-item has one, and one link is what is wanted anyway. The url button is attached to the
-same message as well, so the link stays reachable however a client renders the caption.
+item has one, and one link is what is wanted anyway.
 
 **The position is Telegram's to decide, not ours.** An album caption is drawn by the
 client *against the media*, which is why an earlier attempt landed the link in the
 middle of the set when it was attached to a later item. Anchoring it to the first item
 is the best that can be done from here.
 
-The caption and button go on the **first album only**, so a 30-page work does not carry
-the same link on all three of its messages. A separate text message is now only a
-fallback for the case where nothing was sent at all.
+The caption goes on the **first album only**, so a 30-page work does not carry the same
+link on all three of its messages. A separate text message is now only a fallback for
+the case where nothing was sent at all.
 
 **The cached replay follows the same split.** `send_cached_media` passes
 `attach_link=(platform != "pixiv")`, so a repeat of a cached Pixiv link does not grow a

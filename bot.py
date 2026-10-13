@@ -3007,11 +3007,18 @@ def build_source_keyboard(source_url: str):
     """
     A one-button keyboard whose button opens the source artwork.
 
-    Used instead of a text message for the source link. Telegram draws an album's
-    caption against the media, so a caption put the plain link in the middle of the
-    result; a separate text message put it at the bottom but cost a second message.
-    A url button on the album is part of that album's own message, so the link sits
-    below the images without adding a message.
+    **Kept deliberately, but currently unused.** The source link now travels as the
+    first item's caption, and a button pointing at the same address printed the link a
+    second time, which was reported as redundant. Both callers that attached it
+    (``send_original_files`` for the first message, and the caption path) now pass
+    ``None``.
+
+    It is retained rather than deleted because it is the only place the source-link
+    keyboard exists and it is covered by the characterization suite: if a client is
+    found to render the caption somewhere unreachable, reattaching it is a one-line
+    change. A future reader should treat "no caller" as the intended state, not as an
+    oversight, and should not reattach it without removing the caption link at the same
+    time - attaching both is exactly the duplication this replaced.
 
     Returns None when there is no usable URL, in which case no keyboard is attached.
     """
@@ -3093,6 +3100,11 @@ async def send_original_files(message, files: list[Path], source_url: str,
     # nothing is attached anywhere.
     link_carried = not attach_link
     caption = build_caption(source_url) if attach_link else None
+    # No url button is attached. The caption already carries the link, and a button
+    # pointing at the same address printed it a second time - reported as redundant.
+    # The button was introduced when the link could only be a caption drawn against the
+    # media, so it acted as the guaranteed-reachable copy; now that the link is in the
+    # caption on a message which itself survives cleanup, it no longer earns its place.
 
     images = [path for path in files if path.suffix.lower() in IMAGE_EXTENSIONS]
     others = [path for path in files if path.suffix.lower() not in IMAGE_EXTENSIONS]
@@ -3112,9 +3124,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
             try:
                 await send_media_album(
                     message, chunk, source_url, as_document=as_document,
-                    # The button goes on the first album only, alongside the caption.
-                    keyboard=None if link_carried
-                    else build_source_keyboard(source_url),
+                    keyboard=None,
                     # Later albums get no caption, so the link is not repeated.
                     with_caption=not link_carried,
                 )
@@ -3129,8 +3139,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 if await send_single_media(
                     message, file_path, source_url, temp_dir,
                     prefer_original=as_document,
-                    keyboard=None if link_carried
-                    else build_source_keyboard(source_url),
+                    keyboard=None,
                     caption=None if link_carried else caption,
                 ):
                     sent += 1
@@ -3144,8 +3153,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
             if await send_single_media(
                 message, file_path, source_url, temp_dir,
                 prefer_original=as_document,
-                keyboard=None if link_carried
-                else build_source_keyboard(source_url),
+                keyboard=None,
                 caption=None if link_carried else caption,
             ):
                 sent += 1
