@@ -1341,6 +1341,40 @@ python run_local_api.py --binary "C:\path\to\telegram-bot-api.exe"
 
 Build instructions: <https://tdlib.github.io/telegram-bot-api/build.html>.
 
+### e-hentai throttles and blocks this host — retry absorbs the short ones
+e-hentai refuses requests from this IP in **two different ways**, needing different
+responses. Both were observed here, minutes apart, on the same URL:
+
+| Symptom | What it is | What helps |
+| --- | --- | --- |
+| `ConnectTimeout [WinError 10060]` — the SYN dropped, not answered | a TCP-level throttle with a window of tens of seconds | retry with backoff |
+| `HTTP 200` with a 39-byte body: `Key missing, or incorrect key provided.` | an access refusal, not a timeout | **only waiting**, or fresh cookies |
+
+Measured: six consecutive requests to one gallery all timed out, then the same URL
+answered 200 in 1.7s with no code change. Later, the same URL answered 200 with the
+39-byte refusal four times running.
+
+**The refusal cannot be caught by a status check**, because it is a 200. It is detected by
+its body in `parse_gallery_page` and reported as what it is, rather than as
+"連結有誤或畫廊已被刪除" — which sends the user hunting for a problem that is not there.
+`EHENTAI_COOKIES` matters here: a fresh cookie can lift the refusal when the cause is
+session-related rather than a blanket IP ban.
+
+`ehentai.request_with_retry` handles the first symptom for every e-hentai request
+(`fetch_gallery`, the archiver POST, and the archive probe). **Its window is sized to
+outlast the throttle, not to look reasonable**: five attempts at 2s, 4s, 8s, 16s wait
+about 30s in total. Three attempts (~6s) was tried first and still failed every time —
+the short schedule just burns every attempt inside one throttle window.
+
+Only connection-level failures are retried. An HTTP status is a considered answer, so
+retrying it would repeat the refusal while making the user wait.
+
+**A proxy does not help.** Through the host's SOCKS5 the refusal came back immediately
+(`Key missing`), because the exit node's IP is refused too. `socks5_transport.py` was
+written to test exactly that and is kept for networks where the proxy egress is
+acceptable, but it is **deliberately not wired into the bot** — routing e-hentai through
+it would trade a timeout for a refusal.
+
 ### `base_url` must end with `/bot` — the token is appended, not inserted
 Pointing the bot at a self-hosted server is one line, and getting it subtly wrong kills
 the bot during bootstrap:

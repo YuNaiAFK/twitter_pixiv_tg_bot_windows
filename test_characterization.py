@@ -28,7 +28,10 @@ import inspect
 import shutil
 import sys
 import tempfile
+import time as _time
 from pathlib import Path
+
+import httpx as _httpx
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "vendor"))
@@ -363,6 +366,120 @@ check("PTB really does append the token to base_url",
       == f"http://127.0.0.1:9999/bot{bot.BOT_TOKEN}",
       "if this fails, PTB changed how base_url is parsed and the /bot suffix must change "
       "with it")
+
+
+# A single ConnectTimeout on the archiver POST used to escape to the generic handler and
+# surface as "處理時發生錯誤，請稍後再試" with a full traceback. e-hentai is throttled on
+# this network, so a transient failure is expected rather than exceptional.
+_arch_src = inspect.getsource(bot.resolve_official_archive)
+check("the archiver POST is retried",
+      'request_with_retry(client, "POST"' in _arch_src,
+      "a transient connection failure would fail the whole request")
+check("the archive probe is retried too",
+      'request_with_retry(\n            client, "GET", download_url' in _arch_src,
+      "the ranged probe is as exposed to the throttling as the POST")
+# The throttle hits the gallery page as well, and that is the FIRST request of every
+# gallery action - retrying only the archiver would still fail the common path.
+check("the gallery fetch is retried too",
+      'request_with_retry(client, "GET", url'
+      in inspect.getsource(ehentai.fetch_gallery),
+      "the throttle would fail the first request of every gallery action")
+check("there is exactly one retry implementation",
+      not hasattr(bot, "_archiver_request")
+      and hasattr(ehentai, "request_with_retry"),
+      "two copies of the retry policy would drift apart")
+# Sized against the measured throttle window: 5 attempts at 2/4/8/16s is ~30s. Three
+# attempts (~6s) was tried and still failed every time, so a shorter schedule silently
+# regresses to "always fails under throttling".
+_retry_params = inspect.signature(ehentai.request_with_retry).parameters
+check("the retry window is wide enough to outlast a throttle",
+      _retry_params["attempts"].default >= 5,
+      f"attempts={_retry_params['attempts'].default} is too few for a ~30s window")
+
+# The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
+# generic "gallery deleted" message would be actively misleading.
+_REFUSAL = "Key missing, or incorrect key provided."
+try:
+    ehentai.parse_gallery_page(_REFUSAL, "https://e-hentai.org/g/1/abc/")
+    check("the 200-with-Key-missing refusal is reported as a refusal", False,
+          "it parsed as a gallery instead of raising")
+except ehentai.EhentaiError as _exc:
+    check("the 200-with-Key-missing refusal is reported as a refusal",
+          "拒絕" in str(_exc) and "Key missing" in str(_exc),
+          f"message was {str(_exc)[:70]}")
+try:
+    ehentai.parse_gallery_page("<html><body>not a gallery</body></html>",
+                               "https://e-hentai.org/g/1/abc/")
+except ehentai.EhentaiError as _exc:
+    check("a short non-refusal page keeps the generic message",
+          "拒絕" not in str(_exc),
+          "the refusal detector misfires on unrelated short pages")
+
+# socks5_transport.py exists to test whether a proxy escapes the e-hentai refusal. It
+# does not - the exit node is refused too - so it must stay unwired. Someone finding the
+# module and importing it would trade a timeout for a refusal and think it was a fix.
+check("the SOCKS5 transport is deliberately not wired into the bot",
+      "socks5_transport" not in Path(HERE / "bot.py").read_text(encoding="utf-8")
+      and "socks5_transport" not in Path(HERE / "ehentai.py").read_text(encoding="utf-8"),
+      "importing it would route e-hentai through a proxy whose exit node is also refused")
+check("the unwired transport still compiles and exposes its builder",
+      (HERE / "socks5_transport.py").exists()
+      and hasattr(__import__("socks5_transport"), "build_socks5_http_client"),
+      "it is kept as a working reference, not dead weight")
+
+_saved_sleep = _time.sleep
+_time.sleep = lambda _s: None
+try:
+    _attempts = {"n": 0}
+
+    class _AlwaysTimeouts:
+        def request(self, method, url, **kwargs):
+            _attempts["n"] += 1
+            raise _httpx.ConnectTimeout("simulated")
+
+    try:
+        ehentai.request_with_retry(_AlwaysTimeouts(), "POST", "https://e-hentai.org/x",
+                              attempts=3, data={})
+        check("a persistent connection failure is retried then reported", False,
+              "it returned instead of raising")
+    except bot.ehentai.EhentaiError as exc:
+        check("a persistent connection failure is retried then reported",
+              _attempts["n"] == 3 and "重試 3 次" in str(exc),
+              f"attempts={_attempts['n']}, message={str(exc)[:60]}")
+
+    # An HTTP status is a considered answer: 404 means the archiver refused, and
+    # retrying would repeat the refusal while making the user wait.
+    _status_attempts = {"n": 0}
+
+    class _Always404:
+        def request(self, method, url, **kwargs):
+            _status_attempts["n"] += 1
+            return _httpx.Response(404, text="no",
+                                   request=_httpx.Request(method, url))
+
+    _resp = ehentai.request_with_retry(_Always404(), "POST", "https://e-hentai.org/x", data={})
+    check("an HTTP status is handed back, not retried",
+          _status_attempts["n"] == 1 and _resp.status_code == 404,
+          f"attempts={_status_attempts['n']}")
+
+    # A failure that clears is a slow success, which is the point of retrying at all.
+    _flaky = {"n": 0}
+
+    class _FailsOnce:
+        def request(self, method, url, **kwargs):
+            _flaky["n"] += 1
+            if _flaky["n"] == 1:
+                raise _httpx.ReadTimeout("slow")
+            return _httpx.Response(200, text="ok",
+                                   request=_httpx.Request(method, url))
+
+    check("a transient failure that clears becomes a success",
+          ehentai.request_with_retry(_FailsOnce(), "POST", "https://e-hentai.org/x",
+                               data={}).status_code == 200
+          and _flaky["n"] == 2,
+          f"attempts={_flaky['n']}")
+finally:
+    _time.sleep = _saved_sleep
 check("reply_markup is sent through api_kwargs",
       "api_kwargs" in "".join(inspect.getsource(bot._reply_media_group)),
       "PTB 22.8 has no reply_markup parameter on reply_media_group")

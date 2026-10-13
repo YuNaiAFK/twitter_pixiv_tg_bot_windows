@@ -27,6 +27,7 @@ import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -213,8 +214,22 @@ def parse_gallery_page(text: str, url: str) -> EhentaiGallery:
     Parse a gallery page into an EhentaiGallery.
 
     Raises EhentaiError when the page is not a gallery page at all, which is what
-    a login redirect or a removed gallery looks like.
+    a login redirect, a removed gallery, or a refused host looks like.
     """
+    # e-hentai answers **HTTP 200** with this 39-byte body when it refuses a host, which
+    # is why it cannot be caught by a status check. Measured here: every gallery path
+    # returned it, directly and through a proxy, while the front page still answered
+    # normally. It is an access refusal, not a timeout, so retrying never helps - and
+    # the generic "連結有誤或畫廊已被刪除" message would send the user looking for a
+    # problem that is not there.
+    stripped = text.strip()
+    if len(stripped) < 200 and "key missing" in stripped.lower():
+        raise EhentaiError(
+            "e-hentai 拒絕了這台主機的請求（Key missing, or incorrect key provided.）。"
+            "這通常是 IP 被暫時限制，或需要登入 Cookie。"
+            "請確認 EHENTAI_COOKIES 是最新的，或稍後（可能數分鐘到數小時）再試。"
+        )
+
     title_match = _TITLE_RE.search(text)
     if not title_match:
         if "login" in text.lower() and "ipb_member_id" in text:
@@ -286,6 +301,56 @@ def parse_gallery_page(text: str, url: str) -> EhentaiGallery:
     )
 
 
+def request_with_retry(client, method: str, url: str, *, attempts: int = 5,
+                       base_delay: float = 2.0, **kwargs):
+    """
+    One e-hentai request, retried on transient connection failures.
+
+    This exists because e-hentai **throttles this host at the IP level, at the TCP
+    layer**. Measured directly: six consecutive requests to one gallery all raised
+    ``ConnectTimeout [WinError 10060]`` - the SYN was dropped, not answered - and the
+    same URL answered 200 in 1.7s after a pause, with no code change. The front page can
+    succeed while gallery paths time out, so the throttle is per-connection rather than
+    per-URL.
+
+    Without this a single failure surfaced as "處理時發生錯誤，請稍後再試" with a
+    traceback for something that clears on its own.
+
+    **The retry window is sized to outlast the throttle, not to look reasonable.**
+    Five attempts at 2s, 4s, 8s, 16s cumulatively wait about 30s, which is the order of
+    the observed window; a shorter schedule just burns every attempt inside one window
+    and fails exactly as before. That was a real mistake here: three attempts (~6s)
+    still failed on every try.
+
+    Only connection-level failures are retried. An HTTP status is a considered answer -
+    404 means the gallery really is gone - and retrying it would repeat the refusal
+    while making the user wait.
+
+    Raises EhentaiError once the attempts are exhausted, so every caller reports the
+    same thing rather than leaking httpx exception types to the user.
+    """
+    import httpx
+
+    delay = base_delay
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.request(method, url, **kwargs)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+                httpx.RemoteProtocolError) as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            logger.warning("e-hentai 請求失敗（第 %s/%s 次，%s），%.1f 秒後重試：%s",
+                           attempt, attempts, type(exc).__name__, delay, url)
+            time.sleep(delay)
+            delay *= 2
+    raise EhentaiError(
+        f"連線 e-hentai 逾時或中斷（已重試 {attempts} 次）："
+        f"{type(last_exc).__name__}。e-hentai 有時會暫時限制連線，請稍後再試。"
+    ) from last_exc
+
+
 def fetch_gallery(url: str, *, cookies_path=None, timeout: float = 60.0,
                   http_client=None) -> EhentaiGallery:
     """
@@ -306,7 +371,9 @@ def fetch_gallery(url: str, *, cookies_path=None, timeout: float = 60.0,
 
     client = http_client or httpx.Client(timeout=timeout, follow_redirects=True)
     try:
-        response = client.get(url, headers=headers)
+        # Retried: the throttling described in request_with_retry hits this call too,
+        # and it is the first request of every gallery action.
+        response = request_with_retry(client, "GET", url, headers=headers)
         if response.status_code == 404:
             raise EhentaiError(
                 "找不到這個畫廊。可能是連結有誤或畫廊已被刪除。"

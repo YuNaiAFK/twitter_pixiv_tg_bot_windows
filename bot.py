@@ -4239,7 +4239,7 @@ def resolve_official_archive(gallery, *, resample: bool) -> tuple[str, str, int]
 
     with httpx.Client(headers=headers, follow_redirects=True,
                       timeout=float(EHENTAI_TIMEOUT_SECONDS)) as client:
-        prepared = client.post(archiver_url, data=form)
+        prepared = ehentai.request_with_retry(client, "POST", archiver_url, data=form)
         if prepared.status_code >= 400:
             raise ehentai.EhentaiError(
                 f"官方歸檔頁面回應 {prepared.status_code}，請確認 Cookie 是否有效。")
@@ -4261,7 +4261,10 @@ def resolve_official_archive(gallery, *, resample: bool) -> tuple[str, str, int]
 
         # A ranged GET: this reads the real filename and total size without pulling
         # the whole archive, which matters because the original can be hundreds of MB.
-        probe = client.get(download_url, headers={"Range": "bytes=0-3"})
+        # Retried for the same reason as the POST above, and safe to repeat: the range
+        # asks for four bytes, so a retry cannot re-download the archive.
+        probe = ehentai.request_with_retry(
+            client, "GET", download_url, headers={"Range": "bytes=0-3"})
         if probe.status_code >= 400:
             raise ehentai.EhentaiError(
                 f"官方歸檔下載連結無效（HTTP {probe.status_code}）。")
