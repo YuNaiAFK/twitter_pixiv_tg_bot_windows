@@ -399,6 +399,46 @@ check("e-hentai retries stay light",
 check("e-hentai retries use a fixed delay, not doubling backoff",
       "delay *= 2" not in inspect.getsource(ehentai.request_with_retry),
       "doubling backoff multiplied load on an already-unhappy host")
+
+# The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
+# .pixiv.net entries a multi-site cookie export carries - another site's session cookies
+# handed to e-hentai. Measured before the fix: 1707 chars, 8 foreign cookies.
+_cookie_work = Path(tempfile.mkdtemp(prefix="dsh-cookies-"))
+try:
+    _cf = _cookie_work / "mixed.txt"
+    _cf.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".e-hentai.org\tTRUE\t/\tTRUE\t0\tipb_member_id\t12345\n"
+        ".e-hentai.org\tTRUE\t/\tTRUE\t0\tipb_pass_hash\tabcdef\n"
+        ".exhentai.org\tTRUE\t/\tTRUE\t0\tigneous\txyz\n"
+        ".x.com\tTRUE\t/\tTRUE\t0\tauth_token\tSECRET_TWITTER\n"
+        ".pixiv.net\tTRUE\t/\tTRUE\t0\tPHPSESSID\tSECRET_PIXIV\n"
+        "note-this-is-not-a-cookie-line\n",
+        encoding="utf-8")
+    _hdr = ehentai.cookies_header(_cf)
+    check("e-hentai cookies are sent",
+          "ipb_member_id=12345" in _hdr and "igneous=xyz" in _hdr,
+          _hdr[:80])
+    check("another site's cookies are NOT sent to e-hentai",
+          "SECRET_TWITTER" not in _hdr and "SECRET_PIXIV" not in _hdr,
+          f"leaked: {_hdr[:120]}")
+    check("a malformed line is skipped rather than crashing",
+          isinstance(_hdr, str) and "note-this-is-not-a-cookie-line" not in _hdr)
+    check("the allowed domains are declared once",
+          ehentai.COOKIE_DOMAINS == ("e-hentai.org", "exhentai.org", "hath.network"),
+          ehentai.COOKIE_DOMAINS)
+    # A leading-dot domain must match its own subdomains, or forums.exhentai.org cookies
+    # would be dropped.
+    _sub = _cookie_work / "sub.txt"
+    _sub.write_text(".forums.e-hentai.org\tTRUE\t/\tTRUE\t0\tf\t1\n"
+                    "e-hentai.org\tTRUE\t/\tTRUE\t0\thostonly\t2\n", encoding="utf-8")
+    _shdr = ehentai.cookies_header(_sub)
+    check("subdomain and host-only cookies are both kept",
+          "f=1" in _shdr and "hostonly=2" in _shdr, _shdr)
+finally:
+    shutil.rmtree(_cookie_work, ignore_errors=True)
+    # The memo cache is keyed on path, so a removed temp file cannot poison later reads.
+    ehentai._cookie_header_cache.clear()
 # e-hentai polices gallery-page access hard, so an archive click must not spend a /g/
 # request: the gid and token it needs are already in the cached gallery. Measured: with a
 # warm cache the only request is POST archiver.php?gid=..&token=.., and fetch_gallery is

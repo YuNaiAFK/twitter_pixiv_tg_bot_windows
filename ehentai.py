@@ -392,6 +392,10 @@ def fetch_gallery(url: str, *, cookies_path=None, timeout: float = 60.0,
             client.close()
 
 
+# Domains whose cookies may be sent to e-hentai. Anything else in the file belongs to a
+# different site and must not travel with these requests.
+COOKIE_DOMAINS = ("e-hentai.org", "exhentai.org", "hath.network")
+
 _cookie_header_cache: dict[tuple, tuple[float, int, str]] = {}
 _cookie_header_lock = threading.Lock()
 
@@ -433,7 +437,23 @@ def cookies_header(path) -> str:
 
 
 def _read_cookie_header(path) -> str:
-    """Parse a Netscape cookie file into a Cookie header value."""
+    """
+    Parse a Netscape cookie file into a Cookie header for **e-hentai only**.
+
+    The domain is filtered, and that is a fix rather than tidiness. A cookie file may
+    hold cookies for several sites - the one in this repository carried `.pixiv.net` and
+    `.x.com` entries alongside the e-hentai ones - and this function used to send
+    **every** cookie in the file to every e-hentai request:
+
+        .e-hentai.org            8 cookies   sent
+        .exhentai.org            7 cookies   sent
+        .x.com                   7 cookies   LEAKED to e-hentai
+        .pixiv.net               1 cookie    LEAKED to e-hentai
+
+    That hands another site's session cookies to e-hentai, and it is the kind of thing
+    that also makes a site unhappy with the request. Sending only the cookies that belong
+    to the host is both correct and what the file format means.
+    """
     pairs = []
     try:
         for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
@@ -443,7 +463,17 @@ def _read_cookie_header(path) -> str:
             elif not raw or raw[0] in ("#", "$"):
                 continue
             fields = raw.split("\t")
-            if len(fields) == 7:
+            if len(fields) != 7:
+                continue
+            # A leading dot means "this domain and its subdomains", which is why the
+            # comparison is a suffix test on the stripped domain.
+            domain = fields[0].strip().lstrip(".").lower()
+            if not domain:
+                # A host-only cookie row with no domain: keep it, it belongs to nobody else.
+                pairs.append(f"{fields[5]}={fields[6]}")
+                continue
+            if any(domain == allowed or domain.endswith("." + allowed)
+                   for allowed in COOKIE_DOMAINS):
                 pairs.append(f"{fields[5]}={fields[6]}")
     except OSError as exc:
         logger.warning("讀取 e-hentai cookie 檔案失敗：%s（%s）", path, exc)
