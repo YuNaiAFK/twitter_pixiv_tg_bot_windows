@@ -1153,6 +1153,29 @@ an *application*, and Telegram ties them to your account.
    `skr9008PLBot` looks valid and is refused. The submission then sits on *Saving…* and
    raises `my.telegram.org 顯示 ERROR`.
 
+   **That `ERROR` dialog never says why.** The page's own `createApp()` hands the raw
+   jQuery XHR object to `alert()` on failure, so a real message from the server is
+   replaced by a useless `ERROR` — only a *successful* HTTP response has its body
+   alerted. To see the actual reason, run this in the browser console on `/apps`
+   (F12 → Console):
+
+   ```js
+   $.post('/apps/create', {hash:$('[name=hash]').val(),
+     app_title:'shiroko9008parselinkbot', app_shortname:'skr9008plbot',
+     app_url:'https://example.com', app_platform:'desktop', app_desc:''})
+    .done(t => alert('OK: '+JSON.stringify(t)))
+    .fail((x,s,e) => alert('HTTP '+x.status+' :: '+x.responseText));
+   ```
+
+   It prints the status and body instead of swallowing them. Interpreting the answer:
+
+   | Result | Meaning |
+   | --- | --- |
+   | `OK: ...` | created — reload `/apps` to read the `api_id` / `api_hash` |
+   | `HTTP 401 :: Unauthorized` | the session or the page's `hash` expired — reload `/apps` and retry |
+   | `HTTP 429` or a *too many tries* body | the login rate limit — **stop retrying**, wait hours or change network |
+   | any other body text | a field was rejected; the text names which |
+
 4. Submit. The page then shows:
    - **App api_id** — a number, e.g. `1234567`
    - **App api_hash** — 32 hex characters, e.g. `0123456789abcdef0123456789abcdef`
