@@ -935,7 +935,7 @@ async def send_cached_media(message, status, url: str, payload: dict,
 
     scratch = make_work_dir()
     try:
-        sent, note = await send_original_files(
+        sent, note, _too_large = await send_original_files(
             message, files, url, scratch,
             as_document=(platform == "pixiv"),
             # The same platform split as a fresh download: only X/Twitter carries the
@@ -943,7 +943,6 @@ async def send_cached_media(message, status, url: str, payload: dict,
             # original send did not have.
             attach_link=(platform != "pixiv"),
             # Blur adult works. The rating is cached, so a replay costs nothing extra.
-            spoiler=detect_spoiler(url, platform),
         )
     except TelegramError as exc:
         logger.warning("從快取傳送失敗，將重新下載：%s", exc)
@@ -1678,213 +1677,20 @@ def commands_hint() -> str:
     )
 
 
-def media_is_adult(platform: str | None, url: str, metadata: dict | None = None) -> bool:
-    """
-    Whether this work is adult content, for Telegram's spoiler blur.
-
-    Requested: adult works should arrive blurred. Telegram's ``has_spoiler`` does that
-    for photos, videos and animations.
-
-    **Pixiv** is read from the work's own rating, which gallery-dl already reports in the
-    metadata it fetches for the download:
-
-        "rating": "R-18", "x_restrict": 1
-
-    ``x_restrict`` is the reliable field and is checked first; ``rating`` is the readable
-    fallback. Both come from the same response, so no extra request is involved. Measured
-    on this machine: a daily-ranking work reports ``"General"``/``0`` while the reported
-    adult work reports ``"R-18"``/``1``, so the field does distinguish them.
-
-    **e-hentai** already classifies every gallery - ``is_adult`` is what decides whether a
-    Telegraph page may be built at all - so the gallery object is consulted directly.
-
-    Returns False when the rating cannot be determined. Unknown content is **not**
-    blurred: a false positive blurs every ordinary artwork, which is worse than a missed
-    blur, and the classification is not always available.
-    """
-    if metadata:
-        restrict = metadata.get("x_restrict")
-        if restrict is not None:
-            try:
-                if int(restrict) > 0:
-                    return True
-            except (TypeError, ValueError):
-                pass
-        rating = str(metadata.get("rating") or "").strip().lower()
-        if rating:
-            return rating.startswith("r-18")
-
-    # A rating recorded by an earlier request. This is what makes a repeat cost nothing:
-    # without it every send re-ran gallery-dl to re-read the same answer, which was
-    # measured at about a second per call.
-    cached_rating = PARSE_CACHE.lookup(url, kind="rating")
-    if cached_rating is not None and "adult" in cached_rating:
-        return bool(cached_rating["adult"])
-
-    if platform == "ehentai":
-        cached = PARSE_CACHE.lookup(url, kind="gallery")
-        gallery = gallery_from_payload(cached) if cached else None
-        if gallery is not None:
-            return bool(getattr(gallery, "is_adult", False))
-    return False
-
-
-def fetch_media_metadata(url: str, platform: str | None) -> dict:
-    """
-    The metadata dictionary gallery-dl reports for this URL, or {}.
-
-    Used only to read the age rating. gallery-dl prints one JSON array of entries per
-    post and the artwork's own fields are in the entry carrying an ``"id"``, so that is
-    the entry returned. Any failure returns {} rather than raising: a missing rating means
-    "do not blur", which must never take a working download down with it.
-    """
-    # Built in order rather than by splicing into a list. The first version inserted
-    # --cookies at a fixed index, which landed it between --config and its value, so
-    # gallery-dl read the config path as the cookie file, exited 2 with a usage error,
-    # and the rating silently came back unknown - which looked like "not adult".
-    command = [find_executable()]
-    config_path = gallery_dl_config_path()
-    if config_path is not None:
-        command += ["--config", str(config_path)]
-    cookies_path = resolve_cookie_file(platform) if platform else None
-    if cookies_path is not None:
-        command += ["--cookies", str(cookies_path)]
-    command += ["-j", "--", url]
-
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=min(90.0, float(MAX_DOWNLOAD_SECONDS)),
-            check=False,
-            shell=False,
-            env=gallery_dl_env(platform),
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning("讀取作品分級失敗（%s）：%s", url, exc)
-        return {}
-
-    if result.returncode != 0:
-        return {}
-    try:
-        entries = json.loads(result.stdout or "[]")
-    except json.JSONDecodeError:
-        return {}
-    for entry in entries if isinstance(entries, list) else []:
-        if (isinstance(entry, list) and len(entry) >= 3
-                and isinstance(entry[2], dict) and "id" in entry[2]):
-            return entry[2]
-    return {}
-
-
-def detect_spoiler(url: str, platform: str | None) -> bool:
-    """
-    Whether this request's media should be sent blurred.
-
-    The rating is looked for in the parse cache first, so a repeat of a known work costs
-    no extra request. On a miss the metadata is fetched once per request and stored back
-    into the cache, so it is paid for once per work rather than once per send - which
-    matters because one request sends several messages.
-
-    e-hentai needs no fetch: its gallery object already carries the classification, and
-    that is cached separately under ``kind="gallery"``.
-    """
-    try:
-        if media_is_adult(platform, url):
-            return True
-        if platform == "ehentai":
-            return False
-
-        metadata = fetch_media_metadata(url, platform)
-        if not metadata:
-            return False
-
-        adult = media_is_adult(platform, url, metadata)
-        # Remember the rating for next time. Stored as its own entry so it survives
-        # independently of the media cache, which is pruned and may hold no files yet.
-        try:
-            PARSE_CACHE.store(url, "rating", {"adult": adult})
-            PARSE_CACHE.save()
-        except (OSError, ValueError) as exc:  # pragma: no cover - cache is best effort
-            logger.debug("無法快取分級：%s", exc)
-        return adult
-    except Exception:  # noqa: BLE001
-        # Blurring is cosmetic. A failure here must never stop the media being sent.
-        logger.warning("判斷成人內容失敗，將不加模糊：%s", url, exc_info=True)
-        return False
-
-
-def media_delivery(file_path: Path, *, prefer_original: bool,
-                   adult: bool) -> tuple[bool, bool]:
-    """
-    How one file should be sent. Returns ``(as_document, spoiler)``.
-
-    Requested policy: **an ordinary work goes as a document so the original is
-    preserved, and an adult work goes as a photo so Telegram will blur it.**
-
-    That combination is not a preference - it is forced by Telegram:
-
-    * ``has_spoiler`` **blurs photos**, and Telegram's clients do not blur documents.
-      A document album added unblurred earlier for exactly this reason.
-    * ``reply_photo`` re-encodes the image and renames it ``.jpg``, so a photo upload is
-      never byte-identical to the original. Sending an ordinary work as a photo would
-      therefore silently break the "original files" guarantee that was asked for first.
-    * ``reply_photo`` is capped at ``PHOTO_LIMIT_BYTES`` (10 MB) regardless of the
-      self-hosted server's 2000 MB ceiling, because that limit is Telegram's, not the
-      server's.
-
-    So an adult work larger than the photo limit **cannot** be blurred. It is sent as a
-    document instead of being dropped or shrunk: the artwork still arrives, and the
-    caller notes why it is unblurred. Failing the request to protect the blur would be
-    the wrong trade.
-    """
-    suffix = file_path.suffix.lower()
-    if suffix not in IMAGE_EXTENSIONS:
-        # Not an image: no blur concept applies, and the original is all that matters.
-        return True, False
-    if not adult:
-        # Ordinary work: the original file, untouched.
-        return prefer_original, False
-    if file_path.stat().st_size <= PHOTO_LIMIT_BYTES:
-        # Adult and small enough: send as a photo so the blur applies.
-        return False, True
-    # Adult but too large for a photo: deliver it, unblurred, rather than lose it.
-    return True, False
-
-
-def needs_archive_delivery(files: list[Path], *, adult: bool) -> bool:
-    """
-    Whether this work must be delivered as a ZIP rather than as images.
-
-    True only when **every** image is adult and larger than ``PHOTO_LIMIT_BYTES``.
-
-    The all-or-nothing rule is deliberate. A partial split - some pages as a blurred
-    album, the rest in an archive - would send the same work twice in two forms, which is
-    the duplication bug that was reported earlier. One work, one delivery.
-    """
-    if not adult or not files:
-        return False
-    return all(f.suffix.lower() in IMAGE_EXTENSIONS
-               and f.stat().st_size > PHOTO_LIMIT_BYTES for f in files)
-
-
 def zip_files(files: list[Path], temp_dir: Path, archive_name: str) -> Path:
     """
     Put ``files`` into one ZIP inside ``temp_dir`` and return its path.
 
-    Requested for the case this exists for: an adult work whose images are too large
-    for ``reply_photo`` (Telegram's 10 MB ceiling) cannot be sent as a blurred photo.
-    Bundling them into an archive delivers the bytes **exactly as downloaded** - a ZIP
-    preserves the originals, so nothing is re-encoded - and sidesteps the photo size
-    limit entirely, because the archive travels as a document.
+    Used when Telegram refuses a file for being too large. A ZIP preserves the originals
+    **byte for byte** - nothing is re-encoded - and travels as a document, so it is not
+    subject to the 10 MB photo ceiling that made the direct send impossible.
 
-    Compression is worth having on top of that: PNG artwork often shrinks noticeably,
-    and ``ZIP_DEFLATED`` costs a little CPU for it. It is not the reason for the
-    archive, though - keeping the originals is.
+    Compression is a side benefit rather than the point: PNG artwork often shrinks, and
+    ``ZIP_DEFLATED`` costs a little CPU for it. Keeping the originals intact is the
+    reason this exists.
     """
     archive_path = temp_dir / sanitize_filename(archive_name, "pixiv.zip")
-    # Store relative names only, so extracting does not recreate a temp directory tree.
+    # Relative names only, so extracting does not recreate a temp directory tree.
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
         used: set[str] = set()
         for item in files:
@@ -1898,6 +1704,26 @@ def zip_files(files: list[Path], temp_dir: Path, archive_name: str) -> Path:
             used.add(name)
             archive.write(item, arcname=name)
     return archive_path
+
+
+def is_size_refusal(exc: Exception) -> bool:
+    """
+    Whether Telegram refused a send specifically because the file is too large.
+
+    Checked by message text because the Bot API has no distinct error code for it - the
+    refusal arrives as a generic ``BadRequest``. The phrases cover the wording the API
+    uses ("file is too big", "PHOTO_INVALID_DIMENSIONS" for an oversized photo) and are
+    matched case-insensitively.
+
+    Guarded narrowly on purpose: treating *any* BadRequest as a size problem would turn a
+    genuine rejection - a broken file, a bad chat - into a pointless ZIP and a confusing
+    message.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        "too big", "too large", "file is too", "filesize", "file size",
+        "photo_invalid_dimensions", "invalid dimensions",
+    ))
 
 
 def admin_hint(platform: str | None = None) -> str:
@@ -3184,7 +3010,7 @@ async def edit_message_to_cover(status, gallery, caption: str,
 async def send_single_media(message, file_path: Path, source_url: str,
                             temp_dir: Path, extra: str = "",
                             prefer_original: bool = False,
-                            keyboard=None, caption=None, spoiler: bool = False) -> bool:
+                            keyboard=None, caption=None) -> bool:
     """
     Send one media file. Returns success.
 
@@ -3229,7 +3055,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
                 caption=text,
                 supports_streaming=True,
                 reply_markup=keyboard,
-                has_spoiler=spoiler,
+                
             )
         return True
 
@@ -3240,7 +3066,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
                 filename=file_path.name,
                 caption=text,
                 reply_markup=keyboard,
-                has_spoiler=spoiler,
+                
             )
         return True
 
@@ -3250,7 +3076,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
             with file_path.open("rb") as media:
                 await message.reply_document(
                     document=media, filename=file_path.name, caption=text,
-                    reply_markup=keyboard, has_spoiler=spoiler,
+                    reply_markup=keyboard,
                 )
             return True
 
@@ -3258,7 +3084,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
             with file_path.open("rb") as media:
                 await message.reply_photo(
                     photo=media, filename=file_path.name, caption=text,
-                    reply_markup=keyboard, has_spoiler=spoiler,
+                    reply_markup=keyboard,
                 )
             return True
 
@@ -3273,14 +3099,14 @@ async def send_single_media(message, file_path: Path, source_url: str,
                     # The link still leads when the image had to be shrunk, so the
                     # compression remark is appended rather than replacing it.
                     caption=(f"{text}\n{compress_note}" if text else compress_note),
-                    reply_markup=keyboard, has_spoiler=spoiler,
+                    reply_markup=keyboard,
                 )
             return True
 
         with file_path.open("rb") as media:
             await message.reply_document(
                 document=media, filename=file_path.name, caption=text,
-                reply_markup=keyboard, has_spoiler=spoiler,
+                reply_markup=keyboard,
             )
         return True
 
@@ -3294,8 +3120,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
 
 async def send_media_album(message, files: list[Path], source_url: str,
                            as_document: bool = False, keyboard=None,
-                           with_caption: bool = True,
-                           spoiler: bool = False) -> bool:
+                           with_caption: bool = True) -> bool:
     """
     Send 2..ALBUM_LIMIT files as one album, with the source link as the **first**
     item's caption so it reads above the images. Raises TelegramError so the caller can
@@ -3337,18 +3162,14 @@ async def send_media_album(message, files: list[Path], source_url: str,
     try:
         media = []
         for index, file_path in enumerate(files):
-            # Per-item, because the policy is per file: an adult work needs a photo for
-            # the blur to apply, an ordinary one needs a document to stay original.
-            item_is_document, item_spoiler = media_delivery(
-                file_path, prefer_original=as_document, adult=spoiler)
-            builder = InputMediaDocument if item_is_document else InputMediaPhoto
+            builder = InputMediaDocument if as_document else InputMediaPhoto
             handle = file_path.open("rb")
             handles.append(handle)
             # Only the first item carries text: Telegram rejects a media group whose
             # items all have captions, and one link is what is wanted anyway.
             item_kwargs = {"media": handle,
                            "caption": caption if index == 0 else None}
-            if item_is_document:
+            if as_document:
                 # Send the real filename, so an original does not arrive as
                 # "file_0.dat". It MUST go through api_kwargs: PTB's `filename=`
                 # parameter is deprecated and is dropped by to_dict(), which was
@@ -3356,29 +3177,9 @@ async def send_media_album(message, files: list[Path], source_url: str,
                 # to {"media": ..., "type": "document"} with no filename at all. Passing
                 # it as a keyword looked correct and did nothing.
                 item_kwargs["api_kwargs"] = {"filename": file_path.name}
-            if item_spoiler and not item_is_document:
-                # InputMediaPhoto declares has_spoiler, so it is a named argument and
-                # PTB serialises it itself.
-                item_kwargs["has_spoiler"] = True
-            elif item_spoiler and item_is_document:
-                # Unreachable through media_delivery, which never pairs a document with
-                # a blur - Telegram does not blur documents. Kept as a guard so a future
-                # change cannot silently send an unblurred "blurred" album item.
-                item_kwargs.setdefault("api_kwargs", {})["has_spoiler"] = True
             media.append(builder(**item_kwargs))
-        if len({type(item).__name__ for item in media}) > 1:
-            # A media group must be all photos or all documents. media_delivery can mix
-            # them when only some pages of adult work fit the photo limit, so say so
-            # rather than let Telegram reject the album.
-            raise TelegramError(
-                "相簿中的項目類型不一致（photo 與 document 混用），改為逐個傳送。")
 
-        # Read off the built items rather than from as_document: the per-file policy can
-        # turn an adult album into photos even though the work is sent "as original", and
-        # a log that said "document" there would misreport what actually went out.
-        kind = "photo" if media and isinstance(media[0], InputMediaPhoto) else "document"
-        blurred = "（已加模糊）" if any(
-            getattr(item, "has_spoiler", False) for item in media) else ""
+        kind = "document" if as_document else "photo"
         try:
             await _reply_media_group(message, media, keyboard)
         except TimedOut:
@@ -3408,7 +3209,7 @@ async def send_media_album(message, files: list[Path], source_url: str,
                 logger.warning("相簿傳送失敗（%s × %s）：%s",
                                kind, len(media), retry_exc)
                 raise
-        logger.info("已以單一相簿傳送 %s 個%s%s%s", len(media), kind, blurred,
+        logger.info("已以單一相簿傳送 %s 個%s%s", len(media), kind,
                     "（第一張帶原始連結）" if caption else "")
         return True
     finally:
@@ -3510,11 +3311,17 @@ async def send_source_link(message, source_note: str):
 async def send_original_files(message, files: list[Path], source_url: str,
                               temp_dir: Path,
                               as_document: bool = True,
-                              attach_link: bool = True,
-                              spoiler: bool = False) -> tuple[int, str]:
+                              attach_link: bool = True
+                              ) -> tuple[int, str, list[Path]]:
     """
     Send downloaded files, optionally with the source link above them.
-    Returns (sent, note).
+    Returns ``(sent, note, oversize)``.
+
+    ``oversize`` lists the files Telegram refused **specifically for being too large**,
+    so the caller can bundle them into a ZIP and tell the user why. It is a list rather
+    than a count because the caller needs the files themselves to build the archive.
+    A file refused for any other reason is not included: it would not be fixed by
+    zipping, and pretending otherwise would hide a real failure.
 
     When ``attach_link`` is set, the link travels inside the first message as its
     caption, so it reads above the images, plus a url button on that same message so it
@@ -3544,6 +3351,8 @@ async def send_original_files(message, files: list[Path], source_url: str,
     """
     sent = 0
     notes = []
+    # Files Telegram refused for being too large, so the caller can ZIP them.
+    too_large: list[Path] = []
     # Whether the source link has already been carried by a sent message. The link is
     # what makes the result self-describing, so it is attached to whichever message
     # goes out first and never repeated. With attach_link off this stays False and
@@ -3577,7 +3386,6 @@ async def send_original_files(message, files: list[Path], source_url: str,
                     keyboard=None,
                     # Later albums get no caption, so the link is not repeated.
                     with_caption=not link_carried,
-                    spoiler=spoiler,
                 )
                 sent += len(chunk)
                 link_carried = True
@@ -3598,14 +3406,11 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 notes.append("相簿傳送失敗，已改為逐個傳送")
         for file_path in chunk:
             try:
-                as_doc, item_spoiler = media_delivery(
-                    file_path, prefer_original=as_document, adult=spoiler)
                 if await send_single_media(
                     message, file_path, source_url, temp_dir,
-                    prefer_original=as_doc,
+                    prefer_original=as_document,
                     keyboard=None,
                     caption=None if link_carried else caption,
-                    spoiler=item_spoiler,
                 ):
                     sent += 1
                     link_carried = True
@@ -3614,29 +3419,35 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 # is reachable from anywhere, so a retry can deliver the same file twice.
                 logger.warning("傳送逾時，不重試以免重複：%s", file_path.name)
                 notes.append(f"{file_path.name} 傳送逾時（可能已送達）")
-            except TelegramError:
-                logger.exception("傳送失敗：%s", file_path.name)
-                notes.append(f"{file_path.name} 傳送失敗")
+            except TelegramError as exc:
+                if is_size_refusal(exc):
+                    too_large.append(file_path)
+                    logger.warning("檔案過大被拒，將改用 ZIP：%s（%s）",
+                                   file_path.name, exc)
+                else:
+                    logger.exception("傳送失敗：%s", file_path.name)
+                    notes.append(f"{file_path.name} 傳送失敗")
 
     for file_path in oversized + others:
         try:
-            as_doc, item_spoiler = media_delivery(
-                file_path, prefer_original=as_document, adult=spoiler)
             if await send_single_media(
                 message, file_path, source_url, temp_dir,
-                prefer_original=as_doc,
+                prefer_original=as_document,
                 keyboard=None,
                 caption=None if link_carried else caption,
-                spoiler=item_spoiler,
             ):
                 sent += 1
                 link_carried = True
         except TimedOut:
             logger.warning("傳送逾時，不重試以免重複：%s", file_path.name)
             notes.append(f"{file_path.name} 傳送逾時（可能已送達）")
-        except TelegramError:
-            logger.exception("傳送失敗：%s", file_path.name)
-            notes.append(f"{file_path.name} 傳送失敗")
+        except TelegramError as exc:
+            if is_size_refusal(exc):
+                too_large.append(file_path)
+                logger.warning("檔案過大被拒，將改用 ZIP：%s（%s）", file_path.name, exc)
+            else:
+                logger.exception("傳送失敗：%s", file_path.name)
+                notes.append(f"{file_path.name} 傳送失敗")
 
     # Nothing carried the link only if there was nothing to send, or every send failed.
     # The text message is still the honest fallback in that case, rather than leaving
@@ -3644,7 +3455,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
     if attach_link and not link_carried and sent == 0:
         await send_source_link(message, caption or build_caption(source_url))
 
-    return sent, ("；".join(dict.fromkeys(notes)) if notes else "")
+    return sent, ("；".join(dict.fromkeys(notes)) if notes else ""), too_large
 
 
 def gallery_url(text: str) -> str | None:
@@ -5576,66 +5387,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Computed once per request, before any send, so every message of a multi-album
-        # work gets the same treatment. On a first request this costs one metadata read;
-        # afterwards the rating is cached and it costs nothing. Failure returns False -
-        # an unblurred ordinary artwork is a better outcome than a failed send.
-        spoiler = await asyncio.to_thread(detect_spoiler, media_url, platform)
-        if spoiler:
-            logger.info("成人內容，將加上模糊：%s", media_url)
-
         if platform == "pixiv":
-            # Requested: an adult work whose images are too big for a blurred photo is
-            # delivered as a ZIP instead.
+            # Sending the artwork as-is: one message per album, original files.
+            # No image is downscaled, so the bytes the recipient gets match what
+            # gallery-dl downloaded.
             #
-            # The reason is a genuine dead end rather than a preference: has_spoiler only
-            # blurs photos, reply_photo caps at Telegram's 10 MB, and an unblurred
-            # document would show the artwork openly. An archive keeps the originals
-            # byte-for-byte, travels as a document so the 10 MB photo ceiling does not
-            # apply, and is not rendered inline - so nothing is exposed.
-            #
-            # Never cut a work in half. This only applies when EVERY image is adult and
-            # oversize; a partial split would send the same work partially as a blurred
-            # album AND as an archive, which is the duplication that was reported before.
-            if needs_archive_delivery(media_files, adult=spoiler):
-                oversized_mb = sum(f.stat().st_size for f in media_files) / 1048576
-                archive = await asyncio.to_thread(
-                    zip_files, media_files, temp_dir, f"pixiv_{Path(media_url).name}.zip")
-                # Tell the user why, and what to expect. A silent archive would look like
-                # the bot had failed to send the artwork.
+            # If a send is refused purely because a file is too large, the work is
+            # re-sent as a ZIP - see send_original_files, which reports that back
+            # through ``oversize`` so the user can be told what happened and why.
+            sent_count, album_note, oversize = await send_original_files(
+                message, media_files, media_url, temp_dir,
+                # Requested: Pixiv sends the images alone, with no source link and no
+                # button. Only X/Twitter carries the link.
+                attach_link=False,
+            )
+
+            if oversize:
+                total_mb = sum(f.stat().st_size for f in oversize) / 1048576
+                # Say what happened and what to expect. An unexplained archive looks
+                # like a failure, and the user cannot tell that the originals are inside.
                 await status.edit_text(
-                    f"這個作品是成人內容，共 {len(media_files)} 張、約 {oversized_mb:.1f} MB，"
-                    f"超過 Telegram 單張圖片 10 MB 的上限，無法加上模糊後傳送。\n\n"
-                    f"已改為壓縮成 ZIP 傳送原檔（不重新編碼，畫質不變）。"
-                    f"請下載後解壓縮查看，檔案較大請稍等。",
+                    f"{len(oversize)} 個檔案因為超過 Telegram 的上傳限制而無法直接傳送"
+                    f"（共約 {total_mb:.1f} MB）。\n\n"
+                    f"已改用 ZIP 傳送原檔，內容與原圖完全相同（不重新編碼）。"
+                    f"檔案較大，請稍等，下載後解壓縮即可看到原檔。",
                     link_preview_options=source_link_options(),
                 )
-                # Sent directly rather than through send_original_files: that helper's
-                # job is albums and the adult/photo policy, and this archive is neither.
-                # A single document, with the source link left to the caller.
+                archive = await asyncio.to_thread(
+                    zip_files, oversize, temp_dir, f"{Path(media_url).name}.zip")
                 await send_single_media(
                     message, archive, media_url, temp_dir,
-                    prefer_original=True,   # a document: the ZIP is the payload
-                    extra="", caption=None,
+                    prefer_original=True,      # a document: the ZIP is the payload
+                    caption=build_caption(media_url),
                 )
                 await cleanup_request_messages(status, message)
                 await asyncio.to_thread(remember_media_parse, media_url, media_files)
                 succeeded = True
                 return
-
-            # Sending the artwork as-is: one message per album, original files.
-            # No image is downscaled, so the bytes the recipient gets match what
-            # gallery-dl downloaded. (A ZIP is used only for the adult-and-oversize
-            # case handled above, where a blurred photo is impossible.)
-            sent_count, album_note = await send_original_files(
-                message, media_files, media_url, temp_dir,
-                # Requested: Pixiv sends the images alone, with no source link and no
-                # button. Only X/Twitter carries the link.
-                attach_link=False,
-                # Requested: adult works arrive blurred. Read from the work's own
-                # rating, which was fetched above and cached on a previous request.
-                spoiler=spoiler,
-            )
 
             summary = f"Pixiv 解析完成，已傳送原圖 {sent_count}/{len(media_files)} 個檔案。"
             if album_note:
@@ -5653,13 +5441,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # --- X/Twitter: the same sender, but as normal photos. A Telegram photo
         # is re-encoded, which is what users expect from a post preview; the
         # byte-exact "original" path is reserved for Pixiv artwork. ---
-        sent_count, album_note = await send_original_files(
+        sent_count, album_note, _too_large = await send_original_files(
             message, media_files, media_url, temp_dir, as_document=False,
             # Requested: X/Twitter shows the source link, Pixiv does not.
             attach_link=True,
-            # X marks adult media itself; its posts carry no rating field, so this is
-            # False unless a future extractor starts reporting one.
-            spoiler=spoiler,
         )
 
         summary = f"X/Twitter 解析完成，已傳送 {sent_count}/{len(media_files)} 個檔案。"

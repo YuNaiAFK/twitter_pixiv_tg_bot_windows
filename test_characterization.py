@@ -502,91 +502,10 @@ check("the cached-send timeout handler comes before the generic one",
       _cache_block.index("except TimedOut") < _cache_block.index("except TelegramError"),
       "TimedOut subclasses TelegramError, so order decides this")
 
-# Requested: adult works arrive blurred. Pixiv's rating comes from the metadata
-# gallery-dl already fetches ("x_restrict": 1 / "rating": "R-18"); e-hentai already has
-# is_adult. Unknown content is NOT blurred - a false positive blurs everything.
-_adult_cases = [
-    ({"x_restrict": 1, "rating": "R-18"}, True, "x_restrict"),
-    ({"x_restrict": 0, "rating": "General"}, False, "general"),
-    ({"rating": "R-18"}, True, "rating only"),
-    ({"x_restrict": "0"}, False, "string zero"),
-    ({}, False, "empty metadata"),
-    (None, False, "no metadata"),
-]
-for _meta, _want, _label in _adult_cases:
-    check(f"adult detection: {_label}",
-          bot.media_is_adult("pixiv", "https://www.pixiv.net/artworks/1", _meta) is _want,
-          f"{_meta} -> {bot.media_is_adult('pixiv', 'https://www.pixiv.net/artworks/1', _meta)}")
-check("unknown content is not blurred",
-      bot.media_is_adult("pixiv", "https://www.pixiv.net/artworks/1", None) is False,
-      "a false positive would blur every ordinary artwork")
-_reads_rating = 'kind="rating"' in inspect.getsource(bot.media_is_adult)
-_stores_rating = 'PARSE_CACHE.store(url, "rating"' in inspect.getsource(bot.detect_spoiler)
-check("the rating is cached so a repeat costs nothing",
-      _reads_rating and _stores_rating,
-      f"read={_reads_rating} store={_stores_rating}; without both, every send re-ran "
-      f"gallery-dl for the same answer")
-check("a failure to classify never blocks the send",
-      "except Exception" in inspect.getsource(bot.detect_spoiler)
-      and "return False" in inspect.getsource(bot.detect_spoiler),
-      "blurring is cosmetic; it must not break delivery")
-# InputMediaDocument has no has_spoiler parameter, so it must go through api_kwargs,
-# while InputMediaPhoto declares it. Verified by serialisation, not by assumption.
-from telegram import InputMediaDocument as _IMD2, InputMediaPhoto as _IMP  # noqa: E402
-
-check("InputMediaPhoto serialises has_spoiler",
-      _IMP(media="x", has_spoiler=True).to_dict().get("has_spoiler") is True)
-check("InputMediaDocument needs api_kwargs for has_spoiler",
-      "has_spoiler" not in inspect.signature(_IMD2.__init__).parameters
-      and _IMD2(media="x", api_kwargs={"has_spoiler": True}).to_dict()
-      .get("has_spoiler") is True,
-      "it has no named parameter, so api_kwargs is the only route")
 _album_src3 = inspect.getsource(bot.send_media_album)
-check("the album uses the right channel per media type",
-      'item_kwargs["has_spoiler"] = True' in _album_src3
-      and 'item_kwargs.setdefault("api_kwargs", {})["has_spoiler"] = True' in _album_src3,
-      "using one channel for both would silently drop the flag")
 
-# Requested policy: an ordinary work goes as a document so the original is preserved,
-# an adult one goes as a photo so Telegram will blur it. Forced by Telegram - has_spoiler
-# blurs photos only, and reply_photo re-encodes, so an ordinary work sent as a photo
-# would quietly stop being the original.
-_delivery_work = Path(tempfile.mkdtemp(prefix="dsh-delivery-"))
-try:
-    _small = _delivery_work / "s_p0.png"
-    _small.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 5_000_000)
-    _big = _delivery_work / "b_p0.png"
-    _big.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 12_000_000)
-    _vid = _delivery_work / "v_p0.mp4"
-    _vid.write_bytes(b"x" * 1000)
+from telegram import InputMediaDocument as _IMD2  # noqa: E402
 
-    for _path, _pref, _adult, _want, _label in (
-            (_small, True, False, (True, False), "ordinary keeps the original document"),
-            (_small, True, True, (False, True), "adult becomes a photo, blurred"),
-            (_big, True, True, (True, False),
-             "adult over the 10 MB photo limit still arrives, unblurred"),
-            (_vid, True, True, (True, False), "a video has no blur and stays original"),
-    ):
-        check(f"delivery: {_label}",
-              bot.media_delivery(_path, prefer_original=_pref, adult=_adult) == _want,
-              f"got {bot.media_delivery(_path, prefer_original=_pref, adult=_adult)}")
-finally:
-    shutil.rmtree(_delivery_work, ignore_errors=True)
-
-check("the photo limit is Telegram's 10 MB, not the server's",
-      bot.PHOTO_LIMIT_BYTES == 10 * 1024 * 1024,
-      "the self-hosted server's 2000 MB does not apply to reply_photo")
-check("a mixed album is refused rather than sent",
-      "項目類型不一致" in _album_src3,
-      "a media group must be all photos or all documents")
-check("the album log reads the real kind, not the request",
-      "isinstance(media[0], InputMediaPhoto)" in _album_src3,
-      "an adult album is photos even though the work is sent as original")
-
-# The album sent every document with filename=None, so a Pixiv original arrived as
-# "file_0.dat" instead of 150824857_p0.png. PTB's filename= parameter is deprecated and
-# dropped by to_dict(), so it has to go through api_kwargs - proven by serialising, since
-# passing it as a keyword looks correct and does nothing.
 check("album documents carry their real filename via api_kwargs",
       'item_kwargs["api_kwargs"] = {"filename": file_path.name}' in _album_src3,
       "a document album would deliver originals under a generic name")
@@ -596,55 +515,76 @@ check("PTB drops the filename named parameter (pinned)",
 check("api_kwargs is the route that survives serialisation",
       _IMD2(media="x", api_kwargs={"filename": "n.png"}).to_dict().get("filename") == "n.png")
 
-# Requested: an adult work too large for a blurred photo is delivered as a ZIP. The
-# all-or-nothing rule matters - a partial split would send one work twice, in two forms.
+# Telegram refuses an oversized file with a generic BadRequest and no distinct code, so
+# the fallback matches on wording - narrowly, because treating any refusal as a size
+# problem would turn a broken file into a pointless ZIP and a confusing message.
+from telegram.error import BadRequest as _BadRequest  # noqa: E402
+
+for _msg, _want, _label in (
+        ("Bad Request: file is too big", True, "too big"),
+        ("Bad Request: file size exceeds limit", True, "size exceeds"),
+        ("Bad Request: PHOTO_INVALID_DIMENSIONS", True, "photo dimensions"),
+        ("Bad Request: chat not found", False, "a missing chat is not a size problem"),
+        ("Bad Request: wrong file identifier", False, "a bad file id is not size"),
+        ("Bad Request: file must be non-empty", False, "an empty file is not size"),
+):
+    check(f"size refusal: {_label}",
+          bot.is_size_refusal(_BadRequest(_msg)) is _want,
+          f"{_msg!r} -> {bot.is_size_refusal(_BadRequest(_msg))}")
+
+# The ZIP exists so nothing is re-encoded: it must carry the originals byte for byte.
 _arch_work = Path(tempfile.mkdtemp(prefix="dsh-archive-"))
 try:
-    def _mk(name, megabytes):
-        p = _arch_work / name
-        p.write_bytes(b"x" * int(megabytes * 1024 * 1024))
-        return p
-
-    _over1, _over2 = _mk("o_p0.png", 12), _mk("o_p1.png", 12)
-    _under = _mk("u_p0.png", 5)
-    _clip = _mk("c_p0.mp4", 12)
-
-    for _files, _adult, _want, _label in (
-            ([_over1, _over2], True, True, "adult, all oversize -> archive"),
-            ([_over1, _under], True, False, "adult, mixed sizes -> no split"),
-            ([_under, _under], True, False, "adult, all under -> album"),
-            ([_over1, _over2], False, False, "ordinary oversize -> original document"),
-            ([_over1, _clip], True, False, "a video is not archived"),
-    ):
-        check(f"archive decision: {_label}",
-              bot.needs_archive_delivery(_files, adult=_adult) is _want,
-              f"got {bot.needs_archive_delivery(_files, adult=_adult)}")
-
-    # The archive must carry the originals byte-for-byte: it exists precisely so nothing
-    # is re-encoded.
     import hashlib as _hashlib
     import zipfile as _zipfile
 
-    _arc = bot.zip_files([_over1, _under], _arch_work, "pixiv_1.zip")
+    _a = _arch_work / "o_p0.png"
+    _a.write_bytes(b"\x89PNG\r\n\x1a\n" + b"first" * 2000)
+    _b = _arch_work / "o_p1.png"
+    _b.write_bytes(b"\x89PNG\r\n\x1a\n" + b"second" * 2000)
+
+    _arc = bot.zip_files([_a, _b], _arch_work, "pixiv_150824857.zip")
     with _zipfile.ZipFile(_arc) as _zf:
-        check("the archive holds the original bytes",
-              _hashlib.sha256(_zf.read("o_p0.png")).hexdigest()
-              == _hashlib.sha256(_over1.read_bytes()).hexdigest(),
-              "a re-encoded archive would defeat the point of sending one")
+        check("the archive holds the originals byte for byte",
+              all(_hashlib.sha256(_zf.read(_n)).hexdigest()
+                  == _hashlib.sha256(_p.read_bytes()).hexdigest()
+                  for _n, _p in (("o_p0.png", _a), ("o_p1.png", _b))),
+              "a re-encoded archive would defeat its whole purpose")
         check("the archive keeps the real filenames",
-              set(_zf.namelist()) == {"o_p0.png", "u_p0.png"}, _zf.namelist())
+              set(_zf.namelist()) == {"o_p0.png", "o_p1.png"}, _zf.namelist())
         check("the archive is not corrupt", _zf.testzip() is None)
+
+    # A duplicate name must not silently overwrite the earlier entry.
+    _dupdir = _arch_work / "sub"
+    _dupdir.mkdir()
+    _dup = _dupdir / "o_p0.png"
+    _dup.write_bytes(b"different")
+    with _zipfile.ZipFile(bot.zip_files([_a, _dup], _arch_work, "dup.zip")) as _zf:
+        check("a duplicate filename does not overwrite an entry",
+              len(_zf.namelist()) == 2 and len(set(_zf.namelist())) == 2,
+              _zf.namelist())
 finally:
     shutil.rmtree(_arch_work, ignore_errors=True)
 
 _handle_src3 = inspect.getsource(bot.handle_message)
-check("the archive path explains itself to the user",
-      "超過 Telegram 單張圖片 10 MB 的上限" in _handle_src3
-      and "請下載後解壓縮查看" in _handle_src3,
+check("the ZIP fallback explains itself to the user",
+      "無法直接傳送" in _handle_src3 and "下載後解壓縮" in _handle_src3,
       "a silent archive would look like a failure")
+check("the message gives the size, so the wait makes sense",
+      "total_mb" in _handle_src3,
+      "the user needs to know how big it is before waiting")
+check("the fallback says the originals are inside",
+      "不重新編碼" in _handle_src3,
+      "otherwise the user cannot tell the ZIP is lossless")
+check("the fallback triggers only on a size refusal",
+      "if oversize:" in _handle_src3,
+      "zipping after an unrelated failure hides the real error")
 check("the archive is sent as a document, not a photo",
       "prefer_original=True" in _handle_src3,
-      "a photo upload would re-encode and might exceed the 10 MB photo limit")
+      "a photo upload would re-encode and hit the 10 MB ceiling")
+check("the original is attempted first, before any ZIP",
+      _handle_src3.index("await send_original_files(") < _handle_src3.index("zip_files"),
+      "zipping first would defeat the request for original files")
 
 # The refusal is HTTP 200 with a tiny body, so a status check cannot see it and the
 # generic "gallery deleted" message would be actively misleading.
