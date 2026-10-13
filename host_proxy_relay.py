@@ -76,12 +76,60 @@ class Server(socketserver.ThreadingTCPServer):
     proxy_port = 7897
 
 
+def selftest(list_port: int, target_ip: str = "149.154.167.50",
+             target_port: int = 443) -> int:
+    """
+    Complete a SOCKS5 handshake to a Telegram address through the relay.
+
+    Run this **from inside the container** to prove the whole chain in one step:
+    relay reachable, SOCKS5 handshake accepted, and the proxy able to reach a Telegram
+    address that is blocked on this network. Testing the relay from the host proves less
+    than it looks - the host can always reach its own loopback.
+
+    Returns a process exit code.
+    """
+    import struct
+
+    for host in ("127.0.0.1", "192.168.65.254", "172.18.0.1",
+                 "host.docker.internal"):
+        try:
+            sock = socket.create_connection((host, list_port), timeout=8)
+        except OSError as exc:
+            print(f"  {host}:{list_port} unreachable ({exc.__class__.__name__})")
+            continue
+        try:
+            sock.sendall(b"\x05\x01\x00")
+            greeting = sock.recv(2)
+            if greeting != b"\x05\x00":
+                print(f"  {host}:{list_port} greeting refused: {greeting.hex()}")
+                continue
+            sock.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(target_ip)
+                         + struct.pack(">H", target_port))
+            reply = sock.recv(4)
+            if len(reply) == 4 and reply[1] == 0:
+                print(f"  {host}:{list_port} -> SOCKS5 CONNECT to "
+                      f"{target_ip}:{target_port} OK")
+                return 0
+            print(f"  {host}:{list_port} connect refused "
+                  f"({reply.hex() if reply else 'no reply'})")
+        finally:
+            sock.close()
+    print("  no address worked")
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list-port", type=int, default=17900)
     parser.add_argument("--proxy-port", type=int, default=7897)
     parser.add_argument("--proxy-host", default=PROXY_HOST)
+    parser.add_argument("--selftest", action="store_true",
+                        help="Complete a SOCKS5 handshake through the relay and exit. "
+                             "Run this inside the container to prove the whole chain.")
     args = parser.parse_args()
+
+    if args.selftest:
+        return selftest(args.list_port)
 
     Server.proxy_port = args.proxy_port
     Server.proxy_host = args.proxy_host
