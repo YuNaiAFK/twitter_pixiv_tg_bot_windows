@@ -400,6 +400,65 @@ check("e-hentai retries use a fixed delay, not doubling backoff",
       "delay *= 2" not in inspect.getsource(ehentai.request_with_retry),
       "doubling backoff multiplied load on an already-unhappy host")
 
+# httpx does NOT read the Windows registry proxy, so every e-hentai request went out
+# directly and timed out while the same URL worked in a browser - and worked from httpx
+# the moment proxy= was passed. Every client must therefore carry it explicitly.
+_saved_proxy = {k: os.environ.get(k) for k in
+                ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                 "ALL_PROXY", "all_proxy")}
+try:
+    for _k in _saved_proxy:
+        os.environ.pop(_k, None)
+    os.environ["HTTPS_PROXY"] = "http://example.invalid:9"
+    _env_proxy = ehentai.proxy_url()
+finally:
+    for _k, _v in _saved_proxy.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+check("an explicit environment variable wins over the registry",
+      _env_proxy == "http://example.invalid:9", f"got {_env_proxy!r}")
+check("the registry proxy is read on Windows",
+      os.name != "nt" or ehentai.proxy_url() == "" or "://" in ehentai.proxy_url(),
+      f"got {ehentai.proxy_url()!r}")
+_kw = ehentai.http_client_kwargs(10.0)
+check("client kwargs include the proxy when one exists",
+      ("proxy" in _kw) == bool(ehentai.proxy_url()),
+      f"proxy in kwargs={('proxy' in _kw)}, proxy_url={ehentai.proxy_url()!r}")
+check("client kwargs keep the timeout and redirects",
+      _kw["timeout"] == 10.0 and _kw["follow_redirects"] is True, _kw)
+
+# Every httpx client in both files must use the helper. A single bare
+# httpx.Client(timeout=...) is enough to time out on its own - and the call is often
+# split over two lines, so the check reads the whole statement rather than one line.
+for _mod_name, _path in (("ehentai.py", HERE / "ehentai.py"),
+                         ("bot.py", HERE / "bot.py")):
+    _lines = _path.read_text(encoding="utf-8").splitlines()
+    _bare = []
+    for _i, _ln in enumerate(_lines):
+        if "httpx.Client(" not in _ln:
+            continue
+        # Join until the parentheses balance, to see the whole call.
+        _stmt = _ln
+        _depth = _ln.count("(") - _ln.count(")")
+        while _depth > 0 and _i + 1 < len(_lines):
+            _i += 1
+            _stmt += " " + _lines[_i].strip()
+            _depth += _lines[_i].count("(") - _lines[_i].count(")")
+        if "http_client_kwargs" not in _stmt and "http_client or" not in _stmt:
+            _bare.append(_stmt.strip()[:70])
+    check(f"every httpx.Client in {_mod_name} carries the proxy",
+          not _bare, f"bare clients: {_bare}")
+
+check("the e-hentai archiver uses the proxied client",
+      "ehentai.http_client_kwargs" in inspect.getsource(bot.resolve_official_archive),
+      "the archiver is an e-hentai request like any other")
+check("the gallery fetch uses the proxied client",
+      "http_client_kwargs" in inspect.getsource(ehentai.fetch_gallery),
+      "this is the first request of every gallery action")
+
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
 # handed to e-hentai. Measured before the fix: 1707 chars, 8 foreign cookies.

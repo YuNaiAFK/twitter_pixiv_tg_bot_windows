@@ -1367,39 +1367,69 @@ which is worth remembering before concluding a fix works because the code looks 
 An explicit ``HTTPS_PROXY`` in the environment wins over the registry, so this can be
 overridden or disabled without editing the registry.
 
-### e-hentai throttles and blocks this host - retry absorbs the short ones — retry absorbs the short ones
-e-hentai refuses requests from this IP in **two different ways**, needing different
-responses. Both were observed here, minutes apart, on the same URL:
+### httpx ignores the Windows registry proxy — every e-hentai request must set it
 
-| Symptom | What it is | What helps |
-| --- | --- | --- |
-| `ConnectTimeout [WinError 10060]` — the SYN dropped, not answered | a TCP-level throttle with a window of tens of seconds | retry with backoff |
-| `HTTP 200` with a 39-byte body: `Key missing, or incorrect key provided.` | an access refusal, not a timeout | **only waiting**, or fresh cookies |
+**This is the cause of "e-hentai hangs" and it is not e-hentai's fault.** httpx does not
+read the Windows system proxy, so on this machine every e-hentai request went out
+**directly** and timed out, while the same URL loaded fine in a browser. Measured, side
+by side:
 
-Measured: six consecutive requests to one gallery all timed out, then the same URL
-answered 200 in 1.7s with no code change. Later, the same URL answered 200 with the
-39-byte refusal four times running.
+```
+httpx, no explicit proxy   -> ConnectTimeout, every time
+httpx, proxy=...           -> HTTP 200
+browser                    -> works
+```
 
-**The refusal cannot be caught by a status check**, because it is a 200. It is detected by
-its body in `parse_gallery_page` and reported as what it is, rather than as
-"連結有誤或畫廊已被刪除" — which sends the user hunting for a problem that is not there.
-`EHENTAI_COOKIES` matters here: a fresh cookie can lift the refusal when the cause is
-session-related rather than a blanket IP ban.
+A browser reads the system proxy; httpx does not. That single difference explains the
+whole symptom, and it was misread as e-hentai blocking the IP for a long time — including
+a note here that "a proxy does not help", which was **wrong**: the proxy was not being
+used at all.
 
-`ehentai.request_with_retry` handles the first symptom for every e-hentai request
-(`fetch_gallery`, the archiver POST, and the archive probe). **Its window is sized to
-outlast the throttle, not to look reasonable**: five attempts at 2s, 4s, 8s, 16s wait
-about 30s in total. Three attempts (~6s) was tried first and still failed every time —
-the short schedule just burns every attempt inside one throttle window.
+`ehentai.proxy_url()` reads `HTTPS_PROXY`/`ALL_PROXY` first and falls back to the registry
+(`HKCU\...\Internet Settings`), and `ehentai.http_client_kwargs()` returns the keyword
+arguments every client needs. **All nine httpx clients in `bot.py` and `ehentai.py` use
+it** — the gallery fetch, the viewer sweep, page downloads, the archive probe, the
+archiver POST, and the archive download. A characterization check walks both files and
+fails if any `httpx.Client(...)` is built without it, because one bare client is enough to
+hang on its own.
+
+The helper returns the proxy in `http://host:port` form even though the port speaks SOCKS5
+as well: httpx needs the `socksio` extra for `socks5://`, and HTTP CONNECT works here
+without that dependency.
+
+### e-hentai's 39-byte refusal is a real answer, not a timeout
+Separately from the proxy problem, e-hentai answers some requests with **HTTP 200** and a
+39-byte body:
+
+```
+Key missing, or incorrect key provided.
+```
+
+**A status check cannot see this, because it is a 200.** It is detected by its body in
+`parse_gallery_page` and reported as an access refusal rather than as "連結有誤或畫廊已被
+刪除", which would send the user hunting for a problem that is not there. `EHENTAI_COOKIES`
+matters for it: a fresh cookie can lift the refusal when the cause is session-related.
+
+Retrying cannot help, because it is a considered answer rather than a dropped connection.
+
+### e-hentai also throttles bursts
+The front page can answer 200 while gallery paths time out, which is a real TCP-level
+throttle and is what `request_with_retry` exists for. **Its window is sized against the
+measured behaviour rather than to look reasonable:** three attempts with a short fixed
+delay. An earlier five-attempt doubling schedule reached roughly 120 requests during
+testing and the host then began refusing gallery paths outright, so heavier retrying made
+things worse rather than better.
 
 Only connection-level failures are retried. An HTTP status is a considered answer, so
 retrying it would repeat the refusal while making the user wait.
 
-**A proxy does not help.** Through the host's SOCKS5 the refusal came back immediately
-(`Key missing`), because the exit node's IP is refused too. `socks5_transport.py` was
-written to test exactly that and is kept for networks where the proxy egress is
-acceptable, but it is **deliberately not wired into the bot** — routing e-hentai through
-it would trade a timeout for a refusal.
+### Cookie files may hold several sites — filter by domain
+A Netscape cookie file is not necessarily single-site. The one here carried `.pixiv.net`
+and `.x.com` rows alongside the e-hentai ones, and the reader sent **every** cookie to
+**every** e-hentai request — a multi-site leak. It is now filtered against
+`ehentai.COOKIE_DOMAINS`, with a suffix comparison so a leading-dot row still matches its
+own subdomains. Measured 1707 characters of header before, 1041 after, with the foreign
+cookies gone.
 
 ### `base_url` must end with `/bot` — the token is appended, not inserted
 Pointing the bot at a self-hosted server is one line, and getting it subtly wrong kills

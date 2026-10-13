@@ -3994,8 +3994,8 @@ def download_gallery_direct(urls: list[str], output_dir: Path, *, referer: str,
     # cancelled request to hold the response open for minutes.
     request_timeout = 30.0
 
-    with httpx.Client(headers=headers, follow_redirects=True,
-                      timeout=request_timeout) as client:
+    with httpx.Client(headers=headers,
+                      **ehentai.http_client_kwargs(request_timeout)) as client:
         def fetch(item):
             index, image_url = item
             if stopped():
@@ -4540,8 +4540,7 @@ def resolve_official_archive(gallery, *, resample: bool) -> tuple[str, str, int]
     else:
         form = {"dltype": "org", "dlcheck": "Download Original Archive"}
 
-    with httpx.Client(headers=headers, follow_redirects=True,
-                      timeout=float(EHENTAI_TIMEOUT_SECONDS)) as client:
+    with httpx.Client(headers=headers, **ehentai.http_client_kwargs(float(EHENTAI_TIMEOUT_SECONDS))) as client:
         prepared = ehentai.request_with_retry(client, "POST", archiver_url, data=form)
         if prepared.status_code >= 400:
             raise ehentai.EhentaiError(
@@ -4672,8 +4671,8 @@ def download_official_archive(download_url: str, target: Path, *, referer: str,
     range_evidence = False
     size_known = False
     try:
-        with httpx.Client(headers=headers, follow_redirects=True,
-                          timeout=timeout) as client:
+        with httpx.Client(headers=headers,
+                          **ehentai.http_client_kwargs(timeout)) as client:
             probe = client.head(download_url)
             if probe.status_code >= 400:
                 # Some hosts refuse HEAD; the ranged GET below is the real test.
@@ -4747,8 +4746,8 @@ def _download_archive_single(headers: dict, download_url: str, target: Path,
     """One stream straight to disk. The fallback, and the small-file path."""
 
     written = 0
-    with httpx.Client(headers=headers, follow_redirects=True,
-                      timeout=timeout) as client:
+    with httpx.Client(headers=headers,
+                      **ehentai.http_client_kwargs(timeout)) as client:
         with client.stream("GET", download_url) as response:
             if response.status_code >= 400:
                 raise ehentai.EhentaiError(
@@ -4810,8 +4809,8 @@ def _download_archive_parallel(headers: dict, download_url: str, target: Path,
         try:
             # Its own client per worker: sharing one across threads would serialise on
             # its connection pool, which is the very thing being avoided.
-            with httpx.Client(headers=headers, follow_redirects=True,
-                              timeout=timeout) as client:
+            with httpx.Client(headers=headers,
+                              **ehentai.http_client_kwargs(timeout)) as client:
                 with client.stream(
                         "GET", download_url,
                         headers={"Range": f"bytes={lo}-{hi}"}) as response:

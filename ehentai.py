@@ -25,6 +25,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -353,6 +354,75 @@ def request_with_retry(client, method: str, url: str, *, attempts: int = 3,
     ) from last_exc
 
 
+def proxy_url() -> str:
+    """
+    The proxy to send requests through, or "" for a direct connection.
+
+    **This has to be passed explicitly, and that is the whole reason it exists.**
+    httpx does *not* read the Windows registry proxy, so on this machine every request
+    went out directly and timed out, while the same URL worked in a browser and worked
+    from httpx the moment ``proxy=`` was given:
+
+        httpx, no explicit proxy   -> ConnectTimeout
+        httpx, proxy=...           -> HTTP 200
+
+    An explicit environment variable wins, so this stays overridable. ``ALL_PROXY`` and
+    friends are honoured because that is what a command-line user would set.
+    """
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                 "ALL_PROXY", "all_proxy"):
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return _registry_proxy()
+
+
+def _registry_proxy() -> str:
+    """The Windows system proxy, in the form httpx accepts, or ""."""
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if not enabled:
+                return ""
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+    except (OSError, ImportError):
+        return ""
+
+    server = (server or "").strip()
+    if not server:
+        return ""
+    # ProxyServer is normally "host:port", but may be a per-scheme list such as
+    # "http=host:port;https=host:port".
+    if "=" in server:
+        for part in server.split(";"):
+            scheme, _, target = part.partition("=")
+            if scheme.strip().lower() in {"https", "http"} and target.strip():
+                server = target.strip()
+                break
+        else:
+            return ""
+    # A bare host:port is used as an HTTP proxy by httpx. The mixed port on this machine
+    # speaks both HTTP CONNECT and SOCKS5, and httpx needs the socksio extra for the
+    # latter, so the HTTP form is the one that works without another dependency.
+    if "://" not in server:
+        server = f"http://{server}"
+    return server
+
+
+def http_client_kwargs(timeout: float) -> dict:
+    """Keyword arguments for an httpx client that honours the proxy."""
+    kwargs: dict = {"timeout": timeout, "follow_redirects": True}
+    proxy = proxy_url()
+    if proxy:
+        kwargs["proxy"] = proxy
+    return kwargs
+
+
 def fetch_gallery(url: str, *, cookies_path=None, timeout: float = 60.0,
                   http_client=None) -> EhentaiGallery:
     """
@@ -371,7 +441,7 @@ def fetch_gallery(url: str, *, cookies_path=None, timeout: float = 60.0,
     if cookies_path is not None:
         headers["Cookie"] = cookies_header(cookies_path)
 
-    client = http_client or httpx.Client(timeout=timeout, follow_redirects=True)
+    client = http_client or httpx.Client(**http_client_kwargs(timeout))
     try:
         # Retried: the throttling described in request_with_retry hits this call too,
         # and it is the first request of every gallery action.
@@ -539,7 +609,7 @@ def fetch_gallery_images(
     if cookies_path is not None:
         headers["Cookie"] = cookies_header(cookies_path)
 
-    client = http_client or httpx.Client(timeout=timeout, follow_redirects=True)
+    client = http_client or httpx.Client(**http_client_kwargs(timeout))
     try:
         response = client.get(url, headers=headers)
         if response.status_code >= 400:
@@ -746,7 +816,7 @@ def create_telegraph_page(
     # Telegraph requires both names to be non-empty.
     resolved_author = (author_name or "e-hentai")[:128]
 
-    client = http_client or httpx.Client(timeout=timeout, follow_redirects=True)
+    client = http_client or httpx.Client(**http_client_kwargs(timeout))
     try:
         account = client.post(
             f"{TELEGRAPH_API}/createAccount",
