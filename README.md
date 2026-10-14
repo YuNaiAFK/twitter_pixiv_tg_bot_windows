@@ -1397,6 +1397,44 @@ The helper returns the proxy in `http://host:port` form even though the port spe
 as well: httpx needs the `socksio` extra for `socks5://`, and HTTP CONNECT works here
 without that dependency.
 
+### SECURITY: the bot description was hijacked
+The bot's Telegram description was found holding a promotional link:
+
+```
+🔥 Best AI Porn here:
+👉 https://evadast.com/telegram?start=ref_c3966075e4
+🔞 🔥 Лучшее AI-порно здесь:
+👉 https://evadast.com/telegram?start=ref_c3966075e4
+```
+
+Two languages, and a `ref_` code, so it is a paid referral rather than a mistake. **Nothing
+in this repository has ever set a description** - `getMyDescription` was queried directly
+and the text was there, while no code path writes it. It could only have been written by
+someone holding the bot token.
+
+**Treat this as a credential compromise, not a cosmetic problem.** Whoever can set a
+description holds the same token that reads updates and sends messages as the bot. Anyone
+who used the bot while that text was live may have had their links and messages exposed to
+that party.
+
+What to do, in order:
+
+1. **Rotate the token** with BotFather (`/revoke`) and put the new one in `.env`. This is
+   the actual fix; everything below only repairs the symptom.
+2. Check BotFather for anything else that was changed - the name, the about text, the
+   profile photo, and any linked channel.
+3. Restart the bot, which re-publishes its own profile text (below).
+
+The bot now sets `set_my_description` and `set_my_short_description` on **every startup**
+from `BOT_DESCRIPTION` / `BOT_SHORT_DESCRIPTION` (both overridable from `.env`). That makes
+the profile self-healing: an injected description survives only until the next restart.
+A failure to set them is logged and ignored, because an unset description is cosmetic
+while failing to boot is not.
+
+**Why a description is worth attacking:** it is what Telegram shows a user *before* they
+send anything, so it is the highest-reach text a bot has. A referral link there is seen by
+every visitor.
+
 ### The viewer-link pattern was hard-coded to e-hentai.org
 `_VIEWER_LINK_RE` matched only `https://e-hentai.org/s/...`, so **every exhentai gallery
 had zero viewer links** and the feature failed there with "讀不到畫廊的圖片清單。連結可能有誤，

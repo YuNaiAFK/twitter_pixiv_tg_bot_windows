@@ -499,6 +499,34 @@ check("the progress notice survives the final edit",
       "render(latest[0], latest[1], latest[2]" in inspect.getsource(bot.run_with_progress),
       "the closing edit is the message the user keeps, so it must not drop the notice")
 
+# The bot's description was found hijacked: it held a two-language referral link to an
+# unrelated adult site. Nothing here ever set a description, so it came from someone
+# holding the token - and a token that can set a description can also read updates and
+# send messages. The profile is now re-published on every startup so it self-heals.
+check("the description is re-published at startup",
+      "set_my_description" in inspect.getsource(bot.post_init),
+      "an injected description would persist until someone noticed")
+check("the short description is re-published too",
+      "set_my_short_description" in inspect.getsource(bot.post_init))
+check("a profile failure cannot stop the bot starting",
+      "無法設定機器人簡介" in inspect.getsource(bot.post_init),
+      "an unset description is cosmetic; failing to boot is not")
+check("the replacement text fits Telegram's limits",
+      len(bot.BOT_DESCRIPTION) <= 512 and len(bot.BOT_SHORT_DESCRIPTION) <= 120,
+      f"{len(bot.BOT_DESCRIPTION)}/512 and {len(bot.BOT_SHORT_DESCRIPTION)}/120")
+check("the profile text advertises nothing external",
+      not any(w in (bot.BOT_DESCRIPTION + bot.BOT_SHORT_DESCRIPTION).lower()
+              for w in ("http://", "https://", "t.me/", "ref_", "porn")),
+      "the whole point is that this text is ours")
+_profile_src = Path(HERE / "bot.py").read_text(encoding="utf-8")
+check("the profile text is overridable without editing code",
+      'os.getenv("BOT_DESCRIPTION"' in _profile_src
+      and '"BOT_SHORT_DESCRIPTION"' in _profile_src,
+      "the operator should be able to reword it from .env")
+check("the bot sets no chat menu button",
+      "set_chat_menu_button" not in _profile_src,
+      "a menu button pointing elsewhere would be another injection route")
+
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
 # handed to e-hentai. Measured before the fix: 1707 chars, 8 foreign cookies.

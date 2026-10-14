@@ -200,6 +200,32 @@ SUPPORTED_SITES_NOTICE = os.getenv(
     "目前只支援 X/Twitter、Pixiv 與 e-hentai 連結。",
 ).strip()
 
+# The bot's own profile text, re-published on every startup.
+#
+# This exists because the description was **hijacked**: it was found holding a referral
+# link to an unrelated adult site, in two languages. Nothing in this repository has ever
+# set a description, so the text could only have been written by someone else holding the
+# bot token - and a token that can set a description can also read updates and send
+# messages on the bot's behalf.
+#
+# Setting it here makes the profile self-healing, but it repairs only the symptom. The
+# token is the actual problem: rotate it with BotFather. See the README.
+#
+# Overridable so the operator can adjust the wording without editing code.
+BOT_DESCRIPTION = os.getenv("BOT_DESCRIPTION", (
+    "把 X/Twitter、Pixiv 或 e-hentai 的連結傳給我，我會把內容整理好傳回來。\n"
+    "• X/Twitter：圖片直接傳回聊天\n"
+    "• Pixiv：傳送原圖檔案\n"
+    "• e-hentai：整理成 Telegraph 頁面，附標籤分類\n"
+    "每則結果都會附上原始連結。"
+)).strip()
+
+# Telegram caps the short description at 120 characters.
+BOT_SHORT_DESCRIPTION = os.getenv(
+    "BOT_SHORT_DESCRIPTION",
+    "傳送 X/Twitter、Pixiv 或 e-hentai 連結，我把內容整理好傳回給你。",
+).strip()[:120]
+
 # Reply to a link on an unsupported site. Set to 0 to stay silent instead, which
 # suits a busy public group where the notice would just be noise.
 REPLY_UNSUPPORTED_LINKS = os.getenv(
@@ -5534,13 +5560,32 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(application: Application):
     """
-    Publish the command menus.
+    Publish the command menus **and the bot's own profile text**.
 
     The public menu lists visitor commands only, so it does not advertise
     capabilities a visitor cannot use. Administrators get a second menu scoped to
     their own chat, which is how they discover the management commands without
     those being visible to anyone else.
+
+    The description and short description are set here for a security reason rather than a
+    cosmetic one. **Anyone holding the bot token can rewrite them**, and that is exactly
+    what happened: the description was replaced with a referral link to an unrelated
+    adult site, in two languages. Nothing in this repository ever set a description, so
+    the text could only have come from outside - and a token that can set a description
+    can also read updates and send messages.
+
+    Setting them at every startup makes the profile self-healing: the ad comes back only
+    if the attacker acts again, and the next restart removes it. Rotate the token as well
+    - see SECURITY notes in the README; this only repairs the symptom.
     """
+    # Reclaimed on every start. A failure here must not stop the bot: an unset
+    # description is cosmetic, whereas failing to boot is not.
+    try:
+        await application.bot.set_my_description(BOT_DESCRIPTION)
+        await application.bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
+    except TelegramError as exc:
+        logger.warning("無法設定機器人簡介：%s", exc)
+
     await application.bot.set_my_commands([
         BotCommand("start", "開始使用"),
         BotCommand("help", "使用說明"),
