@@ -1426,6 +1426,58 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### run.bat now starts the self-hosted server
+
+The server has to be up before the bot, and nothing said so. Without it the bot silently
+falls back to the public API and the upload limit drops from **2000 MB to 50 MB** - a
+ten-fold difference in what can be delivered, reported only as one line buried in the
+startup log, if it is read at all.
+
+`run.bat` now calls `run_local_api.py --ensure` first, which brings up whatever is missing
+and waits until the server actually answers:
+
+    檢查自架 Bot API 伺服器……
+      啟動轉接（17900 -> 127.0.0.1:7897）……
+      轉接埠 17900：已啟動
+      Docker 引擎尚未啟動，正在開啟 Docker Desktop.exe……
+      等待 Docker 引擎就緒（首次啟動可能需要一兩分鐘）……
+      Docker 引擎：就緒
+      容器：已在執行
+      等待伺服器就緒……
+      伺服器（port 8081）：就緒
+
+**Idempotent**: a second run detects all three and does nothing, in under a second:
+
+    伺服器（port 8081）：已在執行，不需要啟動
+    轉接埠 17900：已在執行
+
+Three things have to be up, and each fails in a way that names something else:
+
+1. **the Docker engine** - without it compose fails on a named pipe (``dockerDesktopLinuxEngine``),
+   which reads as a Docker installation problem rather than "the engine is stopped".
+   `--ensure` launches Docker Desktop itself and waits up to four minutes.
+2. **the host relay** - without it the container cannot reach Telegram at all, because the
+   proxy listens on loopback only. TDLib reports this as a generic connection failure.
+   The relay is started detached, so it outlives the console that launched it - verified by
+   killing `run.bat` and confirming port 17900 still listening.
+3. **the server** - without it, the 50 MB limit.
+
+A failure is **not fatal**: the bot still starts against the public API, with a warning
+naming the limit and the command that explains why. Blocking the start would be worse than a
+smaller upload limit.
+
+`TELEGRAM_SKIP_LOCAL_API=1` skips the whole step, for a machine that has no Docker and does
+not want it.
+
+#### Two bugs written while adding this
+
+- `subprocess.CREATE_DETACHED_PROCESS` does not exist - the constant is `DETACHED_PROCESS`,
+  with no `CREATE_` prefix.
+- The upstream proxy port was read from `TELEGRAM_MT_PROXY`, which is
+  `socks5://192.168.65.254:17900` - **the relay's own address**, so the relay was configured
+  to forward to itself, on 17900. The upstream is the host proxy on 7897, which comes from
+  the SOCKS5 setting the bot itself uses; `upstream_proxy_port()` reads it.
+
 ### A private Pixiv work was reported as a broken link
 
 The narrow rule that replaced a wrong one: **a work that no longer exists is reported, and

@@ -41,7 +41,10 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import socket
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -51,6 +54,12 @@ COMPOSE_FILE = HERE / "docker-compose.yml"
 # The server accepts one bot, so the bot token has to be the one this project uses.
 DEFAULT_PORT = 8081
 DEFAULT_BINARY_NAMES = ("telegram-bot-api", "telegram-bot-api.exe")
+
+# The host-side relay the container needs in order to reach Telegram at all. See
+# host_proxy_relay.py: the proxy listens on loopback only, which a container cannot reach.
+RELAY_SCRIPT = HERE / "host_proxy_relay.py"
+RELAY_PORT = 17900
+DEFAULT_PROXY_PORT = 7897
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -429,6 +438,220 @@ def verify_credentials(api_id: str, api_hash: str) -> int:
     return 0 if ok else 1
 
 
+def port_listening(port: int, host: str = "127.0.0.1") -> bool:
+    """Whether something is listening on a loopback port. A bare TCP connect."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.5)
+            return sock.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+
+
+def docker_daemon_up(cli: Path) -> bool:
+    """
+    Whether the Docker *daemon* is answering, not merely whether the CLI exists.
+
+    This is the distinction that matters at startup: Docker Desktop can be installed and
+    its CLI on disk while the engine is stopped, and every compose command then fails with
+    a named-pipe error rather than anything a user can act on.
+    """
+    try:
+        probe = subprocess.run([str(cli), "info"], capture_output=True, text=True,
+                               timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def find_docker_desktop() -> Path | None:
+    """The Docker Desktop executable, which starts the engine when launched."""
+    if os.name != "nt":
+        return None
+    candidates = []
+    for root in (os.environ.get("ProgramFiles"), os.environ.get("LOCALAPPDATA"),
+                 os.environ.get("ProgramFiles(x86)")):
+        if not root:
+            continue
+        candidates.extend([
+            Path(root) / "Docker" / "Docker" / "Docker Desktop.exe",
+            Path(root) / "Programs" / "DockerDesktop" / "Docker Desktop.exe",
+        ])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def upstream_proxy_port(env: dict[str, str]) -> int:
+    """
+    The host proxy's port, which the relay forwards to.
+
+    **Not** the port in ``TELEGRAM_MT_PROXY``: that is the relay's own address as the
+    container sees it (``socks5://192.168.65.254:17900``), so reading it here produced
+    17900 as the upstream - a relay pointing at itself. The proxy port comes from the
+    SOCKS5 setting the bot itself uses.
+    """
+    for name in ("TELEGRAM_PROXY", "ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"):
+        value = (env.get(name) or os.environ.get(name) or "").strip()
+        if not value:
+            continue
+        tail = value.rstrip("/").rsplit(":", 1)[-1]
+        try:
+            port = int(tail)
+        except ValueError:
+            continue
+        if 0 < port < 65536:
+            return port
+    return DEFAULT_PROXY_PORT
+
+
+def start_relay(proxy_port: int, relay_port: int) -> bool:
+    """
+    Start the host relay if it is not already listening. Returns whether it is up.
+
+    Detached on purpose: the relay has to outlive this script, because it is what the
+    container uses for every request to Telegram. The bot's own shell is not the right
+    parent for it.
+    """
+    if port_listening(relay_port):
+        print(f"  轉接埠 {relay_port}：已在執行")
+        return True
+
+    python = sys.executable
+    if not RELAY_SCRIPT.is_file():
+        print(f"  找不到 {RELAY_SCRIPT.name}，容器將無法連上 Telegram。")
+        return False
+
+    print(f"  啟動轉接（{relay_port} -> 127.0.0.1:{proxy_port}）……")
+    creation = 0
+    if os.name == "nt":
+        # DETACHED_PROCESS so it is not killed with this console, and no window.
+        # The name has no CREATE_ prefix; CREATE_DETACHED_PROCESS does not exist.
+        creation = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen(
+            [python, str(RELAY_SCRIPT),
+             "--list-port", str(relay_port), "--proxy-port", str(proxy_port)],
+            cwd=str(HERE),
+            creationflags=creation,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError as exc:
+        print(f"  啟動轉接失敗：{exc}")
+        return False
+
+    for _ in range(20):
+        if port_listening(relay_port):
+            print(f"  轉接埠 {relay_port}：已啟動")
+            return True
+        time.sleep(0.5)
+    print(f"  轉接埠 {relay_port}：啟動後仍未監聽")
+    return False
+
+
+def wait_for_daemon(cli: Path, timeout: float = 240.0) -> bool:
+    """Wait for the Docker engine, launching Docker Desktop first if it is not running."""
+    if docker_daemon_up(cli):
+        return True
+
+    desktop = find_docker_desktop()
+    if desktop is not None:
+        print(f"  Docker 引擎尚未啟動，正在開啟 {desktop.name}……")
+        try:
+            subprocess.Popen([str(desktop)], close_fds=True)
+        except OSError as exc:
+            print(f"  無法開啟 Docker Desktop：{exc}")
+    else:
+        print("  找不到 Docker Desktop，請手動啟動 Docker。")
+
+    print("  等待 Docker 引擎就緒（首次啟動可能需要一兩分鐘）……")
+    deadline = time.monotonic() + timeout
+    shown = 0
+    while time.monotonic() < deadline:
+        if docker_daemon_up(cli):
+            print("  Docker 引擎：就緒")
+            return True
+        time.sleep(3.0)
+        shown += 3
+        if shown % 30 == 0:
+            print(f"    已等待 {shown} 秒……")
+    print(f"  Docker 引擎在 {int(timeout)} 秒內沒有就緒。")
+    return False
+
+
+def ensure(env: dict[str, str], port: int = DEFAULT_PORT) -> int:
+    """
+    Bring up everything the bot needs to reach Telegram, and wait until it is ready.
+
+    Called by run.bat before the bot starts, so a first run on a machine where nothing has
+    been started yet works without any manual steps. Idempotent: everything already running
+    is detected and left alone, so a second run does nothing visible.
+
+    Three things have to be up, and they fail in ways that do not name the real problem:
+
+      1. the Docker engine  - without it, compose fails on a named pipe
+      2. the host relay     - without it, the container cannot reach Telegram at all, and
+                              TDLib reports it as a generic connection failure
+      3. the server itself  - without it, the bot falls back to the public API and the
+                              upload limit silently drops from 2000 MB to 50 MB
+    """
+    print("檢查自架 Bot API 伺服器……")
+    env_port = env.get("TELEGRAM_API_BASE", "")
+    configured = port
+    if env_port.startswith("http"):
+        try:
+            configured = int(env_port.rstrip("/").rsplit(":", 1)[-1])
+        except ValueError:
+            configured = port
+    proxy_port = upstream_proxy_port(env)
+
+    if server_answers(configured):
+        print(f"  伺服器（port {configured}）：已在執行，不需要啟動")
+        # The relay is still checked: the server can be up while the relay it needs has
+        # died, and that shows up later as a Telegram connection failure.
+        start_relay(proxy_port, RELAY_PORT)
+        return 0
+
+    cli = find_docker()
+    compose = docker_command()
+    if cli is None or compose is None:
+        print("  找不到可用的 Docker／docker compose。")
+        print("  請安裝 Docker Desktop，或改用原生 telegram-bot-api 執行檔：")
+        print("    python run_local_api.py --binary <路徑>")
+        return 1
+
+    # The relay first: the container needs it as soon as it starts, and starting it later
+    # would leave the first requests failing.
+    relay_ok = start_relay(proxy_port, RELAY_PORT)
+
+    if not wait_for_daemon(cli):
+        return 1
+
+    if docker_running(compose):
+        print("  容器：已在執行")
+    else:
+        print("  啟動容器：", " ".join(compose + ["up", "-d"]))
+        code = subprocess.call(compose + ["up", "-d"], cwd=str(HERE))
+        if code != 0:
+            print(f"  docker compose 失敗（離開碼 {code}）。")
+            return code
+
+    print("  等待伺服器就緒……")
+    for _ in range(60):
+        if server_answers(configured):
+            print(f"  伺服器（port {configured}）：就緒")
+            if not relay_ok:
+                print("  ⚠ 轉接未啟動，容器可能無法連上 Telegram。")
+            return 0
+        time.sleep(2.0)
+    print("  伺服器在 120 秒內沒有就緒。查看日誌： docker compose logs -f")
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run a self-hosted Telegram Bot API server for this bot.")
@@ -440,6 +663,10 @@ def main() -> int:
                         help=f"HTTP port (default {DEFAULT_PORT}).")
     parser.add_argument("--check", action="store_true",
                         help="Only report readiness; do not start anything.")
+    parser.add_argument("--ensure", action="store_true",
+                        help="Start whatever is missing and wait until the server is "
+                             "ready. Used by run.bat so a first run works with no manual "
+                             "steps, and does nothing when everything is already up.")
     parser.add_argument("--verify-credentials", action="store_true",
                         help="Check api_id/api_hash against Telegram, then exit.")
     parser.add_argument("--workdir", default=str(HERE / "bot-api-data"),
@@ -451,6 +678,10 @@ def main() -> int:
         return verify_credentials(
             env.get("TELEGRAM_API_ID") or os.environ.get("TELEGRAM_API_ID", ""),
             env.get("TELEGRAM_API_HASH") or os.environ.get("TELEGRAM_API_HASH", ""))
+
+    # Before the readiness report, because --ensure is what brings things up.
+    if args.ensure:
+        return ensure(env, args.port)
 
     binary = find_binary(args.binary, env)
     problems = report(binary, env, args.port)
