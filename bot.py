@@ -1090,10 +1090,20 @@ class ParseCache:
                 logger.debug("無法刪除快取檔案 %s", name, exc_info=True)
 
     def clear(self) -> int:
-        """Forget everything, files included."""
+        """
+        Forget everything, files included.
+
+        Files are removed in batches: the same reason as delete_files_quietly, because this is
+        the other path that can empty the cache in one burst.
+        """
         count = len(self.entries)
+        paths = []
         for entry in self.entries.values():
-            self.discard_files(entry)
+            for name in (entry.get("payload") or {}).get("files") or []:
+                resolved = cache_file_path(name)
+                if resolved is not None:
+                    paths.append(resolved)
+        delete_files_quietly(paths)
         self.entries.clear()
         try:
             self.path.unlink(missing_ok=True)
@@ -1298,16 +1308,14 @@ def prune_orphaned_cache_files() -> int:
 
     Never raises: housekeeping must not fail a request that already succeeded.
     """
-    removed = 0
+    orphans = orphaned_cache_files()
     freed = 0
-    for path in orphaned_cache_files():
+    for path in orphans:
         try:
-            size = path.stat().st_size
-            path.unlink()
-            removed += 1
-            freed += size
+            freed += path.stat().st_size
         except OSError:
             continue
+    removed = delete_files_quietly(orphans)
     if removed:
         logger.info("清除 %s 個沒有索引的快取檔案（%s）", removed,
                     ehentai.format_filesize(freed))
@@ -1701,6 +1709,79 @@ async def report_empty_download(status, message, media_url: str, platform: str |
         )
     except TelegramError:
         await send_status(message, notice)
+
+
+def is_safe_to_clear(path: Path) -> bool:
+    """
+    Whether a cache directory may be emptied at all.
+
+    **A wrong answer here deletes a filesystem.** These paths come from ``.env`` through
+    ``env_text``, and a blank or mistyped value has already turned ``AUTH_FILE`` into the
+    repository directory once - the same mistake with ``CACHE_DIR`` would have ``/cache
+    clear`` walk a whole drive. That is a one-character typo away from unrecoverable, so the
+    check is explicit and refuses rather than trusting the setting.
+
+    Refused: a drive root, the Windows directory, a user profile root, the project root, and
+    anything that is not inside the project.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if resolved == Path(resolved.anchor):
+        return False
+
+    base = BASE_DIR.resolve()
+    if resolved == base:
+        # Emptying the project directory would delete the bot itself.
+        return False
+
+    forbidden = {Path(os.environ.get("SystemRoot", "C:/Windows")).resolve()}
+    for key in ("USERPROFILE", "LOCALAPPDATA", "APPDATA", "ProgramFiles", "ProgramData"):
+        value = os.environ.get(key)
+        if value:
+            try:
+                forbidden.add(Path(value).resolve())
+            except OSError:
+                continue
+    if resolved in forbidden:
+        return False
+
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def delete_files_quietly(paths, *, batch: int = 40, pause: float = 0.02) -> int:
+    """
+    Delete files in small batches, pausing between them. Returns how many went.
+
+    **The pause is the point.** ``/cache clear`` emptying a large cache in one uninterrupted
+    run was reported to blue-screen the machine, and the dump says why:
+
+        0x00000133  DPC_WATCHDOG_VIOLATION  (parameter 1 = 0x1)
+
+    A driver's deferred procedure call exceeded its time limit - a kernel-level stall, which
+    Python can neither raise nor catch. A burst of deletions drives a storage or filter
+    driver (an antivirus minifilter is a common one) past that limit and Windows bugchecks.
+    Yielding every few files keeps that driver's queue short, at a cost of milliseconds.
+
+    A directory is never followed: only files are unlinked, so a mis-shaped entry cannot turn
+    this into a recursive delete.
+    """
+    removed = 0
+    for index, path in enumerate(paths):
+        try:
+            if path.is_file():
+                path.unlink()
+                removed += 1
+        except OSError:
+            pass
+        if batch and index and index % batch == 0:
+            time.sleep(pause)
+    return removed
 
 
 async def send_cached_media(message, status, url: str, payload: dict,
@@ -3229,17 +3310,35 @@ async def cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = [str(a).lower() for a in (getattr(context, "args", None) or [])]
 
     if args and args[0] in {"clear", "清除"}:
-        removed = PARSE_CACHE.clear()
-        archives = 0
-        if ARCHIVE_CACHE_DIR.is_dir():
-            for path in ARCHIVE_CACHE_DIR.glob("*"):
-                try:
-                    path.unlink()
-                    archives += 1
-                except OSError:
-                    continue
+        # Refused outright rather than attempted: a mistyped CACHE_DIR would otherwise empty
+        # a drive, and the deletion cannot be undone.
+        unsafe = [str(d) for d in (CACHE_DIR, ARCHIVE_CACHE_DIR)
+                  if d.exists() and not is_safe_to_clear(d)]
+        if unsafe:
+            logger.warning("拒絕清除不安全的快取路徑：%s", unsafe)
+            await message.reply_text(
+                "已拒絕清除：快取路徑看起來不安全。\n"
+                + "\n".join(f"• {d}" for d in unsafe)
+                + "\n\n請檢查 .env 的 CACHE_DIR／ARCHIVE_CACHE_DIR，"
+                "確認它們指向專案目錄底下。"
+            )
+            return
+
+        # Deleted in batches rather than one burst: see delete_files_quietly for the crash
+        # this avoids.
+        cached_files = [p for p in CACHE_DIR.rglob("*")
+                        if p.is_file() and ARCHIVE_CACHE_DIR not in p.parents]
+        archive_files = ([p for p in ARCHIVE_CACHE_DIR.glob("*") if p.is_file()]
+                         if ARCHIVE_CACHE_DIR.is_dir() else [])
+        removed = await asyncio.to_thread(delete_files_quietly, cached_files)
+        archives = await asyncio.to_thread(delete_files_quietly, archive_files)
+        PARSE_CACHE.entries.clear()
+        try:
+            PARSE_CACHE.path.unlink(missing_ok=True)
+        except OSError:
+            pass
         await message.reply_text(
-            f"已清除解析快取：{removed} 筆（含快取檔案）。\n"
+            f"已清除解析快取：{removed} 個檔案。\n"
             f"已清除歸檔快取：{archives} 個檔案。\n"
             "下次解析會重新下載。"
         )

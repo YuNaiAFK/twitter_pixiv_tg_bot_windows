@@ -171,6 +171,86 @@ def _drop_explains_when_enabled() -> bool:
         bot.AUTHORIZATION.allowed = saved_allowed
 
 
+def _deletion_is_batched() -> bool:
+    """
+    A long list must be deleted in batches, with a pause between them.
+
+    Asserted on the pause rather than on a wall-clock time, so the check does not depend on
+    how fast the disk is.
+    """
+    import time as _tm
+    import tempfile as _tf
+    import shutil as _sh
+    work = Path(_tf.mkdtemp(prefix="dsh-batch-"))
+    try:
+        files = []
+        for i in range(120):
+            path = work / f"f{i:04d}.bin"
+            path.write_bytes(b"x")
+            files.append(path)
+        start = _tm.monotonic()
+        bot.delete_files_quietly(files, batch=40, pause=0.05)
+        elapsed = _tm.monotonic() - start
+        # 120 files at 40 per batch is 2 pauses, so at least ~0.1s of deliberate waiting.
+        return elapsed >= 0.09
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        _sh.rmtree(work, ignore_errors=True)
+
+
+def _deletion_skips_directories() -> bool:
+    """
+    A directory in the list is left alone, and its contents are untouched.
+
+    Asserted on the **count**, not only on the directory surviving.
+
+    Measured with the guard removed: ``unlink()`` on a directory raises PermissionError, the
+    surrounding handler swallows it, and the count stays the same - so the outcome is
+    identical either way and no assertion here can tell the two implementations apart. The
+    guard is therefore defence in depth rather than the thing that makes this safe; the
+    ``except OSError`` is. What this check does pin is the observable contract: exactly one
+    removal, the directory and its contents intact.
+    """
+    import tempfile as _tf
+    import shutil as _sh
+    work = Path(_tf.mkdtemp(prefix="dsh-skipdir-"))
+    try:
+        (work / "sub").mkdir()
+        (work / "sub" / "inner.bin").write_bytes(b"y")
+        (work / "plain.bin").write_bytes(b"x")
+        removed = bot.delete_files_quietly([work / "sub", work / "plain.bin"])
+        # Exactly one removal: the file. The directory must not be counted.
+        return (removed == 1
+                and (work / "sub").is_dir()
+                and (work / "sub" / "inner.bin").is_file()
+                and not (work / "plain.bin").exists())
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        _sh.rmtree(work, ignore_errors=True)
+
+
+def _deletion_is_idempotent() -> bool:
+    """Deleting the same list twice must not raise and must remove nothing the second time."""
+    import tempfile as _tf
+    import shutil as _sh
+    work = Path(_tf.mkdtemp(prefix="dsh-idem-"))
+    try:
+        files = []
+        for i in range(5):
+            path = work / f"f{i}.bin"
+            path.write_bytes(b"x")
+            files.append(path)
+        first = bot.delete_files_quietly(files)
+        second = bot.delete_files_quietly(files)
+        return first == 5 and second == 0
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        _sh.rmtree(work, ignore_errors=True)
+
+
 def _state_from_response(status_code: int, payload=None) -> str:
     """
     Run pixiv_work_state against a stubbed HTTP response.
@@ -1831,6 +1911,57 @@ check("the notice is a documented opt-in",
 check("a dropped link sends nothing to the chat when notices are off",
       _drop_is_silent(),
       "the point of the change is that no message appears at all")
+# --- /cache clear was reported to blue-screen the machine ---
+
+# The dump says what happened:
+#
+#   0x00000133  DPC_WATCHDOG_VIOLATION  (parameter 1 = 0x1)
+#
+# A driver's deferred procedure call exceeded its time limit - a kernel-level stall, which
+# Python can neither raise nor catch. What the bot controls is how much deletion I/O it
+# issues at once, and emptying a cache in one uninterrupted burst is what drives a storage or
+# filter driver past that limit.
+check("bulk deletion is batched rather than one burst",
+      _deletion_is_batched(),
+      "an uninterrupted burst is what the watchdog violation came from")
+check("a directory in the list is never followed",
+      # Only files are unlinked, so a mis-shaped entry cannot become a recursive delete.
+      _deletion_skips_directories(),
+      "following a directory would make this unbounded")
+check("deleting twice removes nothing and does not raise",
+      _deletion_is_idempotent(),
+      "a repeated command must be harmless")
+
+# The dangerous direction for a safety guard is allowing, not refusing: these paths come from
+# .env, and a mistyped CACHE_DIR would empty a drive. A blank value has already turned
+# AUTH_FILE into the repository directory once.
+for _path, _label in (
+        (str(Path("C:/")), "a drive root"),
+        (str(Path("C:/Windows")), "the Windows directory"),
+        (str(Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32"), "under Windows"),
+        (str(Path(os.environ.get("USERPROFILE", "C:/Users/x"))), "a user profile root"),
+        (str(Path(os.environ.get("LOCALAPPDATA", "C:/x/AppData/Local"))), "LOCALAPPDATA"),
+        (str(HERE), "the project root itself"),
+        (str(Path("C:/somewhere/else")), "an unrelated tree"),
+):
+    check(f"cache clear refuses {_label}",
+          bot.is_safe_to_clear(Path(_path)) is False,
+          f"{_path} was accepted for deletion")
+check("cache clear allows the real cache dirs",
+      bot.is_safe_to_clear(bot.BASE_DIR / ".cache") is True
+      and bot.is_safe_to_clear(bot.BASE_DIR / ".cache" / "archives") is True,
+      "refusing the legitimate path would make the command useless")
+check("cache clear checks safety before deleting anything",
+      # The guard has to run first, or a refusal is too late.
+      _order_in(inspect.getsource(bot.cache_command),
+                "is_safe_to_clear(", "delete_files_quietly"),
+      "the refusal must come before the deletion")
+check("every bulk-deletion path is batched",
+      # /cache clear, ParseCache.clear and the orphan sweep can each empty the cache.
+      all("delete_files_quietly" in inspect.getsource(fn) for fn in (
+          bot.cache_command, bot.ParseCache.clear, bot.prune_orphaned_cache_files)),
+      "one unbatched path is enough to trigger it again")
+
 check("the work id is read from every pixiv url shape",
       # An earlier version required five or more digits, so a short id silently yielded ""
       # and every deletion was then reported as silence instead of a message.
