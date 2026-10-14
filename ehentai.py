@@ -29,6 +29,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -302,6 +303,31 @@ def parse_gallery_page(text: str, url: str) -> EhentaiGallery:
     )
 
 
+def redact_url(url: str) -> str:
+    """
+    A URL safe to log: the path with credential-bearing query values removed.
+
+    ``archiver.php?gid=..&token=..`` is the case this exists for - the token is a live
+    e-hentai session value, and it was being written to the log on every retry. The path
+    is kept because that is what makes a log line useful.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url or "")
+    except ValueError:
+        return "<url>"
+    path = parsed.path or "/"
+    if not parsed.query:
+        return path
+    kept = []
+    for part in parsed.query.split("&"):
+        key, sep, _value = part.partition("=")
+        if sep and key.lower() in {"token", "key", "auth", "password", "api_hash"}:
+            kept.append(f"{key}=<REDACTED>")
+        elif sep:
+            kept.append(part)
+    return f"{path}?{'&'.join(kept)}" if kept else path
+
+
 def request_with_retry(client, method: str, url: str, *, attempts: int = 3,
                        delay: float = 3.0, **kwargs):
     """
@@ -345,8 +371,12 @@ def request_with_retry(client, method: str, url: str, *, attempts: int = 3,
             last_exc = exc
             if attempt >= attempts:
                 break
+            # The path only, not the whole URL. The archiver URL is
+            # ``archiver.php?gid=<gid>&token=<session token>``, so logging it wrote a
+            # live session token into the log on every retry.
             logger.warning("e-hentai 請求失敗（第 %s/%s 次，%s），%.0f 秒後重試：%s",
-                           attempt, attempts, type(exc).__name__, delay, url)
+                           attempt, attempts, type(exc).__name__, delay,
+                           redact_url(url))
             time.sleep(delay)
     raise EhentaiError(
         f"連線 e-hentai 逾時或中斷（已重試 {attempts} 次）："

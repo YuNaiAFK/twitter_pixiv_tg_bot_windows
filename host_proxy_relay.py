@@ -23,12 +23,41 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import socketserver
 import sys
 import threading
 
 PROXY_HOST = "127.0.0.1"
+
+# Peer prefixes allowed to use the relay: loopback and the private ranges Docker Desktop
+# and WSL use for host/container traffic. Anything else is refused.
+#
+# Deliberately not "any address": the relay has no authentication, so reachability is the
+# only thing standing between it and an open proxy for the whole network.
+ALLOWED_PEER_PREFIXES = (
+    "127.",
+    "::1",
+    "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.",
+    "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
+    "172.30.", "172.31.",
+    "192.168.65.",
+    "10.",
+)
+
+
+def is_allowed_peer(peer: str) -> bool:
+    """
+    Whether a connecting address may use this relay.
+
+    Set ``RELAY_ALLOW_ANY=1`` to accept everyone, for a setup where the caller is known
+    to be reachable another way. Left as an explicit opt-out rather than a silent default,
+    because turning it on publishes an open proxy.
+    """
+    if os.getenv("RELAY_ALLOW_ANY", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return bool(peer) and peer.startswith(ALLOWED_PEER_PREFIXES)
 
 
 class Relay(socketserver.BaseRequestHandler):
@@ -37,6 +66,25 @@ class Relay(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         proxy_host = self.server.proxy_host
         proxy_port = self.server.proxy_port
+
+        # Refuse anyone who is not the container or this machine.
+        #
+        # **This relay is an unauthenticated SOCKS5 proxy.** Its only reason for binding
+        # a non-loopback address is that a Docker container cannot reach a host service
+        # bound to 127.0.0.1 - but binding 0.0.0.0 also published it to every other
+        # machine that can route here, and this host has VMware and WSL virtual adapters
+        # in addition to its LAN. Anyone who connected could have used this machine's
+        # proxy, and therefore its IP, for free.
+        #
+        # The firewall rule that allows the port was created with RemoteAddress=Any,
+        # which does not narrow it either. Checking the peer here does, and keeps working
+        # even if that rule is widened again or the firewall is off.
+        peer = self.client_address[0] if self.client_address else ""
+        if not is_allowed_peer(peer):
+            print(f"  relay: refused {peer} (not a container or loopback address)",
+                  flush=True)
+            return
+
         try:
             upstream = socket.create_connection((proxy_host, proxy_port), timeout=10)
         except OSError as exc:

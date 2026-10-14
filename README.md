@@ -1397,6 +1397,64 @@ The helper returns the proxy in `http://host:port` form even though the port spe
 as well: httpx needs the `socksio` extra for `socks5://`, and HTTP CONNECT works here
 without that dependency.
 
+### SECURITY AUDIT — what was found and what to do
+
+Four independent audits were run over this codebase (secrets, injection, authorization,
+cache/file integrity). This section records the outcome, including the parts that are
+**not** fixed and the one action that is the operator's.
+
+#### Action required: rotate the bot token
+The bot token was committed to this **public** repository in four places, all quoting the
+same genuine boot error. The token has since been rotated (`/revoke`), and the leaked one
+is confirmed dead — `getMe` with it returns 401. Nothing further is needed for that leak,
+though the bot **id** is now permanently public and should be treated as such.
+
+#### Fixed
+
+| Severity | Problem | Fix |
+| --- | --- | --- |
+| HIGH | Cache index names were joined to `CACHE_DIR` with only an `is_file()` check, so `.cache/../.env` was accepted — **the bot could be made to upload its own token file** — and the same join was used for deletion | `cache_file_path()` validates the name shape, rejects absolutes, and requires the result to resolve to a direct child of the cache directory; used by both the read and delete paths |
+| HIGH | The bot could write its **current** token into the log: httpx echoes the request URL, which embeds it, and `restart.log` is the file people paste into bug reports | `redact_secrets()`; verified against the real leak string, and by shape so a token rotated after the failing request is still caught |
+| MEDIUM | Admin roster disclosed to every authorized user via `/authorized` | Non-admins see the lists but not the admin list |
+| MEDIUM | A valid `authorized.json` containing `"admins": []` locked the bot out of every admin command permanently | The `.env` bootstrap admin is restored when the file has none |
+| MEDIUM | The `stop` button ran with **no** authorization check, and `_running_downloads` is keyed by chat — any chat member, authorized or not, could kill someone else's download | The presser is checked before every branch |
+| MEDIUM | Cache written with `if not target.exists()`, and names are derived from the URL alone — a file planted at that name was served as that URL's media | Atomic write via a temp file and `os.replace` |
+| MEDIUM | Cache bounded by entry count only; measured 101 MB from 29 files, with no byte ceiling | `CACHE_MAX_BYTES`, evicting whole entries oldest-first |
+| MEDIUM | Every staging-dir candidate was created and one returned, so the rest leaked — **2,027 empty directories** measured in %TEMP% | Candidates created lazily, rejected ones removed, and `sweep_stale_work_dirs()` clears what accumulated |
+| MEDIUM | Non-admins could read the admin roster; the docs described an allowlist as a blocklist | See above; wording and the mode label corrected |
+| LOW | The archive URL only had to *contain* `hath.network/archive/`, so a lookalike host would be fetched **with the account's cookies attached** | Hostname checked against `hath.network` before anything is fetched |
+| LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
+| LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
+
+#### Known and NOT fixed
+- **One update is processed at a time.** PTB's default is `max_concurrent_updates=1`, and
+  `.concurrent_updates()` is never called, so a single long request (up to 15 minutes for
+  an e-hentai fallback) blocks every other user. **The 停止 button is therefore also
+  ineffective during a long operation**: the button press is itself an update, so it is not
+  dispatched until the blocking handler finishes, by which time the stop flag has been
+  cleared. Raising concurrency is the fix, and it is not a one-line change — the per-request
+  worker pools and shared state were sized against serial execution, so it needs its own
+  pass rather than being bolted on during an audit.
+- **The official-archive download has no total size or wall-clock bound.** It is bounded
+  per read (300s) but a hostile or mis-sized `Content-Range` drives `truncate()`. A cap is
+  worth adding before the bot is given a large disk.
+- **Page images are read fully into memory**, N at a time, with no per-file cap.
+- `parse_cache.json` and `.cache/` are **writable by any authenticated local user** on a
+  default Windows profile ACL, and `.env` is readable by them. This is what makes the cache
+  findings reachable. On a shared machine:
+  `icacls .env /inheritance:r /grant:r "%USERNAME%:(R,W)"`
+- `api_hash` is passed to the local Bot API server on its command line, so it is visible to
+  any local user through a process listing.
+
+#### Checked and clean
+No command-injection vector: only two `gallery-dl` invocations, both argv lists with
+`shell=False`, `--` always last. No `eval`/`exec`/`pickle`/`yaml.load` in first-party code.
+No path traversal in `sanitize_filename` or ZIP entry names, and the bot never extracts an
+archive it downloads. No cache-key collision across different resources. No non-admin path
+to administrator, and the last admin cannot be demoted or revoked. `admin_only` is
+fail-closed when no admins are configured. No credential file is tracked and `.gitignore`
+covers every one of them; the real `api_hash` and `api_id` never reached a commit.
+
 ### SECURITY: the bot description was hijacked
 The bot's Telegram description was found holding a promotional link:
 
@@ -1537,8 +1595,8 @@ It does **not** substitute a `{token}` placeholder, so the value must already en
 Passing the bare server root produced a URL with the token glued onto the port:
 
 ```
-Bot.base_url = 'http://127.0.0.1:80818693732536:AAEDcYYcEbQ08xurHFD_jFzGV311JsivHag'
-httpx.InvalidURL: Invalid port: '80818693732536:AAEDcYYcEbQ08xurHFD_jFzGV311JsivHag'
+Bot.base_url = 'http://127.0.0.1:<REDACTED-TOKEN>'
+httpx.InvalidURL: Invalid port: '<REDACTED-TOKEN>'
 ```
 
 That message points nowhere near the cause — it reads like a malformed token or a bad

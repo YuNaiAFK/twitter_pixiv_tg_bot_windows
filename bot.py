@@ -16,7 +16,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 # Optional local dependency folder. It exists because this project can run on a
 # host where packages cannot be installed into site-packages; a wheel unpacked
@@ -311,9 +311,17 @@ class Authorization:
     here a reader is most likely to get wrong:
 
         locked=False (default)  empty list -> everyone may parse
-                                the list is a blocklist-style restriction
+                                a non-empty list -> only those users may parse
         locked=True             empty list -> nobody may parse
-                                the list is a closed allowlist
+                                a non-empty list -> only those users may parse
+
+    **The list is an allowlist in both modes, not a blocklist.** The docs and the mode
+    label used to describe it as a restriction on the listed users, which reads as "these
+    users are the ones being blocked". The code has always done the opposite: once the
+    list has any entry, everyone *not* on it is refused. The behaviour is fail-closed and
+    therefore the safer of the two, but an operator who added one user expecting to block
+    that user would instead have locked out everybody else. Both the wording and the label
+    now say what actually happens.
 
     Being locked out entirely is worse than being open, so an empty list means
     "open" unless that meaning was chosen on purpose. Administrators always pass,
@@ -380,6 +388,26 @@ class Authorization:
         state.groups = ids("groups")
         state.locked = bool(raw.get("locked", locked))
         state.group_locked = bool(raw.get("group_locked", group_locked))
+
+        # An empty admin set from a *valid* file is a permanent lockout, so it is refused
+        # when the caller supplied a bootstrap admin.
+        #
+        # Every admin command refuses without an admin (admin_only is deliberately
+        # fail-closed, and the "no admins" path tells the operator to edit .env rather
+        # than trusting whoever asks). That is the right default, but it means a file
+        # containing "admins": [] leaves the bot unmanageable from chat with no way back
+        # except editing the file on the host. The state is reachable through ordinary
+        # use - the last admin revoking themselves - or a partial write.
+        #
+        # A corrupt, missing or non-dict file already falls back to the caller's values;
+        # this closes the one remaining case where a valid file silently locks everyone
+        # out. It cannot widen access: only the bootstrap list is restored.
+        if not state.admins and admins:
+            logger.warning(
+                "授權檔 %s 的 admins 是空的，會讓機器人無法管理；"
+                "改用 .env 的 ADMIN_USER_IDS（%s 位）避免鎖死。",
+                path, len(admins))
+            state.admins = set(admins)
         return state
 
     def save(self, path: Path) -> bool:
@@ -473,7 +501,7 @@ class Authorization:
     def mode_label(self) -> str:
         if self.locked:
             return "守門模式（只有名單內的人可解析）"
-        return "開放模式（所有人可解析，名單為限制）"
+        return "開放模式（所有人可解析，但名單一旦有內容就只有名單內的人可用）"
 
     @property
     def group_mode_label(self) -> str:
@@ -626,6 +654,16 @@ CACHE_DIR = Path(os.getenv("CACHE_DIR", str(BASE_DIR / ".cache")))
 CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", str(14 * 24 * 3600)))
 CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "300"))
 
+# A count bound alone does not bound the disk. 300 entries x MAX_FILES files x any size
+# is unbounded in bytes, and the measured cache was already 101 MB from 29 files. A
+# public bot can be made to fill the volume by requesting large works, so the total is
+# capped as well and the oldest entries are evicted until it fits.
+#
+# Entries are evicted whole rather than by file: half an artwork in the cache would be
+# served as the complete work, which the completeness check refuses anyway - so the entry
+# must go together or not at all.
+CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
+
 # e-hentai's page images are served from signed, time-limited URLs, and the signature
 # lives far less long than the 14-day cache entry that carries it. A cached sweep that
 # outlives its URLs makes EVERY page fail at once, which then dropped the download into
@@ -661,10 +699,12 @@ class ParseCache:
     """
 
     def __init__(self, path: Path, *, stale_seconds: int = CACHE_STALE_SECONDS,
-                 max_entries: int = CACHE_MAX_ENTRIES):
+                 max_entries: int = CACHE_MAX_ENTRIES,
+                 max_bytes: int = CACHE_MAX_BYTES):
         self.path = path
         self.stale_seconds = stale_seconds
         self.max_entries = max_entries
+        self.max_bytes = max(0, int(max_bytes))
         # key -> {"kind", "payload", "at"}
         self.entries: dict[str, dict] = {}
         self.hits = 0
@@ -751,11 +791,16 @@ class ParseCache:
 
     def prune(self) -> int:
         """
-        Drop stale entries and, if still too many, the oldest. Returns how many.
+        Drop stale entries and, if still over a bound, the oldest. Returns how many.
 
-        Bounded on both axes because a media entry points at files on disk: an
-        unbounded entry list would grow without limit, and dropping the entry
-        without removing the files would leak disk space that nothing references.
+        Bounded on **both** axes because a media entry points at files on disk: an
+        unbounded entry list would grow without limit, and dropping the entry without
+        removing the files would leak disk space that nothing references.
+
+        The byte bound matters as much as the count. 300 entries says nothing about size -
+        MAX_FILES files each of any size - and the measured cache was already 101 MB from
+        29 files. A public bot can otherwise be made to fill the volume by requesting
+        large works.
         """
         removed = 0
         for key in [k for k, e in self.entries.items() if self.is_stale(e)]:
@@ -770,7 +815,36 @@ class ParseCache:
                 self.discard_files(entry)
                 self.entries.pop(key, None)
                 removed += 1
+
+        # Then the byte bound, oldest first. Whole entries only: a partially evicted
+        # entry would point at missing files and be refused as unusable anyway, so
+        # keeping the remainder would waste disk rather than save anything.
+        while self.entries and self.total_bytes() > self.max_bytes:
+            oldest = min(self.entries.items(), key=lambda kv: kv[1].get("at", 0))
+            self.discard_files(oldest[1])
+            self.entries.pop(oldest[0], None)
+            removed += 1
         return removed
+
+    def total_bytes(self) -> int:
+        """
+        Size on disk of every file the cache currently references.
+
+        Only files that still resolve inside the cache directory are counted, so a
+        malformed name cannot make this read outside it.
+        """
+        total = 0
+        for entry in self.entries.values():
+            payload = entry.get("payload") or {}
+            for name in payload.get("files") or []:
+                path = cache_file_path(name)
+                if path is None:
+                    continue
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    continue
+        return total
 
     def needs_pruning(self) -> bool:
         """
@@ -778,6 +852,11 @@ class ParseCache:
 
         Checked before pruning, so a request does not walk the whole table on every
         parse just to establish that nothing is stale.
+
+        The byte check is skipped here on purpose: `total_bytes()` stats every cached
+        file, which is exactly the walk this method exists to avoid. It runs on the write
+        path after every stored parse, so the size is re-checked often enough - and prune
+        applies the byte bound whenever it does run.
         """
         if len(self.entries) > self.max_entries:
             return True
@@ -786,11 +865,23 @@ class ParseCache:
 
     @staticmethod
     def discard_files(entry: dict) -> None:
-        """Remove the cached files an entry points at, ignoring failures."""
+        """
+        Remove the cached files an entry points at, ignoring failures.
+
+        Names are resolved through ``cache_file_path``, the same validation the read path
+        uses. The deletion path joined ``CACHE_DIR / name`` bare, so a crafted entry could
+        have deleted anything the bot's account can write - ``.env`` included, which would
+        break the bot on its next start. Deleting is the more dangerous of the two uses, so
+        it must not be the one with less checking.
+        """
         files = (entry.get("payload") or {}).get("files") or []
         for name in files:
+            path = cache_file_path(name)
+            if path is None:
+                logger.warning("快取索引含有不合法的檔名，略過刪除：%r", name)
+                continue
             try:
-                (CACHE_DIR / name).unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             except Exception:  # noqa: BLE001
                 logger.debug("無法刪除快取檔案 %s", name, exc_info=True)
 
@@ -826,6 +917,18 @@ def cache_media_files(files: list[Path], url: str) -> list[str]:
     directory, which the caller deletes, and the caller may still need them to send
     the current reply. A file that cannot be copied is simply not cached, so a
     failure here costs a future re-download rather than the current reply.
+
+    **The write is atomic and does not skip an existing name.** It used to be
+    the old code skipped the copy whenever a file of that name already existed. Both
+    halves were wrong together: the name is derived from the URL alone
+    (``sha1(key)[:12]_NNN.ext``), so it is predictable, and the cache directory is
+    world-modifiable on a default Windows profile ACL. A file planted at that exact name
+    was therefore never overwritten and was later served as that URL's media - no index
+    edit needed, just a file in the right place.
+
+    Writing to a temporary file and ``os.replace``-ing it removes the whole class: a
+    pre-planted file is replaced rather than trusted, and a crash cannot leave a partial
+    file that looks complete.
     """
     names: list[str] = []
     try:
@@ -837,14 +940,67 @@ def cache_media_files(files: list[Path], url: str) -> list[str]:
     key = hashlib.sha1(normalize_cache_key(url).encode("utf-8")).hexdigest()[:12]
     for index, path in enumerate(files, 1):
         name = f"{key}_{index:03d}{path.suffix.lower()}"
-        target = CACHE_DIR / name
+        staging = CACHE_DIR / f".{name}.{os.getpid()}.{index}.part"
         try:
-            if not target.exists():
-                shutil.copy2(path, target)
+            shutil.copy2(path, staging)
+            # Atomic on the same filesystem: either the old file or the new one is
+            # visible, never a half-written file under the real name.
+            os.replace(staging, CACHE_DIR / name)
             names.append(name)
         except Exception as exc:  # noqa: BLE001
             logger.warning("無法快取檔案 %s：%s", path, exc)
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError:
+                pass
     return names
+
+
+# Cache file names are generated as ``<12 hex>_<3 digits><suffix>``, so anything else in
+# the cache file is not something this bot wrote.
+_CACHE_NAME_RE = re.compile(r"^[0-9a-f]{12}_\d{3}\.[A-Za-z0-9]{1,6}$")
+
+
+def cache_file_path(name) -> Path | None:
+    """
+    Resolve one name from the cache index to a path inside ``CACHE_DIR``, or None.
+
+    **This validation is the difference between a cache and a file-disclosure bug.**
+    The names come from ``parse_cache.json``, which is world-modifiable on a default
+    Windows profile ACL, and they were previously joined with a bare ``CACHE_DIR / name``
+    whose only check was ``is_file()``. On Windows that accepts:
+
+        CACHE_DIR / "../.env"          -> the real .env, and is_file() is True
+        CACHE_DIR / "C:/Windows/x"     -> an absolute child REPLACES the base
+
+    Both then reach ``reply_document``, which uploads any extension, so a crafted entry
+    could make the bot send its own token file or cookie jar to whoever requested that
+    URL. The same join was used for **deletion** in ``discard_files``, so an entry could
+    also delete files outside the cache.
+
+    Three independent checks, because each alone has a gap on Windows: the name must look
+    generated, must not be absolute, and must resolve to a direct child of the cache
+    directory.
+    """
+    if not isinstance(name, str) or not _CACHE_NAME_RE.match(name):
+        return None
+    # Test the NAME for absoluteness, not the joined path.
+    #
+    # `(CACHE_DIR / name).is_absolute()` is always True whenever CACHE_DIR is absolute,
+    # which it is - so testing the joined path rejected every legitimate file and would
+    # have disabled the cache entirely. The name is what must not be absolute, because on
+    # Windows an absolute child REPLACES the base when joined.
+    if Path(name).is_absolute() or name != Path(name).name:
+        return None
+    candidate = CACHE_DIR / name
+    try:
+        resolved = candidate.resolve()
+        root = CACHE_DIR.resolve()
+    except OSError:
+        return None
+    if resolved.parent != root:
+        return None
+    return resolved
 
 
 def cached_media_files(payload: dict) -> list[Path]:
@@ -854,11 +1010,21 @@ def cached_media_files(payload: dict) -> list[Path]:
     Every file must still be present. A partially missing set is treated as no
     cache at all, because sending half an artwork as though it were the whole thing
     would be worse than downloading it again.
+
+    Every name is validated first. A name that fails validation is treated the same as a
+    missing file - the cache is unusable and the caller downloads again - rather than
+    being sent or deleted.
     """
     names = (payload or {}).get("files") or []
     if not names:
         return []
-    paths = [CACHE_DIR / name for name in names]
+    paths = []
+    for name in names:
+        path = cache_file_path(name)
+        if path is None:
+            logger.warning("快取索引含有不合法的檔名，已忽略整個項目：%r", name)
+            return []
+        paths.append(path)
     if not all(path.is_file() for path in paths):
         logger.info("快取檔案不完整，將重新下載")
         return []
@@ -1643,6 +1809,54 @@ def create_staging_dir(root: Path) -> Path:
     raise OSError(f"無法在 {root} 下建立唯一暫存目錄")
 
 
+def sweep_stale_work_dirs(*, min_age_seconds: float = 3600.0) -> int:
+    """
+    Delete abandoned staging directories left in the system temp folder.
+
+    The bot creates one staging directory per request and its caller removes it. The
+    historical version of ``make_work_dir`` created **every** candidate and returned one,
+    so the losers were never removed by anyone - 2,027 empty ``twitter_pixiv_*``
+    directories had accumulated in %TEMP% when this was written. That leak is fixed, but
+    the directories already on disk still occupy space and this is the only code that
+    knows what they are.
+
+    Deliberately timid, because it deletes things:
+
+    * only names matching this bot's own prefix,
+    * only directories, never files,
+    * only ones that are completely **empty** - a directory still being used has content
+      in it, so this cannot delete work in progress,
+    * only ones older than an hour, so a directory created moments ago by a request that
+      is still starting up is never touched.
+
+    Returns how many were removed. Never raises.
+    """
+    removed = 0
+    try:
+        import glob
+        now = time.time()
+        for entry in glob.glob(os.path.join(tempfile.gettempdir(),
+                                            "twitter_pixiv_*")):
+            path = Path(entry)
+            try:
+                if not path.is_dir():
+                    continue
+                if now - path.stat().st_mtime < min_age_seconds:
+                    continue
+                # The emptiness check is what makes this safe.
+                if any(path.iterdir()):
+                    continue
+                path.rmdir()
+                removed += 1
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001
+        logger.debug("清理暫存目錄時發生問題", exc_info=True)
+    if removed:
+        logger.info("清除了 %s 個殘留的暫存目錄", removed)
+    return removed
+
+
 def make_work_dir() -> Path:
     """
     Create the per-request staging directory, honouring WORK_DIR.
@@ -1652,32 +1866,40 @@ def make_work_dir() -> Path:
     sandboxed host). Falling back here keeps one bad setting or blocked path
     from failing every single request; the reason is logged so it is
     diagnosable.
+
+    **Candidates are created lazily, one at a time.** Every candidate used to be
+    created up front and then only the winner was returned, so the losers were never
+    removed by anyone - the caller deletes the path it was given and knows nothing about
+    the others. Measured on this machine: **2,027 empty ``twitter_pixiv_*`` directories**
+    in %TEMP%, one or two leaked per request since the bot was first run. Creating a
+    candidate only when it is about to be probed means nothing is created that is not
+    returned.
     """
-    candidates = []
+    attempts = []
 
     if WORK_DIR:
         root = Path(WORK_DIR).expanduser()
         if not root.is_absolute():
             root = BASE_DIR / root
-        try:
-            candidates.append(create_staging_dir(root))
-        except OSError as exc:
-            logger.warning("無法在 WORK_DIR 下建立目錄：%s（%s）", root, exc)
+        attempts.append(("WORK_DIR", lambda root=root: create_staging_dir(root)))
 
     # The project directory is a better fallback than the system temp dir: it is
     # known writable (the bot runs from it) and keeps large artworks on the same
     # drive the user configured the bot to live on.
-    try:
-        candidates.append(create_staging_dir(BASE_DIR / ".downloads"))
-    except OSError as exc:
-        logger.warning("無法在專案目錄下建立暫存目錄：%s", exc)
+    attempts.append(("專案目錄",
+                     lambda: create_staging_dir(BASE_DIR / ".downloads")))
 
-    try:
-        candidates.append(Path(tempfile.mkdtemp(prefix="twitter_pixiv_")))
-    except OSError as exc:
-        logger.warning("無法在系統暫存目錄下建立暫存目錄：%s", exc)
+    # The system temp dir is last: on this host it is the location that used to leak,
+    # so it is only used when both configured locations are unavailable.
+    attempts.append(("系統暫存目錄",
+                     lambda: Path(tempfile.mkdtemp(prefix="twitter_pixiv_"))))
 
-    for path in candidates:
+    for label, create in attempts:
+        try:
+            path = create()
+        except OSError as exc:
+            logger.warning("無法在%s下建立暫存目錄：%s", label, exc)
+            continue
         try:
             probe = path / ".write_probe"
             probe.write_text("ok", encoding="utf-8")
@@ -1685,6 +1907,9 @@ def make_work_dir() -> Path:
             return path
         except OSError as exc:
             logger.warning("暫存目錄不可寫入，改用下一個候選：%s（%s）", path, exc)
+            # Remove the candidate we just created and rejected, so a bad location does
+            # not accumulate directories either.
+            shutil.rmtree(path, ignore_errors=True)
 
     raise RuntimeError(
         "找不到可寫入的暫存目錄。請檢查 WORK_DIR 設定或磁碟權限。"
@@ -1759,6 +1984,41 @@ def is_size_refusal(exc: Exception) -> bool:
         "too big", "too large", "file is too", "filesize", "file size",
         "photo_invalid_dimensions", "invalid dimensions",
     ))
+
+
+def redact_secrets(text: str) -> str:
+    """
+    Remove credentials from text that is about to be logged or shown.
+
+    Written for one concrete leak: ``httpx`` includes the full request URL in its
+    exception message, and Telegram URLs embed the bot token as
+    ``https://host/bot<digits>:<secret>/method``. Any failed API call therefore carried
+    the **current bot token** into the log, and ``restart.log`` is the file an operator
+    pastes into a bug report.
+
+    The bot token is matched by shape (``\\d{6,}:[A-Za-z0-9_-]{30,}``) rather than by
+    comparing against ``BOT_TOKEN``, so a token that was rotated *after* the failing
+    request - the case that matters, because a rotation is what makes the next call fail -
+    is still redacted. Query parameters named for secrets are covered too.
+
+    Safe on any string; returns it unchanged when nothing matches.
+    """
+    if not text:
+        return text
+    # A Telegram bot token, matched by shape so a rotated one is caught too.
+    #
+    # No leading ``\b``: in the URL that actually leaks - ``.../bot<digits>:<secret>/...``
+    # - the token is preceded by ``t``, so a word boundary does not exist there and the
+    # pattern silently matched nothing. That was caught by testing the real string rather
+    # than trusting the regex.
+    redacted = re.sub(r"\d{6,}:[A-Za-z0-9_-]{30,}", "<TOKEN>", text)
+    # A known literal token, in case it appears without the numeric prefix.
+    if BOT_TOKEN:
+        redacted = redacted.replace(BOT_TOKEN, "<TOKEN>")
+    # Credential-bearing query parameters: e-hentai's archiver uses ?token=.
+    redacted = re.sub(r"(?i)\b(token|api_hash|api_id|auth|key|password)=[^&\s\"']+",
+                      r"\1=<REDACTED>", redacted)
+    return redacted
 
 
 def admin_hint(platform: str | None = None) -> str:
@@ -2236,7 +2496,36 @@ def authorization_report() -> str:
 
 
 async def authorized_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show who may parse and who may administer."""
+    """
+    Show who may parse and who may administer.
+
+    **Admins only, for the admin part.** This used to be reachable by every allow-listed
+    user through ``list_manager_only``, and the report lists every administrator's numeric
+    ID. Those IDs are not secrets on their own, but there is no reason for an ordinary
+    authorized user to be able to enumerate the admin roster - that is the list an
+    attacker most wants, and it costs nothing to withhold. A non-admin still sees the
+    lists they can act on.
+    """
+    user = update.effective_user
+    if user is not None and not user_is_admin(user.id):
+        # Everything except the admin roster.
+        extra = []
+        if AUTHORIZATION.allowed:
+            extra.append(f"• 已授權使用者（{len(AUTHORIZATION.allowed)}）：" +
+                         ", ".join(str(uid) for uid in sorted(AUTHORIZATION.allowed)))
+        else:
+            extra.append("• 已授權使用者：無")
+        if AUTHORIZATION.groups:
+            extra.append(f"• 已授權群組（{len(AUTHORIZATION.groups)}）：" +
+                         ", ".join(str(cid) for cid in sorted(AUTHORIZATION.groups)))
+        else:
+            extra.append("• 已授權群組：無")
+        extra.append(f"• 模式：{AUTHORIZATION.mode_label}")
+        extra.append(f"• 群組模式：{AUTHORIZATION.group_mode_label}")
+        await update.effective_message.reply_text(
+            "授權狀態：\n" + "\n".join(extra) +
+            "\n• 管理員名單僅限管理員查看。")
+        return
     await update.effective_message.reply_text(
         "授權狀態：\n" + authorization_report()
     )
@@ -3809,6 +4098,23 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
     mode, gid, token = parsed
     gallery_url = f"https://e-hentai.org/g/{gid}/{token}/"
 
+    # The presser is checked BEFORE any branch runs.
+    #
+    # It used to sit below the stop/regen/cancel branches, which meant `stop` ran with no
+    # authorization at all: `_running_downloads` is keyed by chat id, so **any member of
+    # the chat - including a user with no access to the bot - could press 停止 and kill
+    # somebody else's running download.** The check is now first, so every button action
+    # is gated by the same rule.
+    #
+    # `cancel` only clears its own keyboard, but it is gated too rather than special-cased:
+    # a rule with exceptions is a rule that gets one wrong later.
+    if not user_is_allowed(
+            user.id,
+            getattr(message, "chat_id", None),
+            getattr(getattr(message, "chat", None), "type", None)):
+        await query.answer("此機器人目前不允許你的帳號使用。", show_alert=True)
+        return
+
     if mode == "stop":
         stopped = stop_running_download(message.chat_id)
         await query.answer("已停止下載。" if stopped else "目前沒有進行中的下載。",
@@ -3825,15 +4131,6 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
             await message.edit_reply_markup(reply_markup=None)
         except TelegramError:
             pass
-        return
-
-    # The chat is passed too, because in a group the group's own authorization
-    # decides, not the member's.
-    if not user_is_allowed(
-            user.id,
-            getattr(message, "chat_id", None),
-            getattr(getattr(message, "chat", None), "type", None)):
-        await query.answer("此機器人目前不允許你的帳號使用。", show_alert=True)
         return
 
     # Refused only while a request is genuinely running, so pressing a second
@@ -4593,6 +4890,20 @@ def resolve_official_archive(gallery, *, resample: bool) -> tuple[str, str, int]
                 f"官方歸檔無法取得下載連結：{reason[-200:]}")
 
         waiting_url = match.group(1)
+        # The host is checked before anything is fetched with it.
+        #
+        # The pattern above only required the URL to *contain* ``hath.network/archive/``,
+        # so ``https://evil.example/hath.network/archive/x`` would have been accepted as
+        # the archive URL and then fetched **with the account's e-hentai cookies
+        # attached** - full session credentials, not a harmless value. The source HTML is
+        # e-hentai's own TLS page, so this was not reachable from Telegram, but sending
+        # session cookies to a host chosen by page content is not a risk worth carrying
+        # for the sake of one comparison.
+        host = (urlsplit(waiting_url).hostname or "").lower()
+        if not (host == "hath.network" or host.endswith(".hath.network")):
+            raise ehentai.EhentaiError(
+                f"官方歸檔回傳了非預期的下載主機（{host or '空'}），已中止。")
+
         download_url = (waiting_url if waiting_url.endswith("/2")
                         else waiting_url + "/2") + "?start=1"
 
@@ -5772,7 +6083,7 @@ def telegram_base_url() -> str:
     Passing the bare root produced exactly this, and it is worth recording because the
     message points nowhere near the cause:
 
-        InvalidURL: Invalid port: '80818693732536:AAEDcYYcEbQ08xurHFD_jFzGV311JsivHag'
+        InvalidURL: Invalid port: '<REDACTED-TOKEN>'
 
     The token was concatenated onto the port, so httpx read it as part of the port
     number and the bot died during bootstrap.
@@ -5829,8 +6140,21 @@ def probe_telegram_limits() -> dict:
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:  # noqa: BLE001
-        info["detail"] = f"無法連線自架伺服器：{type(exc).__name__}: {exc}"
-        logger.warning("自架 Bot API 伺服器無法使用：%s", info["detail"])
+        # The token is redacted, and that is not tidiness.
+        #
+        # httpx puts the full request URL in its exception text, and this URL is
+        # ``.../bot<TOKEN>/getMe``. So any non-2xx answer - most likely a 401 immediately
+        # after a token rotation, which is exactly when this runs - wrote the **current
+        # bot token in plaintext** into the startup log. `restart.log` is the file an
+        # operator pastes into a bug report, so the leak would have travelled.
+        #
+        # The status code is reported instead: it carries the diagnosis without the
+        # credential, and it is the part that actually distinguishes the failure modes.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        detail = f"{type(exc).__name__}" + (f" HTTP {status}" if status else "")
+        safe = redact_secrets(str(exc))[:120]
+        info["detail"] = f"無法連線自架伺服器：{safe}"
+        logger.warning("自架 Bot API 伺服器無法使用：%s（%s）", detail, safe)
         return info
 
     if not payload.get("ok"):
@@ -5923,6 +6247,12 @@ def main():
         logger.info("Bot API 來源：%s", api_info.get("detail"))
     else:
         logger.warning("Bot API 來源：%s", api_info.get("detail"))
+
+    # Clear staging directories abandoned by earlier runs. Housekeeping only - it is
+    # wrapped internally and never raises, so it cannot stop the bot starting. Called
+    # synchronously because main() is not a coroutine; it does a few thousand stat calls
+    # at worst and runs before polling begins.
+    sweep_stale_work_dirs()
 
     builder = Application.builder().token(BOT_TOKEN)
     if telegram_base_url():

@@ -39,6 +39,11 @@ sys.path.insert(0, str(HERE / "vendor"))
 sys.path.insert(0, str(HERE))
 
 import bot
+
+import re as _re
+
+# Telegram bot token shape. Used to assert that no real token literal is committed.
+_TOKEN_SHAPE = _re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
 import ehentai
 import tag_translations
 
@@ -336,7 +341,7 @@ def _local_server_urls(monkeypatch_base: str):
 
 
 # Reported from a real boot: passing the bare server root to PTB produced
-#   InvalidURL: Invalid port: '80818693732536:AAEDcYYcEbQ08xurHFD_jFzGV311JsivHag'
+#   InvalidURL: Invalid port: '<REDACTED-TOKEN>'
 # because python-telegram-bot parses base_url with `return value + token` - it APPENDS
 # the token, so the value must already end with "/bot". The token was concatenated onto
 # the port, so httpx read it as part of the port number.
@@ -526,6 +531,111 @@ check("the profile text is overridable without editing code",
 check("the bot sets no chat menu button",
       "set_chat_menu_button" not in _profile_src,
       "a menu button pointing elsewhere would be another injection route")
+
+# --- Security audit findings, pinned so they cannot regress ---
+
+# HIGH: cache index names were joined to CACHE_DIR with only an is_file() check, so
+# `.cache/../.env` was accepted and could be uploaded to whoever requested that URL - and
+# the same join was used for deletion. Verified on Windows: an absolute child replaces the
+# base entirely.
+for _name, _ok, _label in (
+        ("75196daa8d51_001.jpg", True, "a name the generator produces"),
+        ("../.env", False, "traversal to the token file"),
+        ("..\\..\\.env", False, "backslash traversal"),
+        ("C:/Windows/win.ini", False, "an absolute child replaces the base"),
+        ("/etc/passwd", False, "an absolute posix path"),
+        ("sub/dir/file.jpg", False, "a nested path"),
+        (".env", False, "the token file by name"),
+        ("", False, "empty"),
+        (None, False, "not a string"),
+        ("75196daa8d51_001.jpg.exe", False, "longer suffix than generated"),
+):
+    check(f"cache path: {_label}",
+          (bot.cache_file_path(_name) is not None) is _ok,
+          f"{_name!r} -> {bot.cache_file_path(_name)}")
+check("a poisoned cache entry resolves to nothing",
+      bot.cached_media_files({"files": ["../.env"]}) == [],
+      "this is the file-disclosure path the audit found")
+check("the deletion path uses the same validation",
+      "cache_file_path(name)" in inspect.getsource(bot.ParseCache.discard_files),
+      "deleting is the more dangerous of the two uses")
+
+# MEDIUM: the cache write skipped an existing name, and names are derived from the URL
+# alone, so a file planted at that name was served as that URL's media.
+_cache_src2 = inspect.getsource(bot.cache_media_files)
+check("cache files are written atomically, not skipped when present",
+      "os.replace(" in _cache_src2
+      # The colon matters: the docstring quotes the old code, and matching on the bare
+      # phrase would fail on this module's own prose rather than on real code.
+      and "if not target.exists():" not in _cache_src2,
+      "a pre-planted file would otherwise be trusted and served")
+
+# MEDIUM: every candidate staging directory was created and only one returned, so the
+# rest leaked - 2,027 empty dirs were measured in %TEMP%.
+_mkwd_src = inspect.getsource(bot.make_work_dir)
+check("staging directories are created lazily",
+      "attempts.append" in _mkwd_src and "candidates.append" not in _mkwd_src,
+      "creating every candidate leaks the ones that are not returned")
+check("a rejected staging directory is removed",
+      "shutil.rmtree(path, ignore_errors=True)" in _mkwd_src,
+      "a bad location would accumulate directories")
+check("abandoned staging directories are swept at startup",
+      "sweep_stale_work_dirs" in inspect.getsource(bot.main),
+      "the directories already on disk would never be reclaimed")
+_sweep_src = inspect.getsource(bot.sweep_stale_work_dirs)
+check("the sweep only removes empty directories",
+      "if any(path.iterdir()):" in _sweep_src,
+      "deleting a non-empty directory could destroy work in progress")
+check("the sweep only removes its own prefix and only old ones",
+      "twitter_pixiv_" in _sweep_src and "min_age_seconds" in _sweep_src,
+      "it deletes things, so it must be narrow")
+
+# The bot token must never be written to a log. httpx puts the full request URL - which
+# embeds the token - into its exception text, and restart.log is the file an operator
+# pastes into a bug report.
+check("bot tokens are redacted before logging",
+      bot.BOT_TOKEN not in bot.redact_secrets(
+          f"url 'https://api.telegram.org/bot{bot.BOT_TOKEN}/getMe'"),
+      "the live token would reach restart.log")
+check("redaction catches a rotated token by shape, not by value",
+      "9999999999:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      not in bot.redact_secrets("x 9999999999:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA y"),
+      "the case that matters is a token rotated after the failing request")
+check("redaction leaves ordinary text alone",
+      bot.redact_secrets("nothing to hide here") == "nothing to hide here")
+check("the e-hentai session token is not logged",
+      "SECRET" not in ehentai.redact_url(
+          "https://e-hentai.org/archiver.php?gid=1&token=SECRET"),
+      "every retry wrote a live session token into the log")
+check("no real token literal remains in a tracked source file",
+      not _TOKEN_SHAPE.search(_profile_src),
+      "the revoked token was committed to a public repo in 4 places")
+
+# LOW: the archive URL only had to CONTAIN hath.network/archive/, so a lookalike host
+# would have been fetched with the account's cookies attached.
+_host_src = inspect.getsource(bot.resolve_official_archive)
+check("the archive host is checked before it is fetched",
+      "hath.network" in _host_src and "hostname" in _host_src,
+      "session cookies would be sent to whatever host the page named")
+
+# MEDIUM: admin roster disclosure and the allowlist/blocklist docstring.
+check("a non-admin cannot enumerate the admin roster",
+      "管理員名單僅限管理員查看" in inspect.getsource(bot.authorized_command),
+      "the admin list is what an attacker most wants")
+check("the list semantics are documented as an allowlist",
+      "the list is a blocklist-style restriction" not in
+      inspect.getsource(bot.Authorization).lower(),
+      "the old wording would make an operator lock everyone else out")
+check("the mode label does not claim the list is a blocklist",
+      "名單為限制" not in bot.Authorization(allowed={1}).mode_label,
+      "an operator would think listed users are blocked, when everyone else is")
+check("an empty admins file cannot lock the bot out",
+      "state.admins = set(admins)" in inspect.getsource(bot.Authorization.load),
+      "no admin means every admin command refuses forever")
+check("the stop button re-checks the presser",
+      inspect.getsource(bot.handle_gallery_callback).index("user_is_allowed")
+      < inspect.getsource(bot.handle_gallery_callback).index('mode == "stop"'),
+      "any chat member could kill someone else's download")
 
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
