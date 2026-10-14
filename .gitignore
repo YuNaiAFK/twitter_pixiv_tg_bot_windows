@@ -22,3 +22,5 @@ bot-api-data/
 telegram-bot-api.log
 telegram-bot-api
 telegram-bot-api.exe
+# Desktop-entry shortcut created per machine
+啟動機器人.lnk
