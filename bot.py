@@ -70,6 +70,19 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("twitter_pixiv_bot")
 
+# A replacement process writes to its own console window, so its output would otherwise never
+# reach a file. This keeps restart.log populated for the diagnosis the restart confirmation
+# points the operator at, while the window shows the same lines live.
+if os.getenv("BOT_RESTART_LOG"):
+    try:
+        _restart_handler = logging.FileHandler(BASE_DIR / "restart.log", encoding="utf-8")
+        _restart_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(_restart_handler)
+    except OSError:
+        pass
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 COOKIES_FILE = os.getenv("GALLERY_DL_COOKIES", "").strip()
 
@@ -2294,15 +2307,18 @@ def acquire_instance_lock(timeout: float) -> bool:
     previous instance is gone". A restart therefore resumes in well under a second, and still
     waits - up to the same budget - when the old process really is still shutting down.
 
-    Returns whether the lock was taken. A failure is not fatal: the caller continues, because
-    the worst case is the Conflict this exists to avoid, and a bot that will not start is
-    worse than one that might have to be restarted again.
+    ``timeout`` of 0 means **try once**: take it or report failure immediately. That is what a
+    plain start uses, because a start that has to wait is a start that already has a bot
+    running - see the refusal in ``main``, which is what stops a second window from polling the
+    same token.
+
+    Returns whether the lock was taken. A failure is not fatal for a *replacement*: the caller
+    continues, because the worst case is the Conflict this exists to avoid. For a plain start
+    the caller stops instead.
     """
     global _instance_lock_handle
 
-    if timeout <= 0:
-        timeout = 0.0
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + max(0.0, timeout)
     # Short interval: the lock is usually free immediately, and the point is not to linger.
     interval = 0.1
     warned = False
@@ -2325,6 +2341,9 @@ def acquire_instance_lock(timeout: float) -> bool:
             # Held by the process being replaced. Close and try again shortly.
             handle.close()
             if time.monotonic() >= deadline:
+                if timeout <= 0:
+                    # Try-once: the caller decides, and a plain start stops here.
+                    return False
                 logger.warning(
                     "前一個程序在 %.0f 秒內仍未釋放鎖定；仍會繼續啟動，"
                     "若出現 Conflict 請再試一次。", timeout)
@@ -3333,12 +3352,23 @@ def spawn_replacement_process() -> subprocess.Popen:
     except (AttributeError, OSError):
         pass
 
-    flags = 0
-    if os.name == "nt":
-        # Hidden console, and its own process group so signals to ours miss it.
-        flags = (subprocess.DETACHED_PROCESS
-                 | subprocess.CREATE_NEW_PROCESS_GROUP
-                 | subprocess.CREATE_NO_WINDOW)
+    # A replacement writes to its own console, which is the window the operator watches, and
+    # the same output is still appended to restart.log so nothing is lost when it closes.
+    #
+    # It used to write only to the log, with no console at all
+    # (DETACHED_PROCESS | CREATE_NO_WINDOW). The visible window belonged to run.bat, so when
+    # the old process exited that window closed and **nothing replaced it**: the bot ran on
+    # with no window to look at, and the only trace was a file. Now the replacement opens a
+    # console of its own, so after a restart there is exactly one window and it is the live
+    # one.
+    #
+    # CREATE_NO_WINDOW is not used: it gives a console (so an accidental print cannot fail,
+    # which was its purpose) but no window, which is the empty-window problem in another
+    # form. CREATE_NEW_PROCESS_GROUP so a Ctrl+C aimed at the old console misses this one.
+    use_console = os.name == "nt"
+    flags = subprocess.CREATE_NEW_CONSOLE if use_console else 0
+    if use_console:
+        flags |= subprocess.CREATE_NEW_PROCESS_GROUP
 
     # The log must be UTF-8 regardless of the machine's locale. Without this the
     # replacement wrote the log in the system code page (cp936 here), so the file
@@ -3356,9 +3386,31 @@ def spawn_replacement_process() -> subprocess.Popen:
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1",
         "RESTART_STARTUP_DELAY": str(RESTART_STARTUP_DELAY_SECONDS),
+        # Tells the child to keep a copy of its own log, since its output now goes to a
+        # console window rather than a redirected file.
+        "BOT_RESTART_LOG": "1",
+        # **Marks this process as a replacement, and it is the only thing that does.**
+        #
+        # The startup wait used to key off RESTART_STARTUP_DELAY, which is also a documented
+        # .env setting - so load_dotenv() set it for EVERY start, every start believed it was
+        # a replacement, and run.bat waited six seconds for nothing while the refusal guard
+        # below was skipped. A marker that only the spawner sets cannot be confused that way.
+        "BOT_IS_REPLACEMENT": "1",
     }
 
     try:
+        # stdout/stderr are NOT redirected when a console is used: the child owns that
+        # console, and pointing its output at a file instead is what would leave the window
+        # blank. The log is still written - the child installs its own file handler - so both
+        # a live window and a file exist.
+        if use_console:
+            return subprocess.Popen(
+                [sys.executable, str(BASE_DIR / "bot.py")],
+                cwd=str(BASE_DIR),
+                creationflags=flags,
+                close_fds=True,
+                env=environment,
+            )
         return subprocess.Popen(
             [sys.executable, str(BASE_DIR / "bot.py")],
             cwd=str(BASE_DIR),
@@ -7841,20 +7893,30 @@ def main():
     # A replacement process waits for the previous instance to release the single-instance
     # lock, instead of sleeping for a fixed period.
     #
-    # The delay used to be unconditional: every /restart paid the full RESTART_STARTUP_DELAY
-    # (6s by default) **even when the old process had already gone**, which is the usual case.
-    # That is the fixed pause visible in the log before anything else happens. Waiting on a
-    # lock asks the question that matters - is the previous instance actually still there? -
-    # and the operating system answers it, releasing the lock when that process dies however
-    # it dies. A normal start from run.bat takes the lock immediately and does not wait at all.
+    # **"Is this a replacement" is decided by BOT_IS_REPLACEMENT, not by the delay setting.**
+    # Those were the same thing once, and it was wrong in a way that took a while to see:
+    # RESTART_STARTUP_DELAY is also a documented .env value, so load_dotenv() supplied it for
+    # every start. Every start therefore believed it was a replacement - which is why run.bat
+    # printed "等待 6.0 秒" and why a second window happily polled the same token instead of
+    # being refused. Only the spawner sets the marker, so only a real replacement sees it.
+    is_replacement = bool((os.getenv("BOT_IS_REPLACEMENT") or "").strip())
     await_lock = 0.0
-    raw_lock = (os.getenv("RESTART_STARTUP_DELAY") or "").strip()
-    if raw_lock:
-        try:
-            await_lock = max(0.0, float(raw_lock))
-        except ValueError:
-            logger.warning("RESTART_STARTUP_DELAY=%r 不是數字，將不等待。", raw_lock)
-    acquire_instance_lock(await_lock)
+    if is_replacement:
+        await_lock = RESTART_STARTUP_DELAY_SECONDS
+
+    if not acquire_instance_lock(await_lock):
+        if not is_replacement:
+            # **A plain start, and something already holds the lock.** Starting anyway would
+            # put two pollers on one token, which Telegram answers with "Conflict: terminated
+            # by other getUpdates request". The usual cause is a window left open from an
+            # earlier run, so the message names it.
+            print()
+            print("  已經有另一個機器人正在執行，這次啟動會結束。")
+            print("  請關閉另一個視窗後再試一次（或直接使用那一個）。")
+            print()
+            raise SystemExit(1)
+        # A replacement: it may continue without the lock, because refusing would leave the
+        # bot offline, which is worse than a possible Conflict.
 
     # Ask the active server what it allows before building anything that depends on
     # the answer. Failure is not fatal: the public limits stay in force.

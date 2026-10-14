@@ -171,6 +171,91 @@ def _drop_explains_when_enabled() -> bool:
         bot.AUTHORIZATION.allowed = saved_allowed
 
 
+def _spawn_flags() -> bool:
+    """
+    Whether the spawner gives the replacement its own console and does not detach it.
+
+    Only the ``flags`` assignments are inspected. The whole function cannot be searched:
+    ast.unparse keeps comments, and the comment there explains that DETACHED_PROCESS is
+    deliberately *not* used - so searching the text found the explanation and failed against
+    correct code.
+    """
+    import ast
+    import inspect as _i
+    import textwrap
+    source = textwrap.dedent(_i.getsource(bot.spawn_replacement_process))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    pieces = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "flags":
+                    pieces.append(ast.unparse(node.value))
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "flags":
+                pieces.append(ast.unparse(node.value))
+    joined = " ".join(pieces)
+    return "CREATE_NEW_CONSOLE" in joined and "DETACHED_PROCESS" not in joined
+
+
+def _replacement_is_decided_not_assumed() -> bool:
+    """
+    Whether ``is_replacement`` comes from the environment rather than a constant.
+
+    Parsed, and matched on the assignment: a literal True is exactly the regression, and a
+    plain text search for the variable name cannot tell the two apart.
+    """
+    import ast
+    import inspect as _i
+    import textwrap
+    source = textwrap.dedent(_i.getsource(bot.main))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if not (isinstance(target, ast.Name) and target.id == "is_replacement"):
+                    continue
+                value = node.value
+                # A constant is the regression; anything computed is acceptable, and the
+                # name it reads is asserted separately below.
+                if isinstance(value, ast.Constant):
+                    return False
+                return True
+    return False
+
+
+def _replacement_flag_is_read() -> bool:
+    """
+    Whether main() reads BOT_IS_REPLACEMENT from the environment to decide the wait.
+
+    Parsed with AST and matched on the call, so the environment dictionary in the spawner -
+    which also contains the name - cannot satisfy it.
+    """
+    import ast
+    import inspect as _i
+    import textwrap
+    # dedent, not lstrip: only the first line loses its indentation otherwise, and the parse
+    # fails - which is how this helper reported False against correct code.
+    source = textwrap.dedent(_i.getsource(bot.main))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "getenv" and node.args):
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and first.value == "BOT_IS_REPLACEMENT":
+                return True
+    return None
+
+
 def _lock_call_uses_the_setting() -> bool:
     """
     main() must pass the configured delay to the lock, not a constant.
@@ -180,9 +265,10 @@ def _lock_call_uses_the_setting() -> bool:
     """
     import ast
     import inspect as _i
-    source = _i.getsource(bot.main)
+    import textwrap
+    source = textwrap.dedent(_i.getsource(bot.main))
     try:
-        tree = ast.parse(source.lstrip())
+        tree = ast.parse(source)
     except SyntaxError:
         return False
     for node in ast.walk(tree):
@@ -2014,10 +2100,41 @@ check("the lock is released explicitly, not only at process exit",
       # wait for the OS to reap the old process.
       "release_instance_lock()" in inspect.getsource(bot.main),
       "an explicit release shortens the next start")
-check("a normal start does not wait at all",
-      # Only /restart sets RESTART_STARTUP_DELAY; run.bat does not.
-      "os.getenv(\"RESTART_STARTUP_DELAY\")" in inspect.getsource(bot.main),
-      "the delay must stay opt-in, not applied to every start")
+check("only a real replacement waits",
+      # **This was wrong once, and it was the whole bug.** The wait keyed off
+      # RESTART_STARTUP_DELAY, which is also a documented .env value - so load_dotenv()
+      # supplied it for every start, every start believed it was a replacement, and run.bat
+      # waited six seconds for nothing while the refusal guard was skipped.
+      "BOT_IS_REPLACEMENT" in inspect.getsource(bot.main)
+      and "os.getenv(\"RESTART_STARTUP_DELAY\")" not in inspect.getsource(bot.main),
+      "the marker must come from the spawner, not from a .env setting")
+check("the spawner sets the replacement marker",
+      '"BOT_IS_REPLACEMENT": "1"' in inspect.getsource(bot.spawn_replacement_process)
+      or "'BOT_IS_REPLACEMENT': '1'" in inspect.getsource(bot.spawn_replacement_process),
+      "nothing else may set it")
+check("the marker is the only thing that decides the wait",
+      # Asserted on how `is_replacement` is DECIDED. A search for the name alone was not
+      # enough: the spawner's environment dictionary also contains it, so that search passed
+      # even with the decision replaced by a hard-coded True.
+      _replacement_is_decided_not_assumed(),
+      "keying this off a .env setting is the bug that made every start wait")
+check("a replacement opens its own console",
+      # Asserted on the FLAGS ASSIGNMENT, because the comment above it explains that
+      # DETACHED_PROCESS is deliberately not used - so a search for the name found the
+      # explanation and failed against correct code.
+      _spawn_flags(),
+      "without a console the replacing process has no window at all")
+check("a replacement keeps a log file as well as its window",
+      # Its output now goes to the console, so without this restart.log would go stale and
+      # the confirmation's advice to read it would be wrong.
+      "BOT_RESTART_LOG" in inspect.getsource(bot.spawn_replacement_process)
+      and "restart.log" in inspect.getsource(bot)
+      and "FileHandler" in inspect.getsource(bot),
+      "the window and the file must both get the output")
+check("the refusal only applies to a plain start",
+      # A replacement may continue without the lock: refusing would leave the bot offline.
+      "if not is_replacement:" in inspect.getsource(bot.main),
+      "a replacement must not be refused")
 check("the fixed sleep is gone",
       # Any sleep in main() before polling is the thing being removed. Naming the exact
       # variable was too specific: an earlier version of this check searched for
@@ -2032,9 +2149,12 @@ check("the configured delay is what the lock is given",
 check("the lock file is not tracked",
       ".bot.lock" in (HERE / ".gitignore").read_text(encoding="utf-8"),
       "runtime state must not be committed")
-check("a bad RESTART_STARTUP_DELAY does not stop the bot",
-      "不是數字，將不等待" in inspect.getsource(bot.main),
-      "a malformed value should fall back, not raise")
+check("the delay setting is a number, read once and bounded",
+      # Read through env_number, which falls back on a malformed value instead of raising at
+      # import - so a bad value cannot stop the bot from starting.
+      isinstance(bot.RESTART_STARTUP_DELAY_SECONDS, (int, float))
+      and bot.RESTART_STARTUP_DELAY_SECONDS >= 0,
+      f"RESTART_STARTUP_DELAY_SECONDS={bot.RESTART_STARTUP_DELAY_SECONDS!r}")
 
 check("bulk deletion is batched rather than one burst",
       _deletion_is_batched(),

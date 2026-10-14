@@ -1426,6 +1426,58 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### A restart left no window, and every start waited six seconds
+
+Two symptoms with **one root cause**, which is why they are together.
+
+`RESTART_STARTUP_DELAY` is a documented `.env` value, and it was also the flag that decided
+"am I a replacement process?". `load_dotenv()` therefore set it for **every** start, so:
+
+1. **every** start believed it was a replacement, and `run.bat` printed
+   `等待 6.0 秒讓前一個程序結束後再開始輪詢……` before doing anything;
+2. the refusal guard added for a second instance was **skipped**, because a "replacement" is
+   allowed to continue - so two windows could both poll the same token.
+
+A separate marker that only the spawner sets fixes both:
+
+    已啟動 → BOT_IS_REPLACEMENT=1 → /restart 的替代程序 → 等待（上限 6s）
+    run.bat  → 沒有這個變數        → 一般啟動        → 完全不等
+
+**Measured: a plain start now reaches "等待 Telegram 訊息" in 1.81s, and the six-second line
+is gone.**
+
+#### The blank window
+
+`/restart` spawned the replacement with:
+
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+
+That is a process with **no console at all**, writing only to `restart.log`. The visible
+window belonged to `run.bat`, so when the old process exited **that window closed and nothing
+took its place** - the bot ran on with no window to look at. What you saw was a console whose
+title was the interpreter path and whose body was empty.
+
+The replacement now gets its own console:
+
+    CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP
+
+so after a restart there is exactly **one** window, and it is the live one. Its output goes to
+that window and is also appended to `restart.log` (the child installs a file handler), because
+the restart confirmation tells the operator to read that file.
+
+`CREATE_NO_WINDOW` was there so an accidental `print` could not fail; `CREATE_NEW_CONSOLE`
+satisfies that too, since a console exists either way.
+
+#### A second window is now refused
+
+A plain start that cannot take the single-instance lock **stops** instead of polling:
+
+    已經有另一個機器人正在執行，這次啟動會結束。
+    請關閉另一個視窗後再試一次（或直接使用那一個）。
+
+A *replacement* still continues without the lock, because refusing would leave the bot
+offline - which is worse than a possible Conflict.
+
 ### A restart slept for six seconds even when nothing was running
 
 The line you will have seen:
