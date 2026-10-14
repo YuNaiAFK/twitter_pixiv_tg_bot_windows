@@ -171,6 +171,95 @@ def _drop_explains_when_enabled() -> bool:
         bot.AUTHORIZATION.allowed = saved_allowed
 
 
+def _state_from_response(status_code: int, payload=None) -> str:
+    """
+    Run pixiv_work_state against a stubbed HTTP response.
+
+    The token and client are stubbed so the classification logic is what is under test, not
+    the network. A real un-published work was used while developing, but it will not stay
+    un-published forever, so the response shape is reproduced instead.
+    """
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = status_code
+
+        def json(self):
+            return payload
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, *a, **k):
+            return FakeResponse()
+
+    saved_token = bot.pixiv_access_token
+    saved_httpx = bot.httpx.Client
+    try:
+        bot.pixiv_access_token = lambda *a, **k: "stub-token"
+        bot.httpx.Client = FakeClient
+        return bot.pixiv_work_state("1")
+    except Exception:  # noqa: BLE001
+        return "ERROR"
+    finally:
+        bot.pixiv_access_token = saved_token
+        bot.httpx.Client = saved_httpx
+
+
+def _unpublished_is_unavailable() -> bool:
+    return _state_from_response(200, {"illust": {
+        "id": 1, "title": "", "visible": False,
+        "total_view": 0, "total_bookmarks": 0}}) == "unavailable"
+
+
+def _deleted_is_unavailable() -> bool:
+    return _state_from_response(404, None) == "unavailable"
+
+
+def _server_error_is_unknown() -> bool:
+    return _state_from_response(500, None) == "unknown"
+
+
+def _unavailable_notice() -> str:
+    """The message text report_empty_download sends for an unavailable work."""
+    import asyncio
+
+    class Msg:
+        def __init__(self):
+            self.chat_id = 1
+            self.message_id = 1
+            self.texts = []
+
+        async def reply_text(self, text, **k):
+            self.texts.append(text)
+            return self
+
+        async def edit_text(self, text, **k):
+            self.texts.append(text)
+            return self
+
+        async def delete(self):
+            return self
+
+    saved = bot.pixiv_work_state
+    try:
+        bot.pixiv_work_state = lambda *a, **k: "unavailable"
+        status, message = Msg(), Msg()
+        asyncio.run(bot.report_empty_download(
+            status, message, "https://www.pixiv.net/artworks/1", "pixiv", "note"))
+        return " ".join(status.texts + message.texts)
+    except Exception:  # noqa: BLE001
+        return ""
+    finally:
+        bot.pixiv_work_state = saved
+
+
 def _empty_download_reports_deleted() -> bool:
     """
     A work the API says is gone must produce a message naming that.
@@ -200,12 +289,12 @@ def _empty_download_reports_deleted() -> bool:
 
     saved = bot.pixiv_work_state
     try:
-        bot.pixiv_work_state = lambda *a, **k: "deleted"
+        bot.pixiv_work_state = lambda *a, **k: "unavailable"
         status, message = Msg(), Msg()
         asyncio.run(bot.report_empty_download(
             status, message, "https://www.pixiv.net/artworks/1", "pixiv", "note"))
         said = " ".join(t for k, t in status.log if t)
-        return "已經不存在" in said and not any(k == "delete" for k, _ in status.log)
+        return "無法瀏覽" in said and not any(k == "delete" for k, _ in status.log)
     except Exception:  # noqa: BLE001
         return False
     finally:
@@ -1771,9 +1860,9 @@ check("a non-work url yields no id",
 #   app API, no credentials   400  login required
 #   app API, with token       200  the work
 #   web API, no credentials   404  same as a deletion
-check("a deleted pixiv work is reported, not silenced",
+check("a deleted or un-published pixiv work is reported, not silenced",
       _empty_download_reports_deleted(),
-      "a dead link is the one case where the sender can act on the message")
+      "a work nobody can open is the one case worth telling the sender about")
 check("a work the bot CAN read is never called deleted",
       # The probe answers 200 for an age-restricted work when credentials work, so the
       # reply is silence and the download path is left to succeed.
@@ -1785,6 +1874,35 @@ check("an unreadable work state is unknown, not a guess",
 check("a private work that cannot be read stays silent",
       _empty_download_is_silent_for_private(),
       "the request was that a private gallery produce no reply")
+# --- An un-published work answers 200, so the status code says nothing ---
+
+# Measured on a work the author had taken down:
+#
+#   {"illust": {"id": 150822697, "title": "", "visible": false,
+#               "total_view": 0, "total_bookmarks": 0}}       status 200
+#
+# against a live work in the same shape:
+#
+#   {"illust": {"id": 150824857, "title": "しろこ", "visible": true,
+#               "total_view": 436}}                          status 200
+#
+# Checking only the status code reported the un-published work as readable, which is why it
+# produced no message at all.
+check("an un-published work reads as unavailable despite HTTP 200",
+      _unpublished_is_unavailable(),
+      "visible=false is the signal; the status code is 200 either way")
+check("a 404 with a valid token reads as unavailable",
+      _deleted_is_unavailable(),
+      "a deletion is the other half of the same answer")
+check("a non-200 that is not a 404 is unknown, not unavailable",
+      # A 500 or a rate limit must not be reported as a deletion.
+      _server_error_is_unknown(),
+      "an unverifiable state must stay silent rather than accuse the link")
+check("the unavailable notice names both causes",
+      # Deleted and un-published are indistinguishable to a visitor, so the message says so
+      # rather than picking one and being wrong half the time.
+      "刪除" in _unavailable_notice() and "非公開" in _unavailable_notice(),
+      "the message must cover both, since gallery-dl cannot tell them apart")
 check("the no-media failure path no longer hard-codes a message",
       # It must route through the decision, or a private work gets the old generic text.
       "report_empty_download(" in inspect.getsource(bot.handle_message),

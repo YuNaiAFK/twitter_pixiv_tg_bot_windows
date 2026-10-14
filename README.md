@@ -1442,6 +1442,33 @@ can act on - and "連結可能已失效" blamed them for it. The bot also left i
 source messages behind, so a link that resolved to nothing produced *more* clutter than one
 that worked.
 
+#### An un-published work answers 200, so the status code says nothing
+
+Reported with a real link: `pixiv.net/artworks/150822697`. A first attempt called it readable
+because the app API answered **200** - and it does, with the content blanked:
+
+    unpublished   {"illust": {"id": 150822697, "title": "", "visible": false,
+                              "total_view": 0, "total_bookmarks": 0}}      status 200
+    live          {"illust": {"id": 150824857, "title": "しろこ", "visible": true,
+                              "total_view": 436, "total_bookmarks": 143}}   status 200
+
+`visible` is the signal, not the status code. The title and the counters are blank as well,
+but `visible` says so directly rather than by inference. So the rule is now:
+
+| the work | how it answers | result |
+| --- | --- | --- |
+| live | 200, `visible: true` | download |
+| age-restricted, credentials work | 200, `visible: true` | download |
+| **taken down by the author** | **200, `visible: false`** | **report** |
+| deleted | 404 | **report** |
+| anything else | 500, timeout | silence |
+
+The notice covers both causes in one sentence, because they are indistinguishable to a
+visitor and gallery-dl cannot tell them apart either:
+
+    這個 Pixiv 作品目前無法瀏覽：可能已被作者刪除，或設為非公開。
+    （若作者之後重新公開，重新傳送連結即可）
+
 #### gallery-dl cannot tell a deletion from a missing login
 
 It reports the same error for both, because the **web** API answers 404 either way:
@@ -1462,7 +1489,7 @@ decides:
 | readable (downloaded) | — | the files, no error |
 | private, credentials work | `ok` | nothing (the download succeeded) |
 | private, credentials broken | `unknown` | **nothing** - silence |
-| deleted | `deleted` | 這個 Pixiv 作品已經不存在了… |
+| taken down or deleted | `unavailable` | 這個 Pixiv 作品目前無法瀏覽… |
 
 **`unknown` is silent on purpose.** Telling someone their link is dead when the bot simply
 cannot verify it is worse than saying nothing.

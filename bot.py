@@ -1678,31 +1678,29 @@ async def report_empty_download(status, message, media_url: str, platform: str |
     When the state cannot be determined the reply is silence, because telling someone their
     link is dead when it is not is worse than saying nothing.
     """
-    deleted = False
+    unavailable = False
     if platform == "pixiv":
         illust_id = pixiv_illust_id(media_url)
         if illust_id:
             state = await asyncio.to_thread(pixiv_work_state, illust_id)
-            deleted = state == "deleted"
+            unavailable = state == "unavailable"
             logger.info("Pixiv 作品狀態：%s（%s）", state, illust_id)
 
-    if not deleted:
+    if not unavailable:
         # Take the bot's own messages back, so the chat is left as though the link was never
         # sent. Failure is the only path where these are not already cleaned up.
         await cleanup_request_messages(status, message)
         return
 
+    notice = ("這個 Pixiv 作品目前無法瀏覽：可能已被作者刪除，或設為非公開。\n"
+              "（若作者之後重新公開，重新傳送連結即可）")
     try:
         await status.edit_text(
-            "這個 Pixiv 作品已經不存在了（可能已被作者刪除或設為非公開）。\n\n"
-            + (source_note or build_caption(media_url)),
+            notice + "\n\n" + (source_note or build_caption(media_url)),
             link_preview_options=source_link_options(),
         )
     except TelegramError:
-        await send_status(
-            message,
-            "這個 Pixiv 作品已經不存在了（可能已被作者刪除或設為非公開）。",
-        )
+        await send_status(message, notice)
 
 
 async def send_cached_media(message, status, url: str, payload: dict,
@@ -2096,17 +2094,30 @@ def pixiv_access_token(timeout: float = 30.0) -> str:
 
 def pixiv_work_state(illust_id: str, timeout: float = 25.0) -> str:
     """
-    Whether a Pixiv work is readable with the configured credentials.
+    Whether a Pixiv work can be read at all.
 
-    Returns ``"ok"``, ``"deleted"`` or ``"unknown"``.
+    Returns ``"ok"``, ``"unavailable"`` (deleted **or** un-published), or ``"unknown"``.
 
-    **This is what makes an honest failure message possible.** gallery-dl reports the same
-    ``NotFoundError`` for a deleted work and for one whose login it does not have, because
-    the *web* API answers 404 for both. The app API does distinguish them, so the two can be
-    told apart instead of being merged into one sentence that is wrong half the time.
+    **`visible` is the signal, not the status code.** A work the author has taken down
+    answers **200** with its content blanked - measured on a real one:
 
-    An unreadable or absent token returns ``"unknown"`` rather than guessing, so the caller
-    falls back to silence instead of telling someone their work was deleted.
+        {"illust": {"id": 150822697, "title": "", "visible": false,
+                    "total_view": 0, "total_bookmarks": 0}}
+
+    against a live work in the same response shape:
+
+        {"illust": {"id": 150824857, "title": "しろこ", "visible": true,
+                    "total_view": 436, "total_bookmarks": 143}}
+
+    Checking only the status code therefore reported an un-published work as readable, and
+    the caller had no reason to explain anything. `title` and the counters are blank for an
+    unpublished work as well, but `visible` says so directly rather than by inference.
+
+    A **404 with a valid token is a deletion**, which is the other half of the same answer:
+    gallery-dl cannot tell the two apart, because the public web API answers 404 for both.
+
+    ``"unknown"`` is returned when the state cannot be established - an unreadable or absent
+    token - so the caller falls back to silence instead of guessing.
     """
     token = pixiv_access_token(timeout=timeout)
     if not token:
@@ -2125,12 +2136,21 @@ def pixiv_work_state(illust_id: str, timeout: float = 25.0) -> str:
     except Exception as exc:  # noqa: BLE001
         logger.debug("查詢 Pixiv 作品狀態失敗：%s", exc)
         return "unknown"
-    if response.status_code == 200:
-        return "ok"
+
     if response.status_code == 404:
-        # With a valid token a 404 means gone: an age-restricted work answers 200 here.
-        return "deleted"
-    return "unknown"
+        # With a valid token, a 404 means gone. An age-restricted work answers 200.
+        return "unavailable"
+    if response.status_code != 200:
+        return "unknown"
+    try:
+        illust = (response.json() or {}).get("illust") or {}
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if illust.get("visible") is False:
+        # Present in the response but not published: taken down by the author, which is
+        # indistinguishable from a deletion as far as a visitor is concerned.
+        return "unavailable"
+    return "ok"
 
 
 def pixiv_illust_id(url: str) -> str:
