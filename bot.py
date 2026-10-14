@@ -3817,6 +3817,68 @@ async def cleanup_request_messages(status_message, source_message) -> None:
         await delete_message_quietly(status_message, "解析提示訊息")
 
 
+# Thumbnail hosts, and which of them Telegram can reach anonymously.
+#
+# Verified by requesting the same path from each (an exhentai gallery's cover):
+#
+#     https://s.exhentai.org/w/02/714/75349-4sjx86ns.webp  -> 403  (session required)
+#     https://ehgt.org/w/02/714/75349-4sjx86ns.webp        -> 200  image/webp, 29.8 KB
+#
+# The paths are byte-identical, so the host is the only thing that has to change. e-hentai
+# galleries already carry the ehgt.org form, which is why this was only ever visible on
+# exhentai.
+_SESSION_BOUND_THUMB_HOSTS = {
+    "s.exhentai.org": "ehgt.org",
+    "s.e-hentai.org": "ehgt.org",
+}
+
+# Only these are handed to Telegram. A URL on any other host is refused rather than sent
+# and failed: the error Telegram gives ("Failed to get http url content") does not say
+# which host or why, so guessing wastes a round trip and produces a confusing log line.
+_TELEGRAM_FETCHABLE_THUMB_HOSTS = frozenset({"ehgt.org", "www.ehgt.org"})
+
+
+def public_thumbnail_url(thumb: str) -> str:
+    """
+    A cover URL Telegram can fetch anonymously, or an empty string.
+
+    Telegram downloads ``InputMediaPhoto(media=url)`` itself, with no cookies and no
+    referer, so any host that requires a session fails - and the failure is only a warning
+    in the log plus a missing cover in the chat. An exhentai gallery's cover comes from
+    ``s.exhentai.org``, which answers an anonymous request with 403, so **every exhentai
+    cover was missing**.
+
+    Rewrites to the public host only when the path is preserved, so the rewritten URL is
+    the same image and not a guess. Returns "" for a host that is neither known-public nor
+    a known alias, so the caller falls back to the text result instead of logging a failure
+    it cannot act on.
+    """
+    thumb = (thumb or "").strip()
+    if not thumb:
+        return ""
+    try:
+        parsed = urlsplit(thumb)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+
+    host = (parsed.netloc or "").lower()
+    if host in _SESSION_BOUND_THUMB_HOSTS:
+        # Same path, public host - but only for a thumbnail path. The rewrite is a host
+        # substitution, so it is safe precisely because the path is carried over
+        # unchanged; refusing anything that is not a thumbnail keeps it from turning a
+        # non-image URL into a request to an unrelated host.
+        if not parsed.path.startswith("/w/"):
+            logger.info("封面路徑不是縮圖，略過封面：%s", parsed.path[:40])
+            return ""
+        return f"https://{_SESSION_BOUND_THUMB_HOSTS[host]}{parsed.path}"
+    if host in _TELEGRAM_FETCHABLE_THUMB_HOSTS:
+        return thumb
+    logger.info("封面主機不確定 Telegram 能否取得，略過封面：%s", host)
+    return ""
+
+
 async def edit_message_to_cover(status, gallery, caption: str,
                                 reply_markup=None) -> bool:
     """
@@ -3829,8 +3891,18 @@ async def edit_message_to_cover(status, gallery, caption: str,
 
     The image is referenced by **URL**, so Telegram fetches it and the bot downloads
     nothing - a cover is decoration, and the pages themselves are only downloaded for
-    the archive actions. The URL is e-hentai's static thumbnail (``ehgt.org``), not
-    one of the time-limited ``hath.network`` links, so a posted cover keeps working.
+    the archive actions.
+
+    **The thumbnail host has to be one Telegram can reach anonymously**, which is what
+    :func:`public_thumbnail_url` enforces. This was wrong: the code assumed the cover came
+    from ``ehgt.org``, but an exhentai gallery's cover is served from ``s.exhentai.org``,
+    where an anonymous request gets **403**:
+
+        https://s.exhentai.org/w/02/714/75349-4sjx86ns.webp   -> 403 (needs the session)
+        https://ehgt.org/w/02/714/75349-4sjx86ns.webp         -> 200 image/webp
+
+    The paths are identical - only the host differs - so the cover was silently missing on
+    every exhentai gallery, reported as "Failed to get http url content".
 
     The keyboard is carried over, because `edit_media` replacing the message body
     would otherwise drop the "重新生成" button that was just attached.
@@ -3839,7 +3911,7 @@ async def edit_message_to_cover(status, gallery, caption: str,
     message: refusing to deliver a gallery because its cover would not load would be
     the wrong trade.
     """
-    url = (gallery.thumb or "").strip()
+    url = public_thumbnail_url(gallery.thumb)
     if not url or status is None:
         return False
     try:

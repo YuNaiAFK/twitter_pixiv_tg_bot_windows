@@ -1426,6 +1426,43 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### Every exhentai cover was missing, and the log said only "Failed to get http url content"
+
+```
+WARNING twitter_pixiv_bot: 封面編輯失敗：https://s.exhentai.org/w/02/714/75349-4sjx86ns.webp
+                            （Failed to get http url content）
+```
+
+The code claimed the cover was "e-hentai's static thumbnail (`ehgt.org`)". It is not: an
+exhentai gallery's cover is served from **`s.exhentai.org`**, and that host requires the
+session. Telegram fetches `InputMediaPhoto(media=url)` itself, with no cookies and no
+referer, so it was refused - and because a failed cover is only a warning plus a missing
+picture, this had been silently failing on every exhentai gallery.
+
+Measured on the URL from the log:
+
+    https://s.exhentai.org/w/02/714/75349-4sjx86ns.webp  -> 403   (anonymous)
+    https://ehgt.org/w/02/714/75349-4sjx86ns.webp        -> 200   image/webp, 29.8 KB
+
+**The paths are byte-identical** - only the host differs. Confirmed by fetching one gallery
+through both hosts, which is what makes the fix a substitution rather than a guess:
+
+    exhentai.org  https://s.exhentai.org/w/02/240/36544-r7iw06st.webp
+    e-hentai.org  https://ehgt.org/w/02/240/36544-r7iw06st.webp
+
+`public_thumbnail_url()` rewrites the session-bound hosts to `ehgt.org`, and refuses
+anything else. Two limits keep it honest:
+
+- **Only thumbnail paths.** The rewrite is a host substitution, so it is safe exactly
+  because the path is carried over unchanged; a non-image URL is refused rather than turned
+  into a request to an unrelated host.
+- **Only hosts known to be fetchable.** An unknown host is refused rather than sent and
+  failed, because Telegram's error names neither the host nor the reason - guessing costs a
+  round trip and produces a log line nobody can act on.
+
+Verified on both real galleries after the change: anonymous requests return
+`200 image/webp`, so the cover now renders.
+
 ### Cache audit: two more ways one resource was cached twice
 
 Following the archive-cache report, every cache in the codebase was checked for the same

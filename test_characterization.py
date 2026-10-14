@@ -1269,6 +1269,39 @@ check("the viewer-URL TTL is shorter than the cache entry lifetime",
       bot.GALLERY_URL_TTL_SECONDS < bot.CACHE_STALE_SECONDS,
       "a reused signed URL would make every page fail together")
 
+# --- Every exhentai cover was missing, silently ---
+
+# Telegram fetches InputMediaPhoto(media=url) itself, with no cookies. An exhentai
+# gallery's cover is served from s.exhentai.org, which answers an anonymous request with
+# 403, so the cover never appeared and the log said only "Failed to get http url content".
+# The e-hentai form of the same gallery uses ehgt.org with a byte-identical path.
+check("a session-bound thumbnail host is rewritten to the public one",
+      bot.public_thumbnail_url("https://s.exhentai.org/w/02/714/x.webp")
+      == "https://ehgt.org/w/02/714/x.webp",
+      "this host answers an anonymous request with 403")
+check("the other session-bound thumbnail host is rewritten too",
+      bot.public_thumbnail_url("https://s.e-hentai.org/w/02/240/y.webp")
+      == "https://ehgt.org/w/02/240/y.webp")
+check("an already-public thumbnail is left alone",
+      bot.public_thumbnail_url("https://ehgt.org/w/02/240/y.webp")
+      == "https://ehgt.org/w/02/240/y.webp")
+check("an unknown host is refused rather than sent and failed",
+      # Telegram's error names neither the host nor the reason, so guessing costs a round
+      # trip and produces a log line nobody can act on.
+      bot.public_thumbnail_url("https://example.com/cover.jpg") == "",
+      "only hosts known to be fetchable are handed to Telegram")
+check("the rewrite is limited to thumbnail paths",
+      # It is a host substitution, so it is only safe because the path is unchanged.
+      # Rewriting a non-image URL would send an unrelated request.
+      bot.public_thumbnail_url("https://s.exhentai.org/g/1/aa/") == ""
+      and bot.public_thumbnail_url("https://s.exhentai.org/") == "",
+      "a gallery page is not a cover")
+check("a non-http scheme is refused",
+      bot.public_thumbnail_url("ftp://ehgt.org/x.webp") == "")
+check("the cover path uses the guard",
+      "public_thumbnail_url(" in inspect.getsource(bot.edit_message_to_cover),
+      "the raw gallery.thumb is what 403s")
+
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
 # handed to e-hentai. Measured before the fix: 1707 chars, 8 foreign cookies.
