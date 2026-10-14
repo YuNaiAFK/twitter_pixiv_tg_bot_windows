@@ -59,6 +59,55 @@ def check(name: str, condition, detail: str = "") -> bool:
     return ok
 
 
+def _resolver_code() -> str:
+    """The resolver's code with its docstring removed, so prose cannot satisfy a check."""
+    import ast
+    import inspect as _i
+    source = _i.getsource(ehentai.resolve_public_image_url)
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(
+                    body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                body.pop(0)
+    return ast.unparse(tree)
+
+
+def _public_embed_urls_passthrough() -> bool:
+    """A list that needs no conversion must be returned as-is, with no network access."""
+    import asyncio
+
+    class G:
+        gid = "1"
+        token = "aa"
+
+    async def scenario():
+        urls = ["https://node.hath.network/h/abc-1280-1-wb",
+                "https://ehgt.org/w/02/240/x.webp"]
+        out = await bot.public_embed_urls(list(urls), G(), None, report=False)
+        return out == urls
+
+    try:
+        return asyncio.run(scenario())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _public_embed_urls_accepts_no_status() -> bool:
+    """
+    report=True with status=None must not raise.
+
+    It did: the helper wrote the progress message before checking it had anywhere to write,
+    which the regenerate path can hit because the message it passes is not a status
+    placeholder.
+    """
+    import inspect as _i
+    source = _i.getsource(bot.public_embed_urls)
+    # Asserted on the guard itself: status is only used when it is present.
+    return "report is not None and status is not None" in source
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -1376,6 +1425,49 @@ check("a non-http scheme is refused",
 check("the cover path uses the guard",
       "public_thumbnail_url(" in inspect.getsource(bot.edit_message_to_cover),
       "the raw gallery.thumb is what 403s")
+
+# --- A Telegraph page embedding original images showed a broken image on every page ---
+
+# The original image is served from /fullimg/..., which needs the session: an anonymous
+# request gets a 302 to the login page. Telegraph fetches every embedded image itself, so
+# its whole page was broken. Measured on a real gallery, creating a page from the raw
+# originals and then fetching it anonymously:
+#
+#   12 images on exhentai.org           -> 0/3 loadable, content-type text/html
+#   12 images on <node>.hath.network    -> 3/3 loadable, content-type image/jpeg
+check("a /fullimg/ url is recognised as session-bound",
+      ehentai.is_session_bound_image("https://exhentai.org/fullimg/1/1/x/001.jpg")
+      and ehentai.is_session_bound_image("https://e-hentai.org/fullimg/1/1/x/001.jpg"),
+      "both hosts serve the login page to an anonymous request")
+check("a public CDN url is not mistaken for a session-bound one",
+      not ehentai.is_session_bound_image(
+          "https://node.hath.network/h/abc-1280-1-wb")
+      and not ehentai.is_session_bound_image("https://ehgt.org/w/02/240/x.webp"),
+      "resolving these would be wasted requests")
+check("both embed paths convert session-bound urls",
+      # Publishing and 重新生成 embed the same list; fixing only the first would leave the
+      # button producing a broken page again.
+      "public_embed_urls(" in inspect.getsource(bot.run_gallery_images)
+      and "public_embed_urls(" in inspect.getsource(bot.run_regenerate),
+      "the regenerate button must not rebuild a broken page")
+check("a list with nothing session-bound is passed through untouched",
+      _public_embed_urls_passthrough(),
+      "the display mode is already public and must cost no requests")
+check("the resolver keeps the list length and order",
+      "zip(resolved, urls)" in inspect.getsource(
+          ehentai.resolve_public_image_urls),
+      "a missing page would shift every later page")
+check("the resolver probes with HEAD, not a ranged GET",
+      # Measured: this CDN ignores Range and answers a ranged GET with the whole file
+      # (6.1 MB for one page), so verifying with a GET would download every original.
+      # Checked against the code, not the prose: the docstring explains the Range problem
+      # and so contains the word, which made a bare search match the explanation.
+      "client.head(" in _resolver_code()
+      and "Range" not in _resolver_code(),
+      "a GET here transfers every original image")
+check("a progress path without a status message does not crash",
+      _public_embed_urls_accepts_no_status(),
+      "report=True with status=None raised AttributeError")
 
 # --- 重新生成 always failed on a gallery whose cover had loaded ---
 

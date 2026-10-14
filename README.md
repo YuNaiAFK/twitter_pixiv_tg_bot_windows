@@ -1426,6 +1426,55 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### A Telegraph page's images were all broken: the original URLs need a session
+
+Reported as "生成的链接点开后图片无法加载". Fetching the page and testing every embedded image
+anonymously - which is exactly what Telegraph's own servers do - showed the cause:
+
+    12 images on exhentai.org   -> 0/3 loadable, content-type text/html (the login page)
+    12 images on <node>.hath.network -> 3/3 loadable, content-type image/jpeg
+
+The gallery page offers two URLs per page, and they are not equivalent:
+
+    <img id="img" src="https://<node>.hath.network/h/...">           public  - 200 image/webp
+    <a href="https://exhentai.org/fullimg/3778922/1/xxx/001.jpg">   session - 302 to login
+
+The second is the **original** image. 顯示圖 embedded the first form and worked; 原圖 embedded
+the second and was broken on every page, because Telegraph fetches each image itself with no
+cookies. So the 原圖 mode had never produced a working page.
+
+#### The fix: resolve the redirect the original hides behind
+
+`/fullimg/` answers with a 302 whose target is on `hath.network` - and **that target is
+publicly fetchable** (measured anonymously: `200 image/jpeg, 6121400B`). The bot already holds
+the session, so it can ask for the redirect and embed the public URL instead:
+
+    exhentai.org/fullimg/...  --302-->  yqcohbpjgjmcamalcfry.hath.network/om/.../001.jpg
+                                        ^ anonymously loadable
+
+`resolve_public_image_urls()` does this for a whole gallery, preserving length and order so a
+failure cannot shift every later page. Used by publishing **and** by 重新生成, because both
+embed the same list - fixing only the first would have left the button rebuilding a broken page.
+
+Measured on a real 27-page gallery: 20 originals converted in 17.7s, and for a 10-page set
+7.1s. 顯示圖 mode converts nothing (already public) and costs no requests.
+
+#### Verifying the target with HEAD, not a ranged GET
+
+The obvious way to confirm the redirect target works is a ranged GET, and it is wrong here -
+measured, this CDN **ignores the Range header** and answers a ranged GET with the whole file:
+
+    resolve the redirect (headers only)   2.5s
+    HEAD the target                       1.4s
+    ranged GET bytes=0-1023               7.7s -> and 6121400 bytes came back
+
+So verification uses HEAD, which costs nothing and is enough to prove the URL is served. Not
+a cosmetic detail: the first version of this used a ranged GET and would have downloaded every
+original image in the gallery, about 6 MB each.
+
+An unresolvable page is left as the original URL and **logged with a count**, rather than
+silently dropped or silently broken, so the number of missing images is known.
+
 ### 重新生成 always failed once the cover loaded
 
 ```

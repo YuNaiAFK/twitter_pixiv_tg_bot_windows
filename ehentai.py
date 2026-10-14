@@ -599,6 +599,134 @@ _VIEWER_ORIGINAL_RE = re.compile(r'href="(https://[^"]*fullimg[^"]*)"')
 # a 27-page gallery silently yields only 20.
 _SHOWING_RE = re.compile(r"Showing\s+\d+\s*-\s*\d+\s+of\s+(\d+)", re.I)
 
+# Hosts whose image URLs require the session, and therefore cannot be embedded anywhere
+# else. Measured on a real gallery page:
+#
+#     <img id="img" src="https://<node>.hath.network/h/...">        public - 200 image/webp
+#     <a href="https://exhentai.org/fullimg/3778922/1/xxx/001.jpg">  session - 302 to login
+#
+# The `/fullimg/` form is the **original** image. An anonymous request to it gets a 302 to
+# the login page, so a Telegraph page embedding it shows a broken image on every page -
+# which is exactly what was reported.
+_SESSION_BOUND_IMAGE_HOSTS = ("e-hentai.org", "exhentai.org", "www.e-hentai.org",
+                              "www.exhentai.org")
+
+
+def is_session_bound_image(url: str) -> bool:
+    """Whether an image URL needs the session and so cannot be embedded elsewhere."""
+    try:
+        host = urllib.parse.urlsplit(url).netloc.lower()
+    except ValueError:
+        return False
+    return host in _SESSION_BOUND_IMAGE_HOSTS
+
+
+def _resolve_headers(cookies_path) -> dict:
+    """
+    Headers for resolving an original image: the session, and a referer the viewer uses.
+
+    The referer matters here because ``/fullimg/`` is reached from a viewer page, and the
+    redirect is what carries the signed target.
+    """
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://e-hentai.org/",
+    }
+    if cookies_path is not None:
+        headers["Cookie"] = cookies_header(cookies_path)
+    return headers
+
+
+def resolve_public_image_url(url: str, cookies_path=None, *, timeout: float = 30.0,
+                             http_client=None) -> str | None:
+    """
+    Turn a session-bound image URL into the public CDN URL it redirects to, or None.
+
+    **This is what makes 原圖 embeddable.** The original image is served from
+    ``/fullimg/...``, which requires the session; an anonymous request gets a 302 to the
+    login page, so a Telegraph page embedding it is broken on every page. The redirect
+    target, however, is on ``hath.network`` and **is publicly fetchable** - measured
+    anonymously: ``200 image/jpeg, 6121400B`` for one page.
+
+    One request per image: the redirect is read without following it (``Location`` is the
+    answer) and the target is confirmed with a **HEAD**, not a GET. That distinction is not
+    cosmetic - measuring showed this CDN ignores a ``Range`` header and answers a ranged GET
+    with the whole 6.1 MB file, so verifying with a GET would download every original.
+
+    Returns None when the URL does not redirect, which the caller treats as "cannot embed".
+    """
+    import httpx
+
+    client = http_client or httpx.Client(**http_client_kwargs(timeout))
+    try:
+        headers = _resolve_headers(cookies_path)
+        response = client.get(url, headers=headers, follow_redirects=False)
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return None
+        target = (response.headers.get("location") or "").strip()
+        if not target.startswith("http"):
+            return None
+        # Confirmed public with a HEAD; a GET here would transfer the whole file.
+        try:
+            probe = client.head(target, follow_redirects=True)
+            if probe.status_code >= 400:
+                logger.debug("原圖的公開網址回應 %s：%s", probe.status_code, target[:70])
+                return None
+        except Exception:  # noqa: BLE001
+            # A CDN that refuses HEAD is not proof of a bad URL, and the redirect itself
+            # already established the target. Kept rather than discarded.
+            logger.debug("無法以 HEAD 確認原圖網址，仍採用：%s", target[:70])
+        return target
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("解析原圖公開網址失敗：%s（%s）", url[:70], exc)
+        return None
+    finally:
+        if http_client is None:
+            client.close()
+
+
+def resolve_public_image_urls(urls: list[str], cookies_path=None, *,
+                              workers: int = 6, timeout: float = 30.0,
+                              progress=None) -> list[str]:
+    """
+    Resolve a whole gallery's session-bound originals to public URLs, keeping order.
+
+    Each entry is either the resolved public URL or, when it could not be resolved, the
+    original - so the list keeps its length and order and the caller can decide what to do
+    with the failures rather than silently dropping pages.
+    """
+    import httpx
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not urls:
+        return []
+
+    resolved: list[str | None] = [None] * len(urls)
+    done = 0
+    lock = threading.Lock()
+
+    def one(item):
+        index, url = item
+        return index, resolve_public_image_url(url, cookies_path, timeout=timeout)
+
+    with httpx.Client(**http_client_kwargs(timeout)) as client:
+        def one_shared(item):
+            index, url = item
+            return index, resolve_public_image_url(url, cookies_path, timeout=timeout,
+                                                   http_client=client)
+
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            for index, result in pool.map(one_shared, enumerate(urls)):
+                with lock:
+                    resolved[index] = result
+                    done += 1
+                    if progress:
+                        progress(done, len(urls))
+
+    return [r or u for r, u in zip(resolved, urls)]
+
 
 def gallery_viewer_links(page_html: str) -> list[str]:
     """

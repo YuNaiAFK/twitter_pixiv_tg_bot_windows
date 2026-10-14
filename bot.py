@@ -4616,6 +4616,9 @@ async def run_regenerate(query, user, entry: dict) -> None:
         await asyncio.to_thread(remember_gallery, gallery.page_url, gallery,
                                 (display_urls, original_urls))
         embed = original_urls if mode == "orig" else display_urls
+        # Same conversion as publishing: the button embeds the same list, so without this
+        # a regenerated page would be broken again on every page.
+        embed = await public_embed_urls(embed, gallery, query.message)
         telegraph_url = await asyncio.to_thread(
             ehentai.create_telegraph_page,
             gallery,
@@ -4884,6 +4887,66 @@ async def run_gallery_action(query, message, user, mode: str,
         gallery_semaphore.release()
 
 
+async def public_embed_urls(embed: list[str], gallery, status,
+                            report=None) -> list[str]:
+    """
+    The list of image URLs safe to embed in a Telegraph page.
+
+    **A session-bound URL cannot be embedded anywhere else.** The original image is served
+    from ``/fullimg/...``, and an anonymous request to it gets a 302 to the login page, so a
+    Telegraph page embedding it shows a broken image on every page - which is what was
+    reported. The display URLs are on the public CDN already, so they pass through
+    untouched and only one mode needs anything done.
+
+    Shared by publishing and by 重新生成 because both embed the same list: fixing only the
+    first would have left the button producing a broken page again.
+
+    ``report`` is the progress callback from run_with_progress, used only when there is work
+    to do.
+    """
+    if not any(ehentai.is_session_bound_image(u) for u in embed):
+        return embed
+
+    # `report` asks for the progress bar, but a status message is what it writes into -
+    # without one there is nowhere to report, so this falls back to the quiet path rather
+    # than failing. The regenerate path passes a message that is not a status placeholder.
+    if report is not None and status is not None:
+        await status.edit_text(
+            f"原圖網址需要登入才能開啟，正在轉換成公開網址（{len(embed)} 頁）……"
+            "\n（這樣 Telegraph 才載入得到圖片）",
+            link_preview_options=source_link_options(),
+        )
+        resolved = await run_with_progress(
+            lambda report_fn: ehentai.resolve_public_image_urls(
+                embed,
+                resolve_ehentai_cookies(),
+                workers=EHENTAI_VIEWER_WORKERS,
+                timeout=float(EHENTAI_TIMEOUT_SECONDS),
+                progress=report_fn,
+            ),
+            status,
+            prefix="正在轉換原圖網址……",
+            gid=gallery.gid,
+            token=gallery.token,
+            total=len(embed),
+        )
+    else:
+        resolved = await asyncio.to_thread(
+            ehentai.resolve_public_image_urls,
+            embed,
+            resolve_ehentai_cookies(),
+            workers=EHENTAI_VIEWER_WORKERS,
+            timeout=float(EHENTAI_TIMEOUT_SECONDS),
+        )
+
+    missing = sum(1 for u in resolved if ehentai.is_session_bound_image(u))
+    if missing:
+        # Reported rather than hidden: those pages will not render, and the user should know
+        # how many before opening the page and wondering which are broken.
+        logger.warning("有 %s 頁原圖無法轉成公開網址，頁面上會缺圖", missing)
+    return resolved
+
+
 async def run_gallery_images(message, status, gallery, mode: str,
                              temp_dir: Path, source_note: str, user) -> None:
     """
@@ -4914,6 +4977,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
     )
 
     embed = display_urls if mode == "view" else (original_urls or display_urls)
+    embed = await public_embed_urls(embed, gallery, status, report=True)
+
     try:
         telegraph_url = await asyncio.to_thread(
             ehentai.create_telegraph_page,
