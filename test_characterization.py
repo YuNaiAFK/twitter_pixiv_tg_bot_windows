@@ -59,6 +59,64 @@ def check(name: str, condition, detail: str = "") -> bool:
     return ok
 
 
+class _FakeGallery:
+    """The minimum a gallery needs to have for cache-key purposes."""
+
+    gid = "3778922"
+    token = "19330e2349"
+    title = "Test Gallery"
+
+
+def _archive_cache_evicts() -> bool:
+    """
+    Fill a small archive cache past its bound and confirm the oldest go first.
+
+    Run against a temporary directory with a temporary bound: the real cache is 8 GB and
+    the real entries are tens of MB, so this is the only way to exercise eviction cheaply.
+    """
+    import os as _os
+    import shutil as _sh
+    import tempfile as _tf
+    import time as _tm
+    real_dir, real_max = bot.ARCHIVE_CACHE_DIR, bot.ARCHIVE_CACHE_MAX_BYTES
+    try:
+        work = Path(_tf.mkdtemp(prefix="dsh-evic-"))
+        bot.ARCHIVE_CACHE_DIR = work
+        bot.ARCHIVE_CACHE_MAX_BYTES = 3000
+        now = _tm.time()
+        for i in range(6):
+            path = work / f"g{i}_orig.zip"
+            path.write_bytes(b"x" * 1000)
+            _os.utime(path, (now - (6 - i), now - (6 - i)))
+        bot.prune_archive_cache()
+        names = {p.name for p in work.glob("*") if p.is_file()}
+        return (bot.archive_cache_total_bytes() <= 3000
+                and "g0_orig.zip" not in names
+                and "g5_orig.zip" in names)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.ARCHIVE_CACHE_DIR, bot.ARCHIVE_CACHE_MAX_BYTES = real_dir, real_max
+        _sh.rmtree(work, ignore_errors=True)
+
+
+def _empty_archive_not_served() -> bool:
+    """A 0-byte file in the archive cache must not be treated as a hit."""
+    import shutil as _sh
+    import tempfile as _tf
+    real_dir = bot.ARCHIVE_CACHE_DIR
+    try:
+        work = Path(_tf.mkdtemp(prefix="dsh-empty-"))
+        bot.ARCHIVE_CACHE_DIR = work
+        (work / f"{bot.archive_cache_key(_FakeGallery(), True)}.zip").write_bytes(b"")
+        return bot.archive_cache_path(_FakeGallery(), True) is None
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.ARCHIVE_CACHE_DIR = real_dir
+        _sh.rmtree(work, ignore_errors=True)
+
+
 def _unguarded_number_reads() -> int:
     """
     Count `int(...)`/`float(...)` applied directly to an environment value.
@@ -1048,6 +1106,74 @@ check("the bot imports with every optional setting blank",
       _imports_with_blank_env(),
       "this is what copying .env.example produces")
 
+# --- The gallery cache stored one gallery twice, so neither copy was reused ---
+
+# e-hentai.org and exhentai.org serve the same gallery under the same gid and token, but
+# the entry was stored under whatever URL the request arrived with. Measured on a real
+# gallery, the cache held:
+#
+#   https://e-hentai.org/g/3778922/19330e2349   -> 27 display_urls
+#   https://exhentai.org/g/3778922/19330e2349   ->  0 display_urls
+#
+# so an exhentai link never hit the entry a button press had written, and vice versa.
+_gallery_variants = [
+    "https://exhentai.org/g/3778922/19330e2349/",
+    "https://e-hentai.org/g/3778922/19330e2349/",
+    "https://e-hentai.org/g/3778922/19330e2349",
+    "https://e-hentai.org/g/3778922/19330e2349/?p=2",
+    "https://www.e-hentai.org/g/3778922/19330e2349/",
+    "https://exhentai.org/g/3778922/19330e2349/?p=3",
+]
+_keys = {bot.gallery_cache_key(u) for u in _gallery_variants}
+check("the same gallery has one cache key on both hosts",
+      len(_keys) == 1,
+      f"{len(_keys)} distinct keys: {sorted(_keys)}")
+check("different galleries still get different keys",
+      bot.gallery_cache_key("https://exhentai.org/g/111/aaa/")
+      != bot.gallery_cache_key("https://exhentai.org/g/222/bbb/"),
+      "collapsing hosts must not collapse galleries")
+check("the key is host-independent but keeps gid and token",
+      bot.gallery_cache_key("https://exhentai.org/g/3778922/19330e2349/")
+      == "https://e-hentai.org/g/3778922/19330e2349/")
+check("storing and looking up use the same key",
+      "gallery_cache_key(url, gallery)" in inspect.getsource(bot.remember_gallery)
+      and "gallery_cache_lookup(url)" in inspect.getsource(bot.handle_ehentai_gallery),
+      "a store and a lookup under different keys is the bug this fixes")
+
+# --- The downloaded archive is now kept, which is the 35 of 41 seconds ---
+
+check("the archive cache is bounded and can be disabled",
+      1 <= bot.ARCHIVE_CACHE_MAX_BYTES <= 512 * 1024 ** 3
+      and isinstance(bot.ARCHIVE_CACHE_ENABLED, bool),
+      f"max={bot.ARCHIVE_CACHE_MAX_BYTES} enabled={bot.ARCHIVE_CACHE_ENABLED}")
+check("the two archive variants are separate entries",
+      bot.archive_cache_key(_FakeGallery(), True)
+      != bot.archive_cache_key(_FakeGallery(), False),
+      "resample and original are different files")
+_archive_src = inspect.getsource(bot.run_gallery_archive)
+# Matched as a call, not as a bare name: the comment above the check names
+# resolve_official_archive to explain the ordering, and a name search found the comment.
+check("the archive cache is consulted before resolving",
+      _archive_src.index("archive_cache_path(gallery, original)")
+      < _archive_src.index("resolve_official_archive,"),
+      "resolving first would waste the 3s the cache exists to avoid")
+check("a cache miss still downloads",
+      "store_archive_cache" in inspect.getsource(bot.run_gallery_archive),
+      "the cache must be populated, or it never helps")
+check("a failed resend falls back to downloading",
+      "改為重新下載" in inspect.getsource(bot.run_gallery_archive),
+      "a broken cache entry must not cost the user their file")
+check("the archive cache evicts least-recently-used entries",
+      _archive_cache_evicts(),
+      "an unbounded archive cache would fill the disk")
+check("a 0-byte cached archive is never served",
+      _empty_archive_not_served(),
+      "a truncated file must not be sent as a complete archive")
+check("the archive cache is excluded from the media cache figure",
+      "ARCHIVE_CACHE_DIR not in path.parents"
+      in inspect.getsource(bot.cache_command),
+      "it lives inside CACHE_DIR, so it would be counted twice")
+
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
 # handed to e-hentai. Measured before the fix: 1707 chars, 8 foreign cookies.
@@ -1096,9 +1222,16 @@ check("an archive click does not re-fetch the gallery page",
       and "fetch_gallery" not in inspect.getsource(bot.run_gallery_archive),
       "a /g/ request per archive click is exactly what e-hentai polices")
 check("the button handler reuses the cached gallery",
-      "PARSE_CACHE.lookup(gallery_url" in inspect.getsource(bot.run_gallery_action)
+      "gallery_cache_lookup(gallery_url)" in inspect.getsource(bot.run_gallery_action)
       and "if gallery is None" in inspect.getsource(bot.run_gallery_action),
       "the gallery facts must come from cache when present, not a fresh fetch")
+check("the button handler and the link handler share one cache key",
+      # This is the fix for the gallery being stored twice: both paths ask the same
+      # question, and only lookups that agree with remember_gallery() can hit.
+      "gallery_cache_lookup" in inspect.getsource(bot.run_gallery_action)
+      and "gallery_cache_lookup" in inspect.getsource(bot.handle_ehentai_gallery)
+      and "gallery_cache_key" in inspect.getsource(bot.remember_gallery),
+      "a store and a lookup under different keys never meet")
 
 # The operator hint used to be a fixed per-platform guess: "Pixiv needs a refresh-token"
 # for ANY empty result, including a deleted artwork. gallery-dl had already said which it

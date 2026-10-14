@@ -1426,6 +1426,75 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### The e-hentai archive cache did not work: one gallery was stored twice
+
+Reported as "归档下载快取功能没有作用". Measuring where an archive request spends its time
+showed which cache mattered, and then why it never hit.
+
+**Where the 41 seconds go** (real 27-page gallery, 歸檔 · 原圖):
+
+| stage | time | a cache removes |
+| --- | --- | --- |
+| read gallery metadata | 1.7s | — |
+| viewer URL sweep (27 pages) | 4.5s | gallery cache |
+| resolve the archive link | 3.1s | archive cache |
+| download 76.3 MiB | 31.9s | archive cache |
+| **total** | **41.2s** | |
+
+#### The gallery cache missed because the key included the host
+
+e-hentai.org and exhentai.org serve the same gallery under the same `gid` and `token`, but
+the cache entry was stored under whatever URL the request arrived with. The cache was found
+holding the gallery **twice**:
+
+    https://e-hentai.org/g/3778922/19330e2349   -> 27 display_urls
+    https://exhentai.org/g/3778922/19330e2349   ->  0 display_urls
+
+So submitting an exhentai link and then pressing a button was a cache miss, and the entry a
+button press wrote never satisfied the link handler. Whichever host a gallery was first seen
+through, only that one entry was ever reused - the second was dead weight.
+
+`gallery_cache_key()` now keys on `gid`/`token`, which collapses six URL variants of one
+gallery (both hosts, trailing slash, `www.`, `?p=N`) into a single entry:
+
+    https://exhentai.org/g/3778922/19330e2349/     \
+    https://e-hentai.org/g/3778922/19330e2349/      |
+    https://e-hentai.org/g/3778922/19330e2349       |  all ->
+    https://e-hentai.org/g/3778922/19330e2349/?p=2  |  https://e-hentai.org/g/3778922/19330e2349/
+    https://www.e-hentai.org/g/3778922/19330e2349/  |
+    https://exhentai.org/g/3778922/19330e2349/?p=3 /
+
+#### The archive file itself was never kept
+
+There was no cache for the downloaded archive at all - every request made e-hentai repackage
+the gallery and re-transferred the whole file. That is 35 of the 41 seconds. It is now kept
+under `.cache/archives/`, keyed by gallery **and** variant (1280 and 原圖 are different
+files), and a repeat is a resend:
+
+    49.7s   ->   0 ms        (76.3 MiB, second request)
+
+The check runs **before** `resolve_official_archive`, not after: resolving is itself a
+network round trip to the archiver, and it is one of the two steps the cache exists to
+remove. A test pins that ordering.
+
+Details that matter:
+
+- **Bounded on its own.** `ARCHIVE_CACHE_MAX_BYTES` (default 8 GiB) is separate from the
+  media cache's 2 GiB, because the magnitudes differ by orders of magnitude: 300 cached
+  artworks are ~100 MB, while 300 cached archives would be tens of GB. Least recently used
+  is evicted first, so a gallery you keep returning to survives.
+- **Can be switched off** with `ARCHIVE_CACHE=0`, without editing code - which is what a
+  debugging session usually wants.
+- **Written atomically** via a temp file and rename, so a kill part-way through cannot leave
+  a truncated file that later looks like a complete archive. A 0-byte entry is never served.
+- **A failed resend falls back to downloading.** A cache is an optimisation; no failure of
+  it may cost the user their file.
+- **Shown and clearable in `/cache`**, which now reports the archive cache separately - it
+  lives inside `CACHE_DIR`, so it is excluded from the media figure or it would be counted
+  twice.
+
+The cold path is unchanged: the first request for a gallery still costs the full 41s.
+
 ### A warning could stop the bot from starting, and a blank `.env` would
 
 Found while testing the change above, and both are the same mistake in two forms:

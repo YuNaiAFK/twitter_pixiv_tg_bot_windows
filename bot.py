@@ -767,6 +767,37 @@ CACHE_MAX_ENTRIES = env_number("CACHE_MAX_ENTRIES", 300)
 # must go together or not at all.
 CACHE_MAX_BYTES = env_number("CACHE_MAX_BYTES", 2 * 1024 * 1024 * 1024)
 
+# -------------------- Downloaded archive cache --------------------
+#
+# The official archiver makes e-hentai repackage the whole gallery on every request, and
+# the download itself is the slowest part of the action. Measured on a real 27-page
+# gallery, 歸檔 · 原圖:
+#
+#     read gallery metadata        1.7s
+#     viewer URL sweep             4.5s
+#     resolve the archive link     3.1s
+#     download 76.3 MiB           31.9s
+#     --------------------------------
+#     total                       41.2s
+#
+# So of 41 seconds, 35 are steps that a stored file removes entirely: a repeat becomes a
+# resend. The two are cached separately because they have different lifetimes - the viewer
+# URLs expire in hours, an archive file does not.
+#
+# Storage is kept apart from the media cache and bounded on its own, because the
+# magnitudes differ by orders of magnitude: 300 cached artworks are ~100 MB, while
+# 300 cached archives would be tens of GB.
+ARCHIVE_CACHE_DIR = Path(env_text("ARCHIVE_CACHE_DIR", str(CACHE_DIR / "archives")))
+
+# Measured for scale: 5 archives of ~76 MiB is 0.37 GiB, 50 is 3.7 GiB. This is a disk
+# budget, not a target; the least recently used entry is evicted when it is exceeded.
+ARCHIVE_CACHE_MAX_BYTES = env_number(
+    "ARCHIVE_CACHE_MAX_BYTES", 8 * 1024 * 1024 * 1024)
+
+# Set to 0 to disable it. A cache of copies is a convenience, so it must be possible to
+# turn off without editing code - and it is what a debugging session usually wants.
+ARCHIVE_CACHE_ENABLED = env_text("ARCHIVE_CACHE", "1").lower() not in {"0", "false", "no", "off"}
+
 # e-hentai's page images are served from signed, time-limited URLs, and the signature
 # lives far less long than the 14-day cache entry that carries it. A cached sweep that
 # outlives its URLs makes EVERY page fail at once, which then dropped the download into
@@ -1159,6 +1190,221 @@ def remember_media_parse(url: str, files: list[Path]) -> None:
     PARSE_CACHE.save()
 
 
+async def send_cached_archive(message, status, path: Path, gallery, label: str,
+                              source_note: str) -> bool:
+    """
+    Send a previously downloaded archive from the cache. Returns whether it was sent.
+
+    Returns False rather than raising so the caller can fall back to downloading: a cache
+    is an optimisation, and no failure of it should cost the user their file.
+    """
+    try:
+        archive_bytes = path.stat().st_size
+    except OSError as exc:
+        logger.warning("歸檔快取無法讀取：%s（%s）", path.name, exc)
+        return False
+
+    caption = build_caption(
+        gallery.page_url,
+        f"{gallery.title[:120]}\n官方歸檔 · {label} · "
+        f"{ehentai.format_filesize(archive_bytes)}（快取）",
+    )
+
+    _limit = upload_limit_bytes()
+    await status.edit_text(
+        f"使用先前下載的歸檔（{ehentai.format_filesize(archive_bytes)}），直接傳送……"
+        + ("\n（超過目前的上傳上限，仍嘗試傳送）" if archive_bytes > _limit else ""),
+        link_preview_options=source_link_options(),
+    )
+
+    try:
+        with path.open("rb") as archive:
+            await message.reply_document(
+                document=archive,
+                # The cached name carries a suffix for the type; the sender's name is
+                # rebuilt from the gallery so the user sees a sensible filename.
+                filename=cache_send_name(gallery, path, label),
+                caption=caption,
+            )
+    except TelegramError as exc:
+        logger.warning("歸檔快取傳送失敗：%s（%s）", path.name, exc)
+        return False
+    except OSError as exc:
+        logger.warning("歸檔快取讀取失敗：%s（%s）", path.name, exc)
+        return False
+    return True
+
+
+def cache_send_name(gallery, path: Path, label: str) -> str:
+    """A readable filename for a resent cached archive."""
+    title = sanitize_filename((getattr(gallery, "title", "") or "gallery")[:80])
+    return f"{title} [{label}]{path.suffix or '.zip'}"
+
+
+def archive_cache_key(gallery, original: bool) -> str:
+    """
+    The filename stem for a gallery's cached archive.
+
+    Includes the resample choice: "歸檔 · 1280" and "歸檔 · 原圖" are different files for the
+    same gallery, so they must not share an entry.
+    """
+    gid = getattr(gallery, "gid", "") or "unknown"
+    token = getattr(gallery, "token", "") or "unknown"
+    variant = "orig" if original else "1280"
+    return f"{sanitize_filename(f'{gid}_{token}')}_{variant}"
+
+
+def archive_cache_path(gallery, original: bool) -> Path | None:
+    """
+    The cached archive for a gallery and variant, or None when there is not one.
+
+    Matched by stem rather than by stored filename, so the entry survives the display name
+    changing - e-hentai's filename carries the gallery title, which is not stable.
+    """
+    if not ARCHIVE_CACHE_ENABLED:
+        return None
+    stem = archive_cache_key(gallery, original)
+    try:
+        for path in ARCHIVE_CACHE_DIR.glob(f"{stem}*"):
+            if path.is_file() and path.stat().st_size > 0:
+                return path
+    except OSError:
+        return None
+    return None
+
+
+def store_archive_cache(source: Path, gallery, original: bool) -> Path | None:
+    """
+    Keep a copy of a downloaded archive, and return where it was stored.
+
+    Copied rather than moved: the caller is about to send the file it already has, and
+    taking it away would mean sending the copy instead - which is fine but pointless
+    indirection.
+
+    The copy is written under a temporary name and renamed, for the same reason the media
+    cache is: a crash or a kill part-way through must not leave a truncated file that
+    later looks like a complete archive.
+    """
+    if not ARCHIVE_CACHE_ENABLED:
+        return None
+    try:
+        ARCHIVE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("無法建立歸檔快取目錄 %s：%s", ARCHIVE_CACHE_DIR, exc)
+        return None
+
+    # The original suffix is kept so the resent file has the same type and name.
+    target = ARCHIVE_CACHE_DIR / f"{archive_cache_key(gallery, original)}{source.suffix}"
+    staging = target.with_name(f".{target.name}.{os.getpid()}.part")
+    try:
+        shutil.copy2(source, staging)
+        os.replace(staging, target)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("無法快取歸檔 %s：%s", source, exc)
+        staging.unlink(missing_ok=True)
+        return None
+
+    prune_archive_cache()
+    return target
+
+
+def prune_archive_cache() -> int:
+    """
+    Evict least-recently-used archives until the cache fits its byte budget. Returns how
+    many were removed.
+
+    Never raises: this runs after a successful download, and a housekeeping failure must
+    not turn a delivered archive into an error.
+    """
+    try:
+        entries = []
+        total = 0
+        for path in ARCHIVE_CACHE_DIR.glob("*"):
+            if not path.is_file() or path.name.endswith(".part"):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append((stat.st_mtime, stat.st_size, path))
+            total += stat.st_size
+
+        removed = 0
+        if total > ARCHIVE_CACHE_MAX_BYTES:
+            # Oldest access first, so a gallery the user keeps returning to survives.
+            for _mtime, size, path in sorted(entries):
+                if total <= ARCHIVE_CACHE_MAX_BYTES:
+                    break
+                try:
+                    path.unlink()
+                    total -= size
+                    removed += 1
+                except OSError:
+                    continue
+        # Leftovers from a run that was killed between copy and rename.
+        for stale in ARCHIVE_CACHE_DIR.glob("*.part"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        if removed:
+            logger.info("歸檔快取清除 %s 個項目（目前 %s）", removed,
+                        ehentai.format_filesize(total))
+        return removed
+    except Exception:  # noqa: BLE001
+        logger.debug("清理歸檔快取時發生問題", exc_info=True)
+        return 0
+
+
+def archive_cache_total_bytes() -> int:
+    """Bytes currently held by the archive cache, for the startup line and /cache."""
+    try:
+        return sum(p.stat().st_size for p in ARCHIVE_CACHE_DIR.glob("*")
+                   if p.is_file() and not p.name.endswith(".part"))
+    except OSError:
+        return 0
+
+
+def gallery_cache_key(url: str, gallery=None) -> str:
+    """
+    The cache key for a gallery, identical for the same gallery on either host.
+
+    **One gallery, one entry.** e-hentai.org and exhentai.org serve the same gallery under
+    the same ``gid`` and ``token``, and ``EhentaiGallery.page_url`` does canonicalise to
+    e-hentai.org - but the key used to *store* was whatever URL the request arrived with.
+    Measured on a real gallery, the cache held two entries for it:
+
+        https://e-hentai.org/g/3778922/19330e2349   -> 27 display_urls
+        https://exhentai.org/g/3778922/19330e2349   ->  0 display_urls
+
+    So submitting an exhentai link and then pressing a button produced a cache miss, and
+    the second entry - written by the button's own ``remember_gallery`` under
+    ``gallery.page_url`` - never satisfied the first. Whichever host a gallery is first seen
+    through, only that one entry was ever reused.
+
+    Keying on ``gid``/``token`` removes the host from the identity entirely, which also
+    collapses the query-string, trailing-slash and pagination variants of the same URL.
+    """
+    gid = getattr(gallery, "gid", "") or ""
+    token = getattr(gallery, "token", "") or ""
+    if gid and token:
+        return f"https://e-hentai.org/g/{gid}/{token}/"
+    match = re.search(r"/(?:g|gallery)/(\d+)/([0-9a-zA-Z]+)", url or "")
+    if match:
+        return f"https://e-hentai.org/g/{match.group(1)}/{match.group(2)}/"
+    return normalize_cache_key(url)
+
+
+def gallery_cache_lookup(url: str, gallery=None) -> dict:
+    """The cached payload for a gallery under its canonical key, or an empty dict."""
+    return PARSE_CACHE.lookup(gallery_cache_key(url, gallery), kind="gallery") or {}
+
+
+def gallery_cache_age(url: str, gallery=None) -> float | None:
+    """How long ago a gallery was cached, or None when it is not cached."""
+    return PARSE_CACHE.age(gallery_cache_key(url, gallery))
+
+
 def gallery_cache_payload(gallery, image_urls=None) -> dict:
     """
     Serialise a gallery for the cache.
@@ -1196,8 +1442,14 @@ def gallery_from_payload(payload: dict):
 
 
 def remember_gallery(url: str, gallery, image_urls=None) -> None:
-    """Cache a gallery's facts and, when available, its image URLs."""
-    PARSE_CACHE.store(url, "gallery", gallery_cache_payload(gallery, image_urls))
+    """
+    Cache a gallery's facts and, when available, its image URLs.
+
+    Written under :func:`gallery_cache_key`, not under ``url`` - see that function for why
+    storing by the request URL produced two entries for one gallery.
+    """
+    PARSE_CACHE.store(gallery_cache_key(url, gallery), "gallery",
+                      gallery_cache_payload(gallery, image_urls))
     if PARSE_CACHE.needs_pruning():
         removed = PARSE_CACHE.prune()
         if removed:
@@ -2361,8 +2613,17 @@ async def cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if args and args[0] in {"clear", "清除"}:
         removed = PARSE_CACHE.clear()
+        archives = 0
+        if ARCHIVE_CACHE_DIR.is_dir():
+            for path in ARCHIVE_CACHE_DIR.glob("*"):
+                try:
+                    path.unlink()
+                    archives += 1
+                except OSError:
+                    continue
         await message.reply_text(
             f"已清除解析快取：{removed} 筆（含快取檔案）。\n"
+            f"已清除歸檔快取：{archives} 個檔案。\n"
             "下次解析會重新下載。"
         )
         return
@@ -2370,13 +2631,20 @@ async def cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     size_kb = 0
     file_count = 0
     if CACHE_DIR.is_dir():
+        # The archive cache lives inside CACHE_DIR, so it has to be excluded here or it
+        # would be counted twice and dominate the figure.
         for path in CACHE_DIR.rglob("*"):
-            if path.is_file():
+            if path.is_file() and ARCHIVE_CACHE_DIR not in path.parents:
                 file_count += 1
                 try:
                     size_kb += path.stat().st_size
                 except OSError:
                     pass
+
+    archive_files = 0
+    if ARCHIVE_CACHE_DIR.is_dir():
+        archive_files = sum(1 for p in ARCHIVE_CACHE_DIR.glob("*")
+                            if p.is_file() and not p.name.endswith(".part"))
 
     lines = [
         "解析快取：",
@@ -2387,6 +2655,14 @@ async def cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 有效期限：{PARSE_CACHE.stale_seconds // 3600} 小時，"
         f"最多 {PARSE_CACHE.max_entries} 筆",
         f"• 快取檔：{PARSE_CACHE.path}",
+        "",
+        "歸檔快取（已下載的官方壓縮包，重複要求時直接重送）：",
+        f"• 狀態：{'啟用' if ARCHIVE_CACHE_ENABLED else '已停用（ARCHIVE_CACHE=0）'}",
+        f"• 檔案：{archive_files} 個，"
+        f"{archive_cache_total_bytes() / 1024 / 1024:.1f} MB",
+        f"• 上限：{ARCHIVE_CACHE_MAX_BYTES / 1024 / 1024 / 1024:.1f} GB"
+        f"（超過時淘汰最久未使用的）",
+        f"• 目錄：{ARCHIVE_CACHE_DIR}",
         "",
         "用法：/cache clear 清除全部快取",
     ]
@@ -3948,10 +4224,10 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
         # A gallery parsed before is served from the cache, so a repeat request
         # costs no request to e-hentai at all. The facts are cheap to fetch; the
         # per-page sweep is not, and that is what the cache mostly saves.
-        cached = PARSE_CACHE.lookup(url, kind="gallery")
+        cached = gallery_cache_lookup(url)
         gallery = gallery_from_payload(cached) if cached else None
         if gallery is not None:
-            age = PARSE_CACHE.age(url)
+            age = gallery_cache_age(url)
             logger.info("命中畫廊快取（%.0f 秒前）：%s", age or 0, url)
 
         if gallery is None:
@@ -4308,7 +4584,7 @@ async def run_gallery_action(query, message, user, mode: str,
         try:
             # The gallery's facts come from the cache when present. The URL sweep is
             # cached separately inside run_gallery_images, since that is the slow part.
-            cached = PARSE_CACHE.lookup(gallery_url, kind="gallery")
+            cached = gallery_cache_lookup(gallery_url)
             gallery = gallery_from_payload(cached) if cached else None
             if gallery is None:
                 gallery = await asyncio.to_thread(
@@ -4728,8 +5004,8 @@ async def gallery_page_urls(gallery, status, original: bool,
     """
     pages = int(gallery.filecount or 0) or None
 
-    cached = {} if force else (PARSE_CACHE.lookup(gallery.page_url, kind="gallery") or {})
-    age = None if force else PARSE_CACHE.age(gallery.page_url)
+    cached = {} if force else gallery_cache_lookup(gallery.page_url, gallery)
+    age = None if force else gallery_cache_age(gallery.page_url, gallery)
     if cached.get("display_urls") and age is not None and age > GALLERY_URL_TTL_SECONDS:
         logger.info("圖片清單已過期（%.0f 分鐘），重新取得：%s",
                     age / 60, gallery.page_url)
@@ -5489,6 +5765,25 @@ async def run_gallery_archive(message, status, gallery, mode: str,
         link_preview_options=source_link_options(),
     )
 
+    # A stored archive is resent without touching e-hentai at all.
+    #
+    # This must come **before** resolve_official_archive: resolving is itself a network
+    # round trip to the archiver, and it is one of the two steps the cache exists to
+    # remove. Measured on a real 27-page gallery, resolve is ~3s of the ~35s that a
+    # cached archive saves.
+    cached_archive = archive_cache_path(gallery, original)
+    if cached_archive is not None:
+        logger.info("命中歸檔快取（%s，%s）", cached_archive.name,
+                    ehentai.format_filesize(cached_archive.stat().st_size))
+        sent = await send_cached_archive(message, status, cached_archive, gallery,
+                                         label, source_note)
+        if sent:
+            return
+        # The resend failed - most often because the stored file no longer fits the
+        # upload limit. Fall through and download it again rather than leaving the user
+        # with nothing, which is why a cache is only ever an optimisation.
+        logger.warning("歸檔快取傳送失敗，改為重新下載：%s", cached_archive.name)
+
     try:
         download_url, filename, size = await asyncio.to_thread(
             resolve_official_archive, gallery, resample=not original)
@@ -5555,6 +5850,12 @@ async def run_gallery_archive(message, status, gallery, mode: str,
             link_preview_options=source_link_options(),
         )
         return
+
+    # Kept for the next time this gallery is asked for. Done before the send so an
+    # archive that is too large for Telegram is still cached - it may fit after a
+    # rotation to a self-hosted server, and re-downloading 76 MiB to find that out again
+    # would be wasteful.
+    await asyncio.to_thread(store_archive_cache, archive_path, gallery, original)
 
     caption = build_caption(
         gallery.page_url,
