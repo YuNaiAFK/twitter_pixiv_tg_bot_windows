@@ -1426,6 +1426,33 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### A stray python window appeared beside the bot's own console
+
+Reported as "why does a python window pop up as well?". It was not the bot - it was the
+**proxy relay**, and the cause was the interpreter used to start it.
+
+`.venv\Scripts\python.exe` is a venv **launcher**, not the interpreter: it re-executes the
+real one as a child. Spawning that pair put a visible, empty console on screen, and neither
+`CREATE_NO_WINDOW` nor `DETACHED_PROCESS` suppressed it - both were tried first:
+
+    venv stub        (python.exe): NEW windows = [(33140, '...\.venv\Scripts\python.exe')]
+    base interpreter (python.exe): NEW windows = []
+
+`sys._base_executable` is the real interpreter and starts with no window. Both background
+spawns use it now - the relay in `run_local_api.py` and the `/restart` replacement in `bot.py`
+- through `detached_interpreter()`.
+
+The cost has to be paid explicitly: the base interpreter does not know about the venv, so
+`child_environment()` adds the venv's `site-packages` to `PYTHONPATH`. Without it the child
+cannot import `telegram` and dies immediately:
+
+    prefix    C:\Python314
+    imports   ['httpx=FAIL', 'telegram=FAIL', 'PIL=FAIL', 'gallery_dl=FAIL']
+
+`list_console_windows.py` is kept because it is what settled this: it enumerates every visible
+console window and its owning process, so "which process put that window there" is answered by
+running it rather than by guessing.
+
 ## Windows shows "Open File - Security Warning" every time
 
 Double-clicking `run.bat` (or a shortcut to it) prompts:
