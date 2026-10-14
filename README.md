@@ -1426,6 +1426,34 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### 重新生成 always failed once the cover loaded
+
+```
+WARNING twitter_pixiv_bot: 更新頁面訊息失敗：There is no text in the message to edit
+```
+
+A second, independent consequence of the cover feature. `edit_message_to_cover` turns the
+result message into the cover **photo**, and Telegram refuses `edit_message_text` on a media
+message. The 重新生成 handler assumed a text message, so pressing it on any gallery whose
+cover had loaded logged a failure and posted a **second copy** instead of updating in place.
+Galleries whose cover had *not* loaded were unaffected, which is why it looked intermittent.
+
+A photo's caption *can* be edited, and Telegram renders it below the image, so the cover
+survives the update and the one-message-per-request rule holds. `update_result_message()`
+picks the call from the message itself:
+
+    message.photo present  -> edit_caption
+    otherwise              -> edit_text
+
+The check reads the message object, which carries its own media from the update, so it
+reflects what the message **is now** rather than what the handler assumed when it was
+written. A photo with an empty caption is refused (Telegram requires a non-empty caption on
+media) and the caller sends separately, because a second message beats silence.
+
+Both branches were checked for the same trap: the cover is applied only in the Telegraph
+action and the archive action only edits text, and the two run from mutually exclusive
+button presses - so neither can meet a message the other converted.
+
 ### Every exhentai cover was missing, and the log said only "Failed to get http url content"
 
 ```

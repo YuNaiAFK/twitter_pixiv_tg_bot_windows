@@ -1326,6 +1326,49 @@ def remember_media_parse(url: str, files: list[Path]) -> None:
     PARSE_CACHE.save()
 
 
+async def update_result_message(message, text: str, *, reply_markup=None,
+                                link_preview: bool = True) -> bool:
+    """
+    Replace a result message's text, whether or not it currently holds a photo.
+
+    **The two need different calls, and using the wrong one fails.** A result message is
+    usually the cover photo - ``edit_message_to_cover`` turns the status message into one -
+    and Telegram refuses ``edit_message_text`` on a media message with "There is no text in
+    the message to edit". That is what pressing 重新生成 produced every time on a gallery
+    whose cover had loaded: the handler assumed a text message and the cover made it a
+    photo.
+
+    A photo's caption *can* be edited, and it is rendered above the image, so the cover
+    survives the update. Editing rather than sending again also keeps the one-message-per-
+    request rule the cover was introduced for.
+
+    Returns whether the message was updated. Callers may send a new message on False.
+    """
+    kwargs = {}
+    if link_preview:
+        kwargs["link_preview_options"] = source_link_options()
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
+
+    # The message object carries its own media from the update, so this reflects what the
+    # message is *now*, not what it was when the handler was written.
+    is_photo = bool(getattr(message, "photo", None))
+    try:
+        if is_photo:
+            if not text:
+                # Telegram needs a non-empty caption on a media message; an empty one is
+                # refused. Nothing sensible to write, so let the caller send separately.
+                return False
+            await message.edit_caption(caption=text, **kwargs)
+        else:
+            await message.edit_text(text, **kwargs)
+        return True
+    except TelegramError as exc:
+        logger.warning("更新結果訊息失敗（%s）：%s",
+                       "照片" if is_photo else "文字", exc)
+        return False
+
+
 async def send_cached_archive(message, status, path: Path, gallery, label: str,
                               source_note: str) -> bool:
     """
@@ -4588,23 +4631,25 @@ async def run_regenerate(query, user, entry: dict) -> None:
         await query.answer("重新生成時發生錯誤，請稍後再試。", show_alert=True)
         return
 
-    # The message being replaced is the finished result, so its new text is built
-    # the same way and a fresh button is attached.
+    # The message being replaced is the finished result, so its new text is built the same
+    # way. **It is usually the cover photo by now**, which is why this goes through
+    # update_result_message: edit_text on a photo message fails with "There is no text in
+    # the message to edit", and that made every 重新生成 press log a failure and post a
+    # second copy instead of updating the picture in place.
     text_lines = [build_gallery_info(gallery)]
     text_lines.append(f"\n📄 Telegraph：{telegraph_url}")
     text_lines.append(f"（已重新生成，內嵌 {len(embed)} 頁圖片）")
     if gallery.is_adult:
         text_lines.append("（成人內容，Telegraph 頁面可能被移除）")
 
-    try:
-        await query.message.edit_text(
-            "\n".join(text_lines),
-            link_preview_options=source_link_options(),
-            reply_markup=regenerate_keyboard(gallery.gid, gallery.token),
-        )
-    except TelegramError as exc:
-        logger.warning("更新頁面訊息失敗：%s", exc)
-        await send_status(query.message, "\n".join(text_lines))
+    new_text = "\n".join(text_lines)
+    if await update_result_message(
+            query.message, new_text,
+            reply_markup=regenerate_keyboard(gallery.gid, gallery.token)):
+        return
+    # Nothing editable - a photo with no caption, or a refusal. A second message is worse
+    # than an edit but better than silence, and the old text stays as the record.
+    await send_status(query.message, new_text)
     return
 
 

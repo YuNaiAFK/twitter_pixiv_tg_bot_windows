@@ -59,6 +59,81 @@ def check(name: str, condition, detail: str = "") -> bool:
     return ok
 
 
+def _result_message_helper_works() -> bool:
+    """
+    update_result_message must edit a caption on a photo and text on a text message.
+
+    A stub that records which call was made, plus a strict edit_text that raises the exact
+    error Telegram gave, so returning the wrong branch is visible rather than silent.
+    """
+    import asyncio
+
+    class Msg:
+        def __init__(self, has_photo):
+            self.photo = [object()] if has_photo else []
+            self.calls = []
+            self.message_id = 1
+            self.chat_id = 1
+            self.caption = None
+
+        async def edit_caption(self, caption=None, **kwargs):
+            self.calls.append(("edit_caption", caption))
+            return self
+
+        async def edit_text(self, text=None, **kwargs):
+            self.calls.append(("edit_text", text))
+            return self
+
+    async def scenario():
+        text_msg = Msg(False)
+        photo_msg = Msg(True)
+        ok_text = await bot.update_result_message(text_msg, "summary")
+        ok_photo = await bot.update_result_message(photo_msg, "summary")
+        if not (ok_text and ok_photo):
+            return False
+        if text_msg.calls[0][0] != "edit_text":
+            return False
+        if photo_msg.calls[0][0] != "edit_caption":
+            return False
+        # And the caption actually carries the new text, not an empty placeholder.
+        return photo_msg.calls[0][1] == "summary"
+
+    try:
+        return asyncio.run(scenario())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _empty_caption_is_refused() -> bool:
+    """An empty caption on a photo must return False, not raise or send an empty edit."""
+    import asyncio
+
+    class Msg:
+        photo = [object()]
+        message_id = 1
+
+        def __init__(self):
+            self.calls = []
+
+        async def edit_caption(self, caption=None, **kwargs):
+            self.calls.append(caption)
+            return self
+
+        async def edit_text(self, text=None, **kwargs):
+            self.calls.append(text)
+            return self
+
+    async def scenario():
+        msg = Msg()
+        result = await bot.update_result_message(msg, "")
+        return result is False and not msg.calls
+
+    try:
+        return asyncio.run(scenario())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _orphan_cleanup_is_safe() -> bool:
     """
     Orphan cleanup must remove exactly the unreferenced files, and nothing else.
@@ -1301,6 +1376,33 @@ check("a non-http scheme is refused",
 check("the cover path uses the guard",
       "public_thumbnail_url(" in inspect.getsource(bot.edit_message_to_cover),
       "the raw gallery.thumb is what 403s")
+
+# --- 重新生成 always failed on a gallery whose cover had loaded ---
+
+# edit_message_to_cover turns the result message into the cover PHOTO, and Telegram refuses
+# edit_message_text on a media message:
+#
+#     WARNING twitter_pixiv_bot: 更新頁面訊息失敗：There is no text in the message to edit
+#
+# so the handler logged a failure and posted a second copy instead of updating in place -
+# only when the cover had loaded, which is why it looked intermittent.
+check("the regenerate path can update a photo message",
+      _result_message_helper_works(),
+      "edit_text on a photo message is the failure that was logged")
+check("the regenerate handler does not call edit_text directly",
+      "edit_text(" not in inspect.getsource(bot.run_regenerate),
+      "the message is usually a photo by then")
+check("the regenerate handler goes through the type-aware helper",
+      "update_result_message(" in inspect.getsource(bot.run_regenerate))
+check("a photo with no caption is refused rather than erroring",
+      _empty_caption_is_refused(),
+      "Telegram needs a non-empty caption on a media message")
+check("only one gallery action can edit a given status message",
+      # The cover converts the message to a photo; the archive action edits text. They run
+      # from mutually exclusive button presses, so neither can meet the other's message.
+      "edit_message_to_cover" not in inspect.getsource(bot.run_gallery_archive)
+      and "run_gallery_archive" not in inspect.getsource(bot.run_gallery_images),
+      "a photo message must never be text-edited by the other branch")
 
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
