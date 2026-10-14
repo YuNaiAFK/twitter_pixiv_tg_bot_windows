@@ -1426,6 +1426,60 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### A private Pixiv work was reported as a broken link
+
+The narrow rule that replaced a wrong one: **a work that no longer exists is reported, and
+everything else is silent.**
+
+Before this, an empty result always produced a message, and for a private or age-restricted
+work that message was wrong twice over:
+
+    沒有找到可傳送的圖片或影片。
+    取不到作品內容，連結可能已失效。
+
+The link was fine. It needed a login this bot did not have, which is not something the sender
+can act on - and "連結可能已失效" blamed them for it. The bot also left its own status and
+source messages behind, so a link that resolved to nothing produced *more* clutter than one
+that worked.
+
+#### gallery-dl cannot tell a deletion from a missing login
+
+It reports the same error for both, because the **web** API answers 404 either way:
+
+    [pixiv][error] NotFoundError: Requested resource (gallery/image) could not be found
+
+Measured against the **app** API, which does distinguish them:
+
+    app API, no credentials   400  login required
+    app API, with token       200  the work
+    web API, no credentials   404  identical to a deletion
+
+So `pixiv_work_state()` asks the app API with the configured credentials, and the answer
+decides:
+
+| the work | state | what the user sees |
+| --- | --- | --- |
+| readable (downloaded) | — | the files, no error |
+| private, credentials work | `ok` | nothing (the download succeeded) |
+| private, credentials broken | `unknown` | **nothing** - silence |
+| deleted | `deleted` | 這個 Pixiv 作品已經不存在了… |
+
+**`unknown` is silent on purpose.** Telling someone their link is dead when the bot simply
+cannot verify it is worse than saying nothing.
+
+A private work the bot *can* read is downloaded normally, which is what the request asked
+for: "私人画廊如果在登录的时候能解析出来则不需要提示错误".
+
+#### Two bugs found while checking this
+
+- **`classify_download_output` could not recognise the real error.** It looked for
+  `"not found"` with a space; gallery-dl prints `NotFoundError:` and "could not be found".
+  Neither matched, so a deleted work classified as `""` and the operator hint fell back to a
+  guess about credentials - sending an operator to redo an OAuth flow that was never the
+  problem. Both spellings are matched now.
+- **`pixiv_illust_id` required five or more digits**, so a short id silently yielded `""` and
+  every deletion was then reported as silence instead.
+
 ### Notices are silent, and a Pixiv page is not a work either
 
 Two changes that belong together: an unparseable link now produces **no reply at all**, and

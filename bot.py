@@ -1655,6 +1655,56 @@ def remember_gallery(url: str, gallery, image_urls=None) -> None:
 
 
 
+async def report_empty_download(status, message, media_url: str, platform: str | None,
+                                source_note: str = "") -> None:
+    """
+    Say something - or nothing - when a download produced no media.
+
+    The rule, which is deliberately narrow:
+
+    * **A work that no longer exists is reported.** That is the one case where the answer is
+      certain and silence would leave the user re-sending a dead link.
+    * **Everything else is silent**, and the messages the bot already posted are removed
+      rather than replaced. A private or age-restricted work that this bot cannot reach is
+      not an error the sender can act on: the link may be perfectly good and simply need a
+      login this bot does not have. Replying "取不到作品內容，連結可能已失效" to a private
+      work blamed the link, which was both wrong and useless.
+
+    Silence is verified against the work itself, not assumed: see ``pixiv_work_state``, which
+    asks the Pixiv app API with the configured credentials. A deleted work answers 404 there
+    even with a valid token, while one that needs a login answers 200 - which is exactly the
+    distinction gallery-dl's own output cannot make.
+
+    When the state cannot be determined the reply is silence, because telling someone their
+    link is dead when it is not is worse than saying nothing.
+    """
+    deleted = False
+    if platform == "pixiv":
+        illust_id = pixiv_illust_id(media_url)
+        if illust_id:
+            state = await asyncio.to_thread(pixiv_work_state, illust_id)
+            deleted = state == "deleted"
+            logger.info("Pixiv 作品狀態：%s（%s）", state, illust_id)
+
+    if not deleted:
+        # Take the bot's own messages back, so the chat is left as though the link was never
+        # sent. Failure is the only path where these are not already cleaned up.
+        await cleanup_request_messages(status, message)
+        return
+
+    try:
+        await status.edit_text(
+            "這個 Pixiv 作品已經不存在了（可能已被作者刪除或設為非公開）。\n\n"
+            + (source_note or build_caption(media_url)),
+            link_preview_options=source_link_options(),
+        )
+    except TelegramError:
+        await send_status(
+            message,
+            "這個 Pixiv 作品已經不存在了（可能已被作者刪除或設為非公開）。",
+        )
+
+
 async def send_cached_media(message, status, url: str, payload: dict,
                             platform: str | None, source_note: str) -> bool:
     """
@@ -1990,6 +2040,119 @@ def classify_link(url: str) -> tuple[str, str]:
 def is_parseable_kind(kind: str) -> bool:
     """Whether a classification verdict means "download this"."""
     return kind in {"tweet", "work"}
+
+
+PIXIV_APP_USER_AGENT = "PixivIOSApp/7.19.1 (iOS 16.7.2; iPhone12,8)"
+
+# Cached app-API bearer token, with the refresh token it was minted from, so a probe does
+# not run an OAuth exchange every time.
+_pixiv_token_cache: tuple[str, str] | None = None
+
+
+def pixiv_access_token(timeout: float = 30.0) -> str:
+    """
+    An app-API bearer token from the configured refresh token. Empty when unavailable.
+
+    Needed because the app API and the web API disagree about age-restricted works. Measured
+    on one that requires a login:
+
+        app API, no credentials   400  "login required"
+        app API, with token       200  the work
+        web API, no credentials   404  indistinguishable from a deletion
+
+    The web API's 404 is what gallery-dl reports, and a deleted work gets the same answer -
+    so telling the two apart requires this.
+    """
+    global _pixiv_token_cache
+
+    refresh = (PIXIV_REFRESH_TOKEN or "").strip()
+    if not refresh:
+        return ""
+    if _pixiv_token_cache is not None and _pixiv_token_cache[1] == refresh:
+        return _pixiv_token_cache[0]
+    try:
+        import pixiv_login
+        with httpx.Client(**ehentai.http_client_kwargs(timeout)) as client:
+            response = client.post(
+                "https://oauth.secure.pixiv.net/auth/token",
+                data={
+                    "client_id": pixiv_login.CLIENT_ID,
+                    "client_secret": pixiv_login.CLIENT_SECRET,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh,
+                    "include_policy": "true",
+                    "get_secure_url": "1",
+                },
+                headers={"User-Agent": PIXIV_APP_USER_AGENT},
+            )
+        payload = response.json()
+        token = (payload.get("access_token") or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("取得 Pixiv access token 失敗：%s", exc)
+        return ""
+    _pixiv_token_cache = (token, refresh)
+    return token
+
+
+def pixiv_work_state(illust_id: str, timeout: float = 25.0) -> str:
+    """
+    Whether a Pixiv work is readable with the configured credentials.
+
+    Returns ``"ok"``, ``"deleted"`` or ``"unknown"``.
+
+    **This is what makes an honest failure message possible.** gallery-dl reports the same
+    ``NotFoundError`` for a deleted work and for one whose login it does not have, because
+    the *web* API answers 404 for both. The app API does distinguish them, so the two can be
+    told apart instead of being merged into one sentence that is wrong half the time.
+
+    An unreadable or absent token returns ``"unknown"`` rather than guessing, so the caller
+    falls back to silence instead of telling someone their work was deleted.
+    """
+    token = pixiv_access_token(timeout=timeout)
+    if not token:
+        return "unknown"
+    try:
+        with httpx.Client(**ehentai.http_client_kwargs(timeout)) as client:
+            response = client.get(
+                "https://app-api.pixiv.net/v1/illust/detail",
+                params={"illust_id": illust_id},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": PIXIV_APP_USER_AGENT,
+                    "Referer": "https://app-api.pixiv.net/",
+                },
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("查詢 Pixiv 作品狀態失敗：%s", exc)
+        return "unknown"
+    if response.status_code == 200:
+        return "ok"
+    if response.status_code == 404:
+        # With a valid token a 404 means gone: an age-restricted work answers 200 here.
+        return "deleted"
+    return "unknown"
+
+
+def pixiv_illust_id(url: str) -> str:
+    """
+    The work id in a Pixiv URL, or "" when there is not one.
+
+    Accepts any digit count. An earlier version required five or more, which silently failed
+    on a short id - and the caller then could not tell a deleted work from an unreachable one,
+    so every deletion was reported as silence instead.
+    """
+    parsed = urlparse(url or "")
+    path = unquote(parsed.path or "")
+    # /artworks/<id>, /artwork/<id>, /en/artworks/<id>, /novel/show.php (id is a query).
+    match = re.search(r"/(?:artworks?|novels?)/(\d+)", path)
+    if match:
+        return match.group(1)
+    # The legacy form carries it as a query parameter.
+    query = parse_qs(parsed.query)
+    for key in ("illust_id", "id"):
+        if query.get(key):
+            return str(query[key][0])
+    return ""
 
 
 def user_is_admin(user_id: int) -> bool:
@@ -3841,7 +4004,13 @@ def classify_download_output(text: str) -> str:
     lowered = (text or "").lower()
     if "deleted" in lowered:
         return "deleted"
-    if "does not exist" in lowered or "not found" in lowered or "404" in lowered:
+    # "could not be found" and "notfound" both matter: gallery-dl prints
+    # "NotFoundError: Requested resource (gallery/image) could not be found", and the
+    # original check was for "not found" WITH a space - which matched neither the class name
+    # nor the sentence, so a deleted work classified as "" and the log hint fell back to a
+    # guess about credentials.
+    if ("does not exist" in lowered or "not found" in lowered or "notfound" in lowered
+            or "could not be found" in lowered or "404" in lowered):
         return "missing"
     if "login" in lowered or "authentication" in lowered or "refresh-token" in lowered:
         return "auth"
@@ -6877,11 +7046,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # information is not lost, only kept out of the conversation.
             logger.warning("沒有取得媒體：%s（%s）| %s",
                            media_url, platform, admin_hint(platform))
-            await status.edit_text(
-                "沒有找到可傳送的圖片或影片。\n\n" + visitor_failure_note(platform)
-                + "\n\n" + source_note,
-                link_preview_options=source_link_options(),
-            )
+            await report_empty_download(status, message, media_url, platform)
             return
 
         if platform == "pixiv":
@@ -6961,13 +7126,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # The operator detail goes to the log rather than into the chat: a failure
         # reply should be a short statement of what happened, not a command line.
         logger.warning("解析失敗的診斷：%s | %s", media_url, admin_hint(platform))
-        await status.edit_text(
-            "解析失敗，請稍後再試。\n\n" + source_note,
-            link_preview_options=source_link_options(),
-        )
+        # **A deleted work is reported; anything else is not.** gallery-dl exits non-zero
+        # for both a deletion and a work whose login it lacks, so this used to answer
+        # "解析失敗，請稍後再試" to a private or age-restricted work as well - blaming the
+        # bot for a link that is fine, and telling the sender nothing they can act on. The
+        # work itself decides which it is; see report_empty_download.
+        await report_empty_download(status, message, media_url, platform, source_note)
     finally:
-        # Only after success: on failure the status message carries the reason and
-        # must survive, and the source link is the only reference the user has.
+        # After success, and after a silent failure - report_empty_download already took the
+        # messages back in that case, and calling it twice is harmless because each delete is
+        # guarded. A REPORTED failure keeps its messages: the status carries the reason and
+        # the source link is the only reference the user has left.
         if succeeded:
             await cleanup_request_messages(status, message)
         shutil.rmtree(temp_dir, ignore_errors=True)

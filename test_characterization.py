@@ -171,6 +171,122 @@ def _drop_explains_when_enabled() -> bool:
         bot.AUTHORIZATION.allowed = saved_allowed
 
 
+def _empty_download_reports_deleted() -> bool:
+    """
+    A work the API says is gone must produce a message naming that.
+
+    The probe is stubbed so the test does not depend on any particular artwork still being
+    deleted - the real one used while developing will not be deleted forever.
+    """
+    import asyncio
+
+    class Msg:
+        def __init__(self):
+            self.chat_id = 1
+            self.message_id = 1
+            self.log = []
+
+        async def reply_text(self, text, **k):
+            self.log.append(("reply", text))
+            return self
+
+        async def edit_text(self, text, **k):
+            self.log.append(("edit", text))
+            return self
+
+        async def delete(self):
+            self.log.append(("delete", None))
+            return self
+
+    saved = bot.pixiv_work_state
+    try:
+        bot.pixiv_work_state = lambda *a, **k: "deleted"
+        status, message = Msg(), Msg()
+        asyncio.run(bot.report_empty_download(
+            status, message, "https://www.pixiv.net/artworks/1", "pixiv", "note"))
+        said = " ".join(t for k, t in status.log if t)
+        return "已經不存在" in said and not any(k == "delete" for k, _ in status.log)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.pixiv_work_state = saved
+
+
+def _empty_download_is_silent_for_private() -> bool:
+    """A work whose state is not 'deleted' must produce no message at all."""
+    import asyncio
+
+    class Msg:
+        def __init__(self):
+            self.chat_id = 1
+            self.message_id = 1
+            self.deleted = 0
+
+        async def reply_text(self, text, **k):
+            self.spoke = True
+            return self
+
+        async def edit_text(self, text, **k):
+            self.spoke = True
+            return self
+
+        async def delete(self):
+            self.deleted += 1
+            return self
+
+    saved = bot.pixiv_work_state
+    try:
+        # "ok" is what an age-restricted work answers when credentials work: the work is
+        # readable, so a failure to download it is not something to tell the sender about.
+        bot.pixiv_work_state = lambda *a, **k: "ok"
+        status, message = Msg(), Msg()
+        asyncio.run(bot.report_empty_download(
+            status, message, "https://www.pixiv.net/artworks/124400619", "pixiv", "note"))
+        return (getattr(status, "spoke", False) is False
+                and getattr(message, "spoke", False) is False
+                and status.deleted == 1)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.pixiv_work_state = saved
+
+
+def _unknown_state_is_silent() -> bool:
+    """An unverifiable state must be silent rather than claim a deletion."""
+    import asyncio
+
+    class Msg:
+        def __init__(self):
+            self.chat_id = 1
+            self.message_id = 1
+            self.spoke = False
+            self.deleted = 0
+
+        async def reply_text(self, text, **k):
+            self.spoke = True
+            return self
+
+        async def edit_text(self, text, **k):
+            self.spoke = True
+            return self
+
+        async def delete(self):
+            self.deleted += 1
+            return self
+
+    saved = bot.pixiv_work_state
+    try:
+        bot.pixiv_work_state = lambda *a, **k: "unknown"
+        status, message = Msg(), Msg()
+        asyncio.run(bot.report_empty_download(
+            status, message, "https://www.pixiv.net/artworks/1", "pixiv", "note"))
+        return status.spoke is False and message.spoke is False
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.pixiv_work_state = saved
+
+
 def _env_flag_documented(name: str) -> bool:
     """Whether a configuration flag appears in .env.example, so it can be discovered."""
     try:
@@ -1626,6 +1742,58 @@ check("the notice is a documented opt-in",
 check("a dropped link sends nothing to the chat when notices are off",
       _drop_is_silent(),
       "the point of the change is that no message appears at all")
+check("the work id is read from every pixiv url shape",
+      # An earlier version required five or more digits, so a short id silently yielded ""
+      # and every deletion was then reported as silence instead of a message.
+      all(bot.pixiv_illust_id(u) == want for u, want in (
+          ("https://www.pixiv.net/artworks/1", "1"),
+          ("https://www.pixiv.net/artworks/150824857", "150824857"),
+          ("https://www.pixiv.net/en/artworks/150824857", "150824857"),
+          ("https://www.pixiv.net/artwork/1", "1"),
+          ("https://www.pixiv.net/member_illust.php?mode=medium&illust_id=1", "1"),
+          ("https://www.pixiv.net/novel/show.php?id=123", "123"),
+      )),
+      "a missed id turns a deletion into silence")
+check("a non-work url yields no id",
+      bot.pixiv_illust_id("https://www.pixiv.net/users/12345") == ""
+      and bot.pixiv_illust_id("https://x.com/u/status/123") == "",
+      "probing the wrong thing would report the wrong state")
+
+# --- A private Pixiv work must not be reported as a failure ---
+
+# gallery-dl reports the same NotFoundError for a deleted work and for one whose login it
+# lacks, because the web API answers 404 for both - so the bot used to answer
+# "解析失敗，請稍後再試" or "連結可能已失效" to a private or age-restricted work. The link was
+# fine; the message blamed it and told the sender nothing they could act on.
+#
+# The app API does distinguish them. Measured:
+#
+#   app API, no credentials   400  login required
+#   app API, with token       200  the work
+#   web API, no credentials   404  same as a deletion
+check("a deleted pixiv work is reported, not silenced",
+      _empty_download_reports_deleted(),
+      "a dead link is the one case where the sender can act on the message")
+check("a work the bot CAN read is never called deleted",
+      # The probe answers 200 for an age-restricted work when credentials work, so the
+      # reply is silence and the download path is left to succeed.
+      bot.pixiv_work_state("150824857") == "ok",
+      "a live work must not be reported as deleted")
+check("an unreadable work state is unknown, not a guess",
+      _unknown_state_is_silent(),
+      "claiming a deletion the bot cannot verify is worse than silence")
+check("a private work that cannot be read stays silent",
+      _empty_download_is_silent_for_private(),
+      "the request was that a private gallery produce no reply")
+check("the no-media failure path no longer hard-codes a message",
+      # It must route through the decision, or a private work gets the old generic text.
+      "report_empty_download(" in inspect.getsource(bot.handle_message),
+      "both the empty-result and exception paths must use the same rule")
+check("the exception path uses the same rule too",
+      # gallery-dl exits non-zero for a deletion AND for a missing login, so this path
+      # was the one answering "解析失敗" to a private work.
+      inspect.getsource(bot.handle_message).count("report_empty_download(") >= 2,
+      "the non-zero exit path is where private works landed")
 check("the same drop DOES explain itself when notices are on",
       _drop_explains_when_enabled(),
       "an operator needs a way to see why a link was dropped")
