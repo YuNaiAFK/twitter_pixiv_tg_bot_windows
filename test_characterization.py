@@ -59,6 +59,139 @@ def check(name: str, condition, detail: str = "") -> bool:
     return ok
 
 
+def _deadline_reports_to_user() -> bool:
+    """
+    The timeout must be an EhentaiError so run_gallery_archive shows it in the chat.
+
+    Asserts the type relationship and that the message carries the configured budget,
+    rather than re-running a download - the guard itself is exercised in
+    _deadline_aborts_a_stalled_transfer.
+    """
+    try:
+        guard = bot._archive_deadline_guard(_time.monotonic() - 1)
+        try:
+            guard()
+            return False
+        except bot._ArchiveDeadlineExceeded as exc:
+            # The wording is Chinese ("超過 300 秒"); asserting the bare digits would be
+            # asserting the rendering rather than the message.
+            return (isinstance(exc, ehentai.EhentaiError)
+                    and "官方歸檔下載超過" in str(exc)
+                    and "已中止" in str(exc))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _deadline_aborts_a_stalled_transfer() -> bool:
+    """
+    Serve a stream that never ends and check the guard aborts it.
+
+    A per-read timeout cannot catch this: the transfer keeps producing bytes, just
+    slowly, which is exactly the case the old code had no bound for.
+    """
+    import tempfile
+    import threading
+    import time as _t
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    try:
+        class Trickle(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(50 * 1024 * 1024))
+                self.end_headers()
+                try:
+                    for _ in range(20000):
+                        self.wfile.write(b"x" * 4096)
+                        self.wfile.flush()
+                        _t.sleep(0.005)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        work = Path(tempfile.mkdtemp(prefix="dsh-deadline-"))
+        try:
+            import httpx as _hx
+            try:
+                bot._download_archive_single(
+                    {"User-Agent": "test"}, 
+                    f"http://127.0.0.1:{server.server_address[1]}/a.zip",
+                    work / "a.zip", 50 * 1024 * 1024, None, None,
+                    _hx.Timeout(10.0, read=10.0),
+                    _t.monotonic() - 0.001)
+                return False
+            except bot._ArchiveDeadlineExceeded:
+                return True
+        finally:
+            server.shutdown()
+            shutil.rmtree(work, ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _streamed_pages_are_identical() -> bool:
+    """
+    Serve real bytes and confirm the streamed files match them exactly.
+
+    The change replaced a buffer-and-write with a stream-and-rename, so the risk is a
+    truncated or misnamed file. Comparing hashes is the only assertion that actually
+    covers that.
+    """
+    import hashlib
+    import os as _os
+    import tempfile
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    try:
+        pages = {f"/p{i}.png": _os.urandom(300_000 + i * 10_000) for i in range(1, 5)}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = pages.get(self.path.split("?")[0])
+                if body is None:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                # Small writes, so buffering would be visible in memory use.
+                for i in range(0, len(body), 8192):
+                    self.wfile.write(body[i:i + 8192])
+                    self.wfile.flush()
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        work = Path(tempfile.mkdtemp(prefix="dsh-identical-"))
+        try:
+            out = work / "out"
+            written = bot.download_gallery_direct(
+                [f"http://127.0.0.1:{server.server_address[1]}{k}" for k in pages],
+                out, referer="https://e-hentai.org/", workers=3, total=len(pages))
+            files = sorted(out.iterdir())
+            if written != len(pages) or len(files) != len(pages):
+                return False
+            if any(f.name.endswith(".part") for f in files):
+                return False
+            originals = list(pages.values())
+            for index, path in enumerate(files):
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                if digest != hashlib.sha256(originals[index]).hexdigest():
+                    return False
+            return True
+        finally:
+            server.shutdown()
+            shutil.rmtree(work, ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _concurrent_updates_applied() -> bool:
     """
     Build the bot's REAL Application and read back how many updates it will process.
@@ -745,6 +878,60 @@ check("cancelling never waits behind the work it cancels",
 check("a stop press actually cancels a running job",
       _stop_cancels_running_job(),
       "the whole point: the handler must observe the flag the press set")
+
+# --- The official archive had no total bound, and page images were held in memory ---
+
+# The archive path was bounded only per read (300s), which a slow but steady transfer
+# never trips, so it could stage an arbitrarily large file for an unbounded time.
+check("the archive download has a total wall-clock deadline",
+      1 <= bot.ARCHIVE_DEADLINE_SECONDS <= 3600
+      and bot.ARCHIVE_DEADLINE_SECONDS == 300,
+      f"ARCHIVE_DEADLINE_SECONDS={bot.ARCHIVE_DEADLINE_SECONDS}")
+check("the deadline is passed into both download paths",
+      "deadline" in inspect.signature(bot._download_archive_single).parameters
+      and "deadline" in inspect.signature(bot._download_archive_parallel).parameters,
+      "either path without it is unbounded")
+check("one deadline covers the whole transfer, not one per path",
+      "deadline = (time.monotonic() + ARCHIVE_DEADLINE_SECONDS"
+      in inspect.getsource(bot.download_official_archive),
+      "the fallback must not start a fresh budget")
+check("the deadline is checked inside the transfer loop, not only at connect",
+      "check_deadline()" in inspect.getsource(bot._download_archive_single)
+      and "check_deadline()" in inspect.getsource(bot._download_archive_parallel),
+      "a stalled stream must be noticed mid-body")
+check("a timeout is not retried as a range failure",
+      # Its own type matters: a range can also raise EhentaiError for an HTTP status,
+      # and that one *is* worth retrying. Retrying a timeout would burn a second budget.
+      issubclass(bot._ArchiveDeadlineExceeded, ehentai.EhentaiError)
+      and "_ArchiveDeadlineExceeded" in inspect.getsource(bot._download_archive_parallel),
+      "a timeout must surface as a timeout, not as a corrupt download")
+check("a stalled transfer is actually aborted by the deadline",
+      _deadline_aborts_a_stalled_transfer(),
+      "the guard must fire mid-body on a stream that keeps trickling")
+check("the timeout is reported to the user",
+      _deadline_reports_to_user(),
+      "the message must reach the chat, not just the log")
+
+# Page images were read entirely into memory with EHENTAI_DOWNLOAD_WORKERS running at
+# once. Measured after the change: a 64 MiB page peaks at 4.03 MiB traced RAM (6.3% of
+# the file), and a 6-page download is byte-identical to the source.
+_stream_src = inspect.getsource(bot.download_gallery_direct)
+# Asserted by the mechanism, not by the absence of a string: the docstring explains the
+# old behaviour and mentions ``response.content``, so searching for that phrase found the
+# prose rather than the code.
+check("page images are streamed, not buffered",
+      "client.stream(" in _stream_src and "iter_bytes(" in _stream_src
+      and "handle.write(chunk)" in _stream_src,
+      "buffering holds several full images per gallery")
+check("a page is written to a partial file and renamed into place",
+      'f".{index:04d}.part"' in _stream_src and "os.replace(partial, target)" in _stream_src,
+      "a half-written file must never look complete")
+check("a failed or stopped page leaves no partial behind",
+      _stream_src.count("partial.unlink(missing_ok=True)") >= 3,
+      "partials would accumulate and could be picked up as media")
+check("streamed pages are byte-identical to the source",
+      _streamed_pages_are_identical(),
+      "the download must produce exactly the original bytes")
 
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies

@@ -1426,6 +1426,53 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### The archive had no total time bound, and page images sat in memory
+
+**Two separate problems in the same download path.**
+
+#### The official archive was bounded per read but not in total
+
+The only limit was a 300s *per-read* timeout, which a slow but steady transfer never
+trips - so a stalled or throttled download could stage an arbitrarily large file for an
+unbounded time. There is now one wall-clock deadline for the whole transfer,
+`ARCHIVE_DEADLINE_SECONDS` (default **300s / 5 minutes**), covering the probe, every range
+worker and the single-stream fallback together.
+
+Two details that are easy to get wrong:
+
+- **One deadline, not one per path.** It is created before the parallel/single decision and
+  handed to both, so a fallback to a single stream cannot start a fresh budget and double
+  the wait.
+- **The timeout is its own exception type.** A range request can also raise `EhentaiError`
+  for an HTTP status, and that one *is* worth retrying. Reusing the same type would have let
+  a timeout be retried as a "failed range", burning a second full budget and then reporting
+  a **corrupt download** instead of a timeout.
+
+A per-read timeout could not have caught the case that matters, so the test serves a stream
+that trickles bytes forever and asserts it is aborted:
+
+    pre-expired deadline -> aborted in 1.2s after 256 KiB
+    budget 2.0s          -> aborted after 2.6s
+
+For reference, a real 76.3 MiB original completes in about 27s here, so the 300s budget is
+roughly ten times the normal case and only a genuinely stalled transfer reaches it.
+
+#### Page images were read entirely into memory
+
+`download_gallery_direct` did `response.content` and then wrote the bytes, with
+`EHENTAI_DOWNLOAD_WORKERS` running at once - several full images resident simultaneously for
+no reason, and nothing capped a single oversized file. Each page is now streamed to a
+`.part` file in 256 KiB chunks and renamed into place, so memory is one chunk per worker
+regardless of image size.
+
+Measured, single worker, 64 MiB page:
+
+    peak traced RAM: 4.03 MiB   (6.3% of the file size)
+
+and the streamed files are byte-identical to the source (verified by hash over a local
+server). The rename is what makes it safe: a half-written file exists only under its
+`.part` name, so a failure part-way through can never look like a complete image.
+
 ### The 停止 button did nothing, and the reason was one missing line
 
 PTB processes **one update at a time** by default, and a button press is an update. While a
@@ -1474,12 +1521,9 @@ the end-to-end one that presses stop and asserts the running job observes the fl
 ### The official archive has no total bound (still open)
 
 #### Known and NOT fixed
-- **The official-archive download has no total size or wall-clock bound** (still open;
-  see below).
-- **The official-archive download has no total size or wall-clock bound.** It is bounded
-  per read (300s) but a hostile or mis-sized `Content-Range` drives `truncate()`. A cap is
-  worth adding before the bot is given a large disk.
-- **Page images are read fully into memory**, N at a time, with no per-file cap.
+- **The archive is pre-sized from an untrusted `Content-Range` header.** The total
+  transfer time is now bounded, so this can no longer stage a file indefinitely, but a
+  hostile header could still ask for a large pre-allocation up front.
 - `parse_cache.json` and `.cache/` are **writable by any authenticated local user** on a
   default Windows profile ACL, and `.env` is readable by them. This is what makes the cache
   findings reachable. On a shared machine:

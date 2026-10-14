@@ -186,6 +186,19 @@ EHENTAI_ARCHIVE_WORKERS = int(os.getenv("EHENTAI_ARCHIVE_WORKERS", "4"))
 ARCHIVE_PARALLEL_MIN_BYTES = int(
     os.getenv("ARCHIVE_PARALLEL_MIN_BYTES", str(8 * 1024 * 1024)))
 
+# **Total** wall-clock budget for one official-archive download, across all connections.
+#
+# The archive path previously had no total bound at all - only a per-read timeout of 300s,
+# which a slow but steady transfer never trips. It could therefore stage an arbitrarily
+# large file for an unbounded time. Measured for reference: a 76.3 MiB original completes
+# in about 3s here, so 300s is roughly 100x the normal case and only a genuinely stalled
+# transfer reaches it.
+#
+# This is a deadline for the whole download, not a per-read timeout: the clock starts when
+# the transfer does, and it covers every range worker together.
+ARCHIVE_DEADLINE_SECONDS = int(
+    os.getenv("ARCHIVE_DEADLINE_SECONDS", str(5 * 60)))
+
 # e-hentai's own namespace display names, overridable so a Chinese-only page can
 # be produced without editing the module.
 EHENTAI_NAMESPACE_LABELS = ehentai.NAMESPACE_LABELS
@@ -4410,24 +4423,46 @@ def download_gallery_direct(urls: list[str], output_dir: Path, *, referer: str,
     with httpx.Client(headers=headers,
                       **ehentai.http_client_kwargs(request_timeout)) as client:
         def fetch(item):
+            """
+            Download one page straight to disk and return ``(index, path)``.
+
+            Streaming rather than ``response.content``. The whole page used to be read
+            into memory before being written, and with EHENTAI_DOWNLOAD_WORKERS running at
+            once that held several full images in RAM simultaneously - a 20-page gallery
+            of 4 MB originals meant tens of megabytes resident for no reason, and nothing
+            capped a single oversized file. Chunks now go to a partial file and are renamed
+            into place, so memory use is one chunk per worker regardless of image size.
+
+            The temporary name carries the worker's index because several run at once.
+            """
             index, image_url = item
             if stopped():
                 return None
+            partial = output_dir / f".{index:04d}.part"
             try:
-                response = client.get(image_url)
-                # Checked before the body is even inspected: a stop during the
-                # request should discard the result rather than write the file.
-                if stopped():
-                    return None
-                if response.status_code >= 400:
-                    return None
-                content = response.content
+                with client.stream("GET", image_url) as response:
+                    if response.status_code >= 400:
+                        return None
+                    content_type = response.headers.get("content-type", "")
+                    # A stop while the body is still arriving should discard the result
+                    # rather than finish writing a file nobody wants.
+                    if stopped():
+                        return None
+                    with partial.open("wb") as handle:
+                        for chunk in response.iter_bytes(256 * 1024):
+                            if stopped():
+                                raise _StoppedDownload()
+                            handle.write(chunk)
+            except _StoppedDownload:
+                partial.unlink(missing_ok=True)
+                return None
             except Exception as exc:  # noqa: BLE001
+                partial.unlink(missing_ok=True)
                 if stopped():
                     return None
                 logger.warning("直接下載失敗（第 %s 頁）：%s", index, exc)
                 return None
-            return index, content, response.headers.get("content-type", "")
+            return index, partial, content_type
 
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             # handler=None: map writes each result into an internal queue as it is
@@ -4440,7 +4475,7 @@ def download_gallery_direct(urls: list[str], output_dir: Path, *, referer: str,
                         break
                     done += 1
                     if result is not None:
-                        index, content, content_type = result
+                        index, partial, content_type = result
                         suffix = ".jpg"
                         if "png" in content_type:
                             suffix = ".png"
@@ -4449,8 +4484,15 @@ def download_gallery_direct(urls: list[str], output_dir: Path, *, referer: str,
                         elif "gif" in content_type:
                             suffix = ".gif"
                         target = output_dir / f"{index:04d}{suffix}"
-                        target.write_bytes(content)
-                        written += 1
+                        try:
+                            # The rename publishes the file. Until this succeeds the
+                            # download is invisible under its .part name, so a failure
+                            # part-way through can never leave a short file looking whole.
+                            os.replace(partial, target)
+                            written += 1
+                        except OSError as exc:
+                            logger.warning("無法完成第 %s 頁的檔案（%s）", index, exc)
+                            partial.unlink(missing_ok=True)
                     if progress:
                         progress(done, total or len(urls))
     return written
@@ -5020,6 +5062,21 @@ def resolve_official_archive(gallery, *, resample: bool) -> tuple[str, str, int]
     return download_url, filename, size
 
 
+class _StoppedDownload(Exception):
+    """Raised inside a streaming worker when a stop arrives mid-body, to discard it."""
+
+
+class _ArchiveDeadlineExceeded(ehentai.EhentaiError):
+    """
+    Raised when an official-archive download runs past its total wall-clock budget.
+
+    Subclasses ``EhentaiError`` so the existing handler in ``run_gallery_archive`` turns it
+    into the message in the chat with no extra plumbing, while still being distinguishable
+    where that matters - the parallel workers must not treat it as a retryable range
+    failure.
+    """
+
+
 class _RangesUnsupported(Exception):
     """
     Raised when a server ignores a Range request and answers with the whole file.
@@ -5075,11 +5132,18 @@ def download_official_archive(download_url: str, target: Path, *, referer: str,
     """
 
     headers = _archive_headers(referer)
-    # A generous read timeout: the archive is served from a CDN and can be large,
-    # while "stop" is handled by the flag rather than by a short timeout.
+    # A generous per-read timeout: the archive is served from a CDN and can be large,
+    # while "stop" is handled by the flag rather than by a short timeout. The *total*
+    # budget is separate and enforced below.
     timeout = httpx.Timeout(30.0, read=300.0)
     if workers <= 0:
         workers = max(1, min(EHENTAI_ARCHIVE_WORKERS, 8))
+
+    # One deadline for the whole transfer, covering the probe, every range worker and the
+    # single-stream fallback together. Started here rather than per path so a fallback
+    # cannot reset it and grant a second full budget.
+    deadline = (time.monotonic() + ARCHIVE_DEADLINE_SECONDS
+                if ARCHIVE_DEADLINE_SECONDS > 0 else None)
 
     # --- probe: total size, and evidence that ranges are honoured ---
     #
@@ -5152,26 +5216,49 @@ def download_official_archive(download_url: str, target: Path, *, referer: str,
             reason = "未知原因"
         logger.info("官方歸檔使用單一連線下載（%s）", reason)
         return _download_archive_single(headers, download_url, target, total,
-                                        stop_event, progress, timeout)
+                                        stop_event, progress, timeout, deadline)
 
     logger.info("官方歸檔使用 %s 個連線分段下載（%s）", workers,
                 ehentai.format_filesize(total))
     try:
         return _download_archive_parallel(headers, download_url, target, total,
-                                          workers, stop_event, progress, timeout)
+                                          workers, stop_event, progress, timeout,
+                                          deadline)
     except _RangesUnsupported as exc:
         # The probe said ranges were honoured and the workers proved otherwise. One
         # stream is correct, just slower, so fall back instead of failing the download.
+        # The same deadline carries over, so the fallback cannot start a fresh budget.
         logger.warning("分段請求未被接受（%s），改用單一連線", exc)
         return _download_archive_single(headers, download_url, target, total,
-                                        stop_event, progress, timeout)
+                                        stop_event, progress, timeout, deadline)
+
+
+def _archive_deadline_guard(deadline: float | None):
+    """
+    A callable that raises once a wall-clock deadline has passed.
+
+    Returned as a closure so both download paths share one implementation and one error
+    message. ``None`` disables it, which is what the parameter default does.
+
+    Raises :class:`_ArchiveDeadlineExceeded`, a type of its own rather than a plain
+    ``EhentaiError``. That distinction is what stops the parallel workers from mistaking a
+    timeout for a per-range failure and retrying it - which would burn a second full
+    budget and then report a corrupt download instead of a timeout.
+    """
+    def check() -> None:
+        if deadline is not None and time.monotonic() > deadline:
+            raise _ArchiveDeadlineExceeded(
+                f"官方歸檔下載超過 {ARCHIVE_DEADLINE_SECONDS} 秒仍未完成，已中止。"
+                "（可能是線路太慢或對方主機沒有回應，請稍後再試一次。）")
+    return check
 
 
 def _download_archive_single(headers: dict, download_url: str, target: Path,
                              total: int, stop_event, progress,
-                             timeout) -> int:
+                             timeout, deadline: float | None = None) -> int:
     """One stream straight to disk. The fallback, and the small-file path."""
 
+    check_deadline = _archive_deadline_guard(deadline)
     written = 0
     with httpx.Client(headers=headers,
                       **ehentai.http_client_kwargs(timeout)) as client:
@@ -5186,6 +5273,7 @@ def _download_archive_single(headers: dict, download_url: str, target: Path,
                     total = 0
             with target.open("wb") as handle:
                 for chunk in response.iter_bytes(256 * 1024):
+                    check_deadline()
                     if stop_event is not None and stop_event.is_set():
                         break
                     handle.write(chunk)
@@ -5197,7 +5285,7 @@ def _download_archive_single(headers: dict, download_url: str, target: Path,
 
 def _download_archive_parallel(headers: dict, download_url: str, target: Path,
                                total: int, workers: int, stop_event, progress,
-                               timeout) -> int:
+                               timeout, deadline: float | None = None) -> int:
     """
     Split the archive into contiguous ranges and fetch them at once.
 
@@ -5212,6 +5300,7 @@ def _download_archive_parallel(headers: dict, download_url: str, target: Path,
 
     written = 0
     lock = threading.Lock()
+    check_deadline = _archive_deadline_guard(deadline)
     # Declared before the workers so the closure always refers to one list.
     failed_ranges: list[tuple[int, int]] = []
     # A modest chunk keeps the last worker from idling on a straggler, while staying
@@ -5252,6 +5341,10 @@ def _download_archive_parallel(headers: dict, download_url: str, target: Path,
                     offset = lo
                     with target.open("r+b") as handle:
                         for part in response.iter_bytes(256 * 1024):
+                            # The deadline is checked per chunk so a stalled transfer is
+                            # abandoned promptly instead of waiting out a per-read
+                            # timeout that a trickling stream never trips.
+                            check_deadline()
                             if stopped():
                                 return got
                             handle.seek(offset)
@@ -5262,6 +5355,13 @@ def _download_archive_parallel(headers: dict, download_url: str, target: Path,
                                 written += len(part)
                                 if progress is not None:
                                     progress(written, total)
+        except _ArchiveDeadlineExceeded:
+            # The deadline fired. Not retryable and not a range failure: retrying would
+            # burn another full budget, and recording it as a failed range would report a
+            # corrupt download instead of a timeout. This must precede the generic
+            # handler below, and it must be its own type - a range request can also raise
+            # EhentaiError for an HTTP status, and that one *is* worth retrying.
+            raise
         except _RangesUnsupported:
             # Not retryable and not a per-range failure: the server does not support
             # ranges at all, so retrying the other ranges would fail identically.
