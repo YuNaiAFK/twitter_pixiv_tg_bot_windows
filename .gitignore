@@ -10,6 +10,7 @@ restart.log
 restart.log.1
 authorized.json
 authorized.json.tmp
+.bot.lock
 screenshot_test.*
 __pycache__/
 *.pyc

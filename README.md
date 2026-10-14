@@ -1426,6 +1426,39 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### A restart slept for six seconds even when nothing was running
+
+The line you will have seen:
+
+    等待 6.0 秒讓前一個程序結束後再開始輪詢……
+
+It exists for a real reason - the process being replaced takes a moment to release
+Telegram's ``getUpdates`` lock, and a second poller on the same token gets "Conflict:
+terminated by other getUpdates request", which is how a restart can finish with no bot
+running. But the wait was **unconditional**, so every restart paid the full six seconds
+**even when the old process had already exited** - which is the usual case.
+
+A single-instance lock answers the question that actually matters - *is the previous instance
+still there?* - and the operating system answers it, releasing the lock when that process dies
+**however it dies**:
+
+| the previous process | old | new |
+| --- | --- | --- |
+| already gone (the usual case) | 6.000s | **~0.00s** |
+| still shutting down | 6.000s | waits only as long as it takes, ceiling still 6s |
+| killed with no chance to clean up | 6.000s | lock released by the OS anyway |
+
+Measured: a replacement started while the old process was still exiting became ready in
+**1.2s** instead of a flat 6s, and with nothing holding the lock it takes it in **0.001s**.
+
+`RESTART_STARTUP_DELAY` is now a **ceiling, not a delay** - it bounds how long a replacement
+will wait for the lock, and it still defaults to 6s so nothing behaves worse than before. A
+normal start from `run.bat` does not set it at all and never waits.
+
+The lock is also released explicitly in a `finally`, not only when the process exits, so a
+replacement started straight after the operator stops the bot does not have to wait for the
+operating system to reap the old one.
+
 ### run.bat now starts the self-hosted server
 
 The server has to be up before the bot, and nothing said so. Without it the bot silently

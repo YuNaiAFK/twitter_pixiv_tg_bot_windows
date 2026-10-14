@@ -171,6 +171,81 @@ def _drop_explains_when_enabled() -> bool:
         bot.AUTHORIZATION.allowed = saved_allowed
 
 
+def _lock_call_uses_the_setting() -> bool:
+    """
+    main() must pass the configured delay to the lock, not a constant.
+
+    Parsed from the source rather than run, because the value only matters while a previous
+    instance is actually holding the lock.
+    """
+    import ast
+    import inspect as _i
+    source = _i.getsource(bot.main)
+    try:
+        tree = ast.parse(source.lstrip())
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "acquire_instance_lock" and node.args):
+            arg = node.args[0]
+            # The argument must be the variable the setting was read into.
+            return isinstance(arg, ast.Name) and arg.id == "await_lock"
+    return False
+
+
+def _lock_acquires_immediately() -> bool:
+    """With nothing holding it, the lock must be taken at once."""
+    import time as _tm
+    try:
+        start = _tm.monotonic()
+        got = bot.acquire_instance_lock(2.0)
+        elapsed = _tm.monotonic() - start
+        bot.release_instance_lock()
+        return got is True and elapsed < 0.5
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _lock_waits_for_the_holder() -> bool:
+    """
+    A second holder must wait, and succeed once the first releases.
+
+    Run in a child process, because the lock is per-process by design: an in-process test
+    would hold it with the same handle and prove nothing.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    import time as _tm
+    try:
+        bot.acquire_instance_lock(2.0)
+    except Exception:  # noqa: BLE001
+        return False
+    child = (
+        "import sys, time; sys.path.append('vendor'); import bot;"
+        "t=time.monotonic(); got=bot.acquire_instance_lock(8.0);"
+        "print(got, round(time.monotonic()-t, 2))"
+    )
+    try:
+        proc = _sp.Popen([_sys.executable, "-c", child], stdout=_sp.PIPE,
+                         stderr=_sp.DEVNULL, text=True, encoding="utf-8")
+        _tm.sleep(1.0)
+        bot.release_instance_lock()
+        out = (proc.communicate(timeout=30)[0] or "").strip()
+    except Exception:  # noqa: BLE001
+        bot.release_instance_lock()
+        return False
+    finally:
+        bot.release_instance_lock()
+    if not out:
+        return False
+    try:
+        got_text, elapsed_text = out.split()
+        return got_text == "True" and float(elapsed_text) >= 0.5
+    except ValueError:
+        return False
+
+
 def _deletion_is_batched() -> bool:
     """
     A long list must be deleted in batches, with a pause between them.
@@ -1921,6 +1996,46 @@ check("a dropped link sends nothing to the chat when notices are off",
 # Python can neither raise nor catch. What the bot controls is how much deletion I/O it
 # issues at once, and emptying a cache in one uninterrupted burst is what drives a storage or
 # filter driver past that limit.
+# --- A restart slept for a fixed six seconds even when nothing was running ---
+
+# RESTART_STARTUP_DELAY made the replacement wait unconditionally, so every /restart paid the
+# full 6s even when the process being replaced had long since exited - the usual case, and the
+# fixed pause visible in the log before anything else happened. A single-instance lock answers
+# the question that matters instead: the OS releases it when the holding process dies, however
+# it dies.
+check("the instance lock is free when nothing holds it",
+      _lock_acquires_immediately(),
+      "a replacement must not wait when there is nothing to wait for")
+check("a held lock makes the next attempt wait, then succeed",
+      _lock_waits_for_the_holder(),
+      "the conflict this exists to avoid is a second poller on one token")
+check("the lock is released explicitly, not only at process exit",
+      # so a replacement started right after the operator stops this one does not have to
+      # wait for the OS to reap the old process.
+      "release_instance_lock()" in inspect.getsource(bot.main),
+      "an explicit release shortens the next start")
+check("a normal start does not wait at all",
+      # Only /restart sets RESTART_STARTUP_DELAY; run.bat does not.
+      "os.getenv(\"RESTART_STARTUP_DELAY\")" in inspect.getsource(bot.main),
+      "the delay must stay opt-in, not applied to every start")
+check("the fixed sleep is gone",
+      # Any sleep in main() before polling is the thing being removed. Naming the exact
+      # variable was too specific: an earlier version of this check searched for
+      # "time.sleep(startup_delay)" and passed against "time.sleep(await_lock)".
+      "time.sleep(" not in inspect.getsource(bot.main),
+      "an unconditional sleep is what cost the six seconds")
+check("the configured delay is what the lock is given",
+      # Not merely that a lock is taken: a hard-coded 0 would take it too, and would ignore
+      # the configured ceiling.
+      _lock_call_uses_the_setting(),
+      "the ceiling must come from RESTART_STARTUP_DELAY")
+check("the lock file is not tracked",
+      ".bot.lock" in (HERE / ".gitignore").read_text(encoding="utf-8"),
+      "runtime state must not be committed")
+check("a bad RESTART_STARTUP_DELAY does not stop the bot",
+      "不是數字，將不等待" in inspect.getsource(bot.main),
+      "a malformed value should fall back, not raise")
+
 check("bulk deletion is batched rather than one burst",
       _deletion_is_batched(),
       "an uninterrupted burst is what the watchdog violation came from")

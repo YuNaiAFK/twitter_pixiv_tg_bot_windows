@@ -162,6 +162,19 @@ RESTART_LOG_MAX_BYTES = env_number("RESTART_LOG_MAX_MB", 2) * 1024 * 1024
 # "Conflict: terminated by other getUpdates request".
 RESTART_STARTUP_DELAY_SECONDS = env_number("RESTART_STARTUP_DELAY", 6, kind=float)
 
+# The single-instance lock, and how long a *replacement* process may wait for it.
+#
+# The lock file is not the lock: the lock is the operating-system lock taken on it, which is
+# released when the holding process exits however it exits. The file itself is kept only
+# because it has to exist to be locked, and it holds the owner's pid to make a stuck start
+# diagnosable.
+INSTANCE_LOCK_FILE = Path(env_text("INSTANCE_LOCK_FILE", str(BASE_DIR / ".bot.lock")))
+_instance_lock_handle = None
+
+# How long to wait for the lock before continuing without it. Only a replacement process
+# waits at all, and it normally gets the lock immediately - see acquire_instance_lock.
+INSTANCE_LOCK_TIMEOUT_SECONDS = env_number("INSTANCE_LOCK_TIMEOUT", 15, kind=float)
+
 # -------------------- Login credentials --------------------
 #
 # Login state for X/Twitter and Pixiv is supplied as Netscape-format cookie files
@@ -2254,6 +2267,106 @@ def pixiv_illust_id(url: str) -> str:
         if query.get(key):
             return str(query[key][0])
     return ""
+
+
+def _instance_lock_path() -> Path:
+    """Where the single-instance lock lives, as an absolute path."""
+    path = INSTANCE_LOCK_FILE
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path
+
+
+def acquire_instance_lock(timeout: float) -> bool:
+    """
+    Claim this bot's single-instance lock, waiting up to ``timeout`` seconds.
+
+    **Why a lock instead of sleeping.** A restart used to wait a fixed
+    ``RESTART_STARTUP_DELAY`` before polling, because the process being replaced takes a
+    moment to release Telegram's ``getUpdates`` lock and a second poller on the same token
+    gets "Conflict: terminated by other getUpdates request". That wait was unconditional, so
+    every restart paid the full six seconds **even when the previous process had already
+    exited** - the usual case, and visible in the log as a fixed pause before anything
+    happens.
+
+    An exclusive file lock answers the real question instead: the operating system releases
+    it when the holding process dies, however it dies, so "the lock is free" means "the
+    previous instance is gone". A restart therefore resumes in well under a second, and still
+    waits - up to the same budget - when the old process really is still shutting down.
+
+    Returns whether the lock was taken. A failure is not fatal: the caller continues, because
+    the worst case is the Conflict this exists to avoid, and a bot that will not start is
+    worse than one that might have to be restarted again.
+    """
+    global _instance_lock_handle
+
+    if timeout <= 0:
+        timeout = 0.0
+    deadline = time.monotonic() + timeout
+    # Short interval: the lock is usually free immediately, and the point is not to linger.
+    interval = 0.1
+    warned = False
+
+    while True:
+        try:
+            handle = open(_instance_lock_path(), "a+b")
+        except OSError as exc:
+            logger.warning("無法建立實例鎖定檔 %s：%s", _instance_lock_path(), exc)
+            return False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Held by the process being replaced. Close and try again shortly.
+            handle.close()
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "前一個程序在 %.0f 秒內仍未釋放鎖定；仍會繼續啟動，"
+                    "若出現 Conflict 請再試一次。", timeout)
+                return False
+            if not warned:
+                logger.info("前一個程序仍在結束中，等待它釋放鎖定……")
+                warned = True
+            time.sleep(interval)
+            continue
+
+        _instance_lock_handle = handle
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{os.getpid()}\n".encode("ascii"))
+            handle.flush()
+        except OSError:
+            pass
+        return True
+
+
+def release_instance_lock() -> None:
+    """Release the single-instance lock, so the next start does not have to wait."""
+    global _instance_lock_handle
+    handle = _instance_lock_handle
+    if handle is None:
+        return
+    _instance_lock_handle = None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
 
 
 def user_is_admin(user_id: int) -> bool:
@@ -7725,17 +7838,23 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("缺少 BOT_TOKEN，請複製 .env.example 為 .env 並填寫 Token。")
 
-    # A replacement process waits before polling, so the process it is replacing has
-    # time to release Telegram's getUpdates lock. Only /restart sets this variable,
-    # so a normal start has no delay.
-    startup_delay = 0.0
-    try:
-        startup_delay = float(os.getenv("RESTART_STARTUP_DELAY", "0") or 0)
-    except ValueError:
-        logger.warning("RESTART_STARTUP_DELAY 不是數字，將忽略。")
-    if startup_delay > 0:
-        logger.info("等待 %.1f 秒讓前一個程序結束後再開始輪詢……", startup_delay)
-        time.sleep(startup_delay)
+    # A replacement process waits for the previous instance to release the single-instance
+    # lock, instead of sleeping for a fixed period.
+    #
+    # The delay used to be unconditional: every /restart paid the full RESTART_STARTUP_DELAY
+    # (6s by default) **even when the old process had already gone**, which is the usual case.
+    # That is the fixed pause visible in the log before anything else happens. Waiting on a
+    # lock asks the question that matters - is the previous instance actually still there? -
+    # and the operating system answers it, releasing the lock when that process dies however
+    # it dies. A normal start from run.bat takes the lock immediately and does not wait at all.
+    await_lock = 0.0
+    raw_lock = (os.getenv("RESTART_STARTUP_DELAY") or "").strip()
+    if raw_lock:
+        try:
+            await_lock = max(0.0, float(raw_lock))
+        except ValueError:
+            logger.warning("RESTART_STARTUP_DELAY=%r 不是數字，將不等待。", raw_lock)
+    acquire_instance_lock(await_lock)
 
     # Ask the active server what it allows before building anything that depends on
     # the answer. Failure is not fatal: the public limits stay in force.
@@ -7841,7 +7960,13 @@ def main():
 
     log_startup_configuration()
     logger.info("機器人已啟動，等待 Telegram 訊息。")
-    application.run_polling(drop_pending_updates=True)
+    try:
+        application.run_polling(drop_pending_updates=True)
+    finally:
+        # Released explicitly rather than left to process exit, so a replacement started
+        # immediately after the operator stops this one does not have to wait for the
+        # operating system to reap it.
+        release_instance_lock()
 
 
 if __name__ == "__main__":
