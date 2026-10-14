@@ -59,6 +59,75 @@ def check(name: str, condition, detail: str = "") -> bool:
     return ok
 
 
+def _concurrent_updates_applied() -> bool:
+    """
+    Build the bot's REAL Application and read back how many updates it will process.
+
+    Calls ``bot.build_application()`` rather than assembling an Application here. The
+    first version of this helper built its own, which meant deleting the
+    ``concurrent_updates`` call from the bot's builder left the test passing - it was
+    asserting on the test's own code. Anything claimed about how this bot dispatches
+    updates has to come through the real builder.
+    """
+    try:
+        app = bot.build_application()
+        return app.update_processor.max_concurrent_updates == bot.MAX_CONCURRENT_UPDATES
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _stop_cancels_running_job() -> bool:
+    """
+    Drive the REAL Application's update processor: block a job, press stop, and see
+    whether the job observes the flag.
+
+    This is the end-to-end assertion the whole change exists for - it exercises PTB's
+    dispatch and bot's stop registry together, through the application the bot actually
+    builds. A regression in either (the concurrency limit dropped, or the flag not
+    readable) fails here.
+
+    Asserts the flag is seen BEFORE the job would have finished, because a flag that is
+    only set after completion is exactly the original bug.
+    """
+    import asyncio
+    import threading
+    try:
+        app = bot.build_application()
+        processor = app.update_processor
+
+        async def scenario():
+            chat_id = 987654321
+            stop_event = threading.Event()
+            bot.register_running_stop(chat_id, stop_event)
+            asked = {}
+
+            async def job():
+                # Stands in for the parallel page fetch: bounded work that checks the flag.
+                for _ in range(500):
+                    if stop_event.is_set():
+                        asked["stopped_early"] = True
+                        return
+                    await asyncio.sleep(0.005)
+
+            async def press():
+                asked["answer"] = bot.stop_running_download(chat_id)
+
+            try:
+                running = asyncio.create_task(processor.process_update("u1", job()))
+                await asyncio.sleep(0.05)
+                stop = asyncio.create_task(processor.process_update("u2", press()))
+                await asyncio.sleep(0.05)
+                await asyncio.gather(running, stop, return_exceptions=True)
+            finally:
+                bot.register_running_stop(chat_id, None)
+
+            return bool(asked.get("answer")) and bool(asked.get("stopped_early"))
+
+        return asyncio.run(scenario())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 print("=== 1. Public surface: configuration constants ===")
 # A refactor that drops a constant used only from a rarely-taken branch is a latent
 # crash, so the whole set is pinned.
@@ -637,6 +706,46 @@ check("the stop button re-checks the presser",
       < inspect.getsource(bot.handle_gallery_callback).index('mode == "stop"'),
       "any chat member could kill someone else's download")
 
+# --- The 停止 button could not be dispatched at all ---
+
+# PTB processes ONE update at a time by default, and a button press IS an update. While a
+# long download held the single slot the press was never dispatched, so it could not set
+# the stop flag until after the download had finished and cleared it. Reproduced against
+# PTB's own update processor: with the default the stop handler is never reached while a
+# handler blocks; with a limit above one it is reached at once.
+_builder_src = inspect.getsource(bot.build_application)
+check("more than one update is processed at a time",
+      "concurrent_updates(" in _builder_src,
+      "one update at a time means the stop press is never dispatched")
+check("the update concurrency limit is bounded",
+      1 <= bot.MAX_CONCURRENT_UPDATES <= 32,
+      f"MAX_CONCURRENT_UPDATES={bot.MAX_CONCURRENT_UPDATES}")
+check("PTB actually reports the raised limit",
+      _concurrent_updates_applied(),
+      "setting it on the builder is not the same as it taking effect")
+check("heavy gallery work is bounded across all chats",
+      "gallery_semaphore" in inspect.getsource(bot.run_gallery_action)
+      and 1 <= bot.MAX_CONCURRENT_GALLERY_JOBS <= 16,
+      "per-request worker pools would otherwise multiply: "
+      f"MAX_CONCURRENT_GALLERY_JOBS={bot.MAX_CONCURRENT_GALLERY_JOBS}")
+check("a busy bot refuses immediately instead of holding an update slot",
+      # A job parked on the semaphore is still inside its handler. Measured: with six jobs
+      # submitted, every update slot was held by a job doing nothing and a stop press was
+      # not dispatched until one finished. Not waiting is what keeps the button alive.
+      ".locked()" in inspect.getsource(bot.run_gallery_action)
+      and "async with gallery_semaphore" not in
+      inspect.getsource(bot.run_gallery_action),
+      "waiting for a slot holds the update slot the stop press needs")
+check("the gallery slot is released on every path",
+      "gallery_semaphore.release()" in inspect.getsource(bot.run_gallery_action),
+      "a leaked slot would eventually refuse every request")
+check("cancelling never waits behind the work it cancels",
+      "gallery_semaphore" not in inspect.getsource(bot.handle_gallery_callback),
+      "the stop branch must not be behind admission control")
+check("a stop press actually cancels a running job",
+      _stop_cancels_running_job(),
+      "the whole point: the handler must observe the flag the press set")
+
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
 # handed to e-hentai. Measured before the fix: 1707 chars, 8 foreign cookies.
@@ -754,9 +863,12 @@ check("a timed-out single send is not retried either",
       "the same reasoning applies to a single file: a public bot can redeliver twice")
 # The underlying cause: PTB defaults are read/write 5s, pool 1s, media write 20s, and a
 # self-hosted server needs longer because it relays the upload to Telegram itself.
-_main_src = inspect.getsource(bot.main)
+# Asserted against the builder function, not main(): the builder was extracted so the
+# real Application can be inspected, and main() no longer holds these settings.
+_builder_src = inspect.getsource(bot.build_application)
 check("the request timeouts are raised above PTB's 5s defaults",
-      "media_write_timeout" in _main_src and "TELEGRAM_TIMEOUT_SECONDS" in _main_src,
+      "media_write_timeout" in _builder_src
+      and "TELEGRAM_TIMEOUT_SECONDS" in _builder_src,
       "a 5s read timeout is what fired in the first place")
 _httpx_sig = inspect.signature(__import__("telegram.request",
                                           fromlist=["HTTPXRequest"]).HTTPXRequest.__init__)

@@ -596,6 +596,43 @@ logger = logging.getLogger("twitter_pixiv_bot")
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 last_request_time = {}
 
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 64) -> int:
+    """Read a bounded integer from the environment, falling back on anything unusable."""
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        logger.warning("%s 不是數字，改用預設值 %s", name, default)
+        return default
+    return max(minimum, min(maximum, value))
+
+
+# How many updates may be processed at once.
+#
+# **This is what makes the 停止 button work.** python-telegram-bot defaults to one update
+# at a time, and a button press is itself an update - so while a long download ran, the
+# press sat in the queue and was not dispatched until that download had already finished
+# and cleared the stop flag. Reproduced directly against PTB's update processor: with the
+# default the stop handler is never reached while the download blocks; with a limit above
+# one it runs immediately.
+#
+# Each update therefore gets its own slot, and a slow request no longer freezes every
+# other user either.
+MAX_CONCURRENT_UPDATES = _env_int("MAX_CONCURRENT_UPDATES", 4, 1, 32)
+
+# Heavy e-hentai work allowed to run at once, counted across ALL chats.
+#
+# Needed *because* updates are now concurrent: each request builds its own
+# ThreadPoolExecutor (EHENTAI_VIEWER_WORKERS, EHENTAI_ARCHIVE_WORKERS,
+# EHENTAI_DOWNLOAD_WORKERS), and those pools were sized against strictly serial
+# execution. Four concurrent updates without this would multiply the worker threads and
+# the memory they hold, so concurrency alone would trade one availability problem for
+# another. The pools stay as they are; this bounds how many of them exist at once.
+#
+# Deliberately low. It is a resource bound, not a throughput target.
+MAX_CONCURRENT_GALLERY_JOBS = _env_int("MAX_CONCURRENT_GALLERY_JOBS", 2, 1, 16)
+gallery_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GALLERY_JOBS)
+
 # Set once when Pillow is missing, so the warning is not logged per photo.
 _pillow_unavailable = False
 
@@ -4139,14 +4176,20 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
         if not guard.ok:
             await query.answer(busy_message(user.id), show_alert=True)
             return
-        await run_gallery_action(query, message, user, mode, gallery_url)
+        await run_gallery_action(query, message, user, mode, gallery_url, gid, token)
 
     return
 
 
 async def run_gallery_action(query, message, user, mode: str,
-                             gallery_url: str) -> None:
-    """Do the chosen gallery work. See handle_gallery_callback."""
+                             gallery_url: str, gid: str, token: str) -> None:
+    """Do the chosen gallery work. See handle_gallery_callback.
+
+    ``gid`` and ``token`` are passed rather than re-parsed out of ``gallery_url``: the
+    caller already has them from the callback data, and the waiting message needs them to
+    render a 停止 button. Re-deriving them would be a second chance to get the URL format
+    wrong for no benefit.
+    """
     await query.answer()
     # The menu has served its purpose once an action is chosen.
     try:
@@ -4162,43 +4205,81 @@ async def run_gallery_action(query, message, user, mode: str,
     }[mode]
     status = await send_status(message, f"已選擇「{label}」，開始處理……")
 
-    temp_dir = make_work_dir()
-    try:
-        # The gallery's facts come from the cache when present. The URL sweep is
-        # cached separately inside run_gallery_images, since that is the slow part.
-        cached = PARSE_CACHE.lookup(gallery_url, kind="gallery")
-        gallery = gallery_from_payload(cached) if cached else None
-        if gallery is None:
-            gallery = await asyncio.to_thread(
-                ehentai.fetch_gallery,
-                gallery_url,
-                cookies_path=resolve_ehentai_cookies(),
-                timeout=float(EHENTAI_TIMEOUT_SECONDS),
+    # Admission control: take a slot **without waiting**, or turn the request away.
+    #
+    # Waiting here was the first thing tried, and measuring it showed why it is wrong. A
+    # job parked on the semaphore is still inside its handler, and a handler occupies one
+    # of the MAX_CONCURRENT_UPDATES slots the whole time it waits. Measured with six jobs
+    # submitted: every update slot was held by a job doing nothing, and a stop press was
+    # **not dispatched** until one of them finished - the same dead button, moved to a
+    # different trigger. Not waiting means no update slot is ever held by a job that has
+    # not started, so cancelling and other users stay responsive.
+    #
+    # The cost is that a third simultaneous request is refused rather than queued. That is
+    # the honest trade for a public bot: "busy, try again" beats a frozen bot, and the
+    # refusal is immediate instead of arriving minutes later.
+    if gallery_semaphore.locked():
+        slot_taken = False
+        logger.info("畫廊同時處理數已滿（%s），婉拒 %s",
+                    MAX_CONCURRENT_GALLERY_JOBS, gallery_url)
+        try:
+            await status.edit_text(
+                f"目前同時有其他下載在進行（最多 {MAX_CONCURRENT_GALLERY_JOBS} 個），"
+                "請稍後再按一次。\n\n" + build_caption(gallery_url),
+                link_preview_options=source_link_options(),
             )
-            await asyncio.to_thread(remember_gallery, gallery_url, gallery)
-        source_note = build_caption(gallery_url)
+        except TelegramError:
+            pass
+    else:
+        await gallery_semaphore.acquire()
+        slot_taken = True
 
-        if mode in {"view", "orig"}:
-            await run_gallery_images(
-                message, status, gallery, mode, temp_dir, source_note, user
+    if not slot_taken:
+        return
+
+    try:
+        temp_dir = make_work_dir()
+        try:
+            # The gallery's facts come from the cache when present. The URL sweep is
+            # cached separately inside run_gallery_images, since that is the slow part.
+            cached = PARSE_CACHE.lookup(gallery_url, kind="gallery")
+            gallery = gallery_from_payload(cached) if cached else None
+            if gallery is None:
+                gallery = await asyncio.to_thread(
+                    ehentai.fetch_gallery,
+                    gallery_url,
+                    cookies_path=resolve_ehentai_cookies(),
+                    timeout=float(EHENTAI_TIMEOUT_SECONDS),
+                )
+                await asyncio.to_thread(remember_gallery, gallery_url, gallery)
+            source_note = build_caption(gallery_url)
+
+            if mode in {"view", "orig"}:
+                await run_gallery_images(
+                    message, status, gallery, mode, temp_dir, source_note, user
+                )
+            else:
+                await run_gallery_archive(
+                    message, status, gallery, mode, temp_dir, source_note
+                )
+        except ehentai.EhentaiError as exc:
+            logger.warning("畫廊按鈕處理失敗：%s（%s）| %s", gallery_url, exc,
+                           admin_hint(None))
+            await status.edit_text(
+                f"處理失敗：{exc}\n\n{build_caption(gallery_url)}",
+                link_preview_options=source_link_options())
+        except Exception:
+            logger.exception("畫廊按鈕處理發生未預期錯誤：%s", gallery_url)
+            await status.edit_text(
+                "處理時發生錯誤，請稍後再試。\n\n" + build_caption(gallery_url),
+                link_preview_options=source_link_options(),
             )
-        else:
-            await run_gallery_archive(
-                message, status, gallery, mode, temp_dir, source_note
-            )
-    except ehentai.EhentaiError as exc:
-        logger.warning("畫廊按鈕處理失敗：%s（%s）| %s", gallery_url, exc,
-                       admin_hint(None))
-        await status.edit_text(f"處理失敗：{exc}\n\n{source_note}",
-                               link_preview_options=source_link_options())
-    except Exception:
-        logger.exception("畫廊按鈕處理發生未預期錯誤：%s", gallery_url)
-        await status.edit_text(
-            "處理時發生錯誤，請稍後再試。\n\n" + build_caption(gallery_url),
-            link_preview_options=source_link_options(),
-        )
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # Released on every path, including the exceptions above: a slot that is never
+        # returned would eventually refuse every request.
+        gallery_semaphore.release()
 
 
 async def run_gallery_images(message, status, gallery, mode: str,
@@ -6197,6 +6278,75 @@ def can_upload_by_path() -> bool:
     return LOCAL_API_SERVER and SERVER_CAN_UPLOAD_BY_PATH
 
 
+def build_application() -> Application:
+    """
+    Build the Application with every setting this bot depends on.
+
+    Extracted from ``main()`` so that the configuration can be inspected by building the
+    real thing, rather than by a test constructing its own Application and thereby
+    checking the test instead of the bot.
+
+    That distinction caught a real gap: the first version of the tests for the 停止 button
+    built their own Application with ``concurrent_updates``, so removing the call from
+    ``main()`` - the actual regression - left them all passing. Anything asserted about
+    how this bot dispatches updates has to come through here.
+    """
+    builder = Application.builder().token(BOT_TOKEN)
+    if telegram_base_url():
+        # Points every request at the self-hosted server. api.telegram.org stays the
+        # default when TELEGRAM_API_BASE is unset.
+        builder = builder.base_url(telegram_base_url())
+
+    # Process more than one update at a time.
+    #
+    # **THIS IS THE FIX FOR THE DEAD 停止 BUTTON**, and it is one line whose absence made
+    # a control silently do nothing. PTB defaults to a single update at a time, and a
+    # button press IS an update: while a long download held the only slot, the press was
+    # never dispatched, so it could not set the stop flag until the download had already
+    # finished and cleared it. Reproduced against PTB's own update processor before
+    # changing anything - with the default the stop handler is never reached while a
+    # download blocks; with a limit above one it is reached at once.
+    #
+    # It also removes a denial of service: one 15-minute request used to freeze every
+    # other user, not just the stop button. The resource cost is bounded separately by
+    # ``gallery_semaphore``, because the per-request worker pools were sized against
+    # serial execution and would otherwise multiply.
+    builder = builder.concurrent_updates(MAX_CONCURRENT_UPDATES)
+
+    # Timeouts are raised well above PTB's defaults, which are 5.0s for read, write and
+    # connect, 1.0s for pool, and 20.0s for a media write.
+    #
+    # THIS IS THE FIX FOR A REPORTED DUPLICATION BUG. With a self-hosted server the
+    # upload does not finish when the HTTP request does: the server takes the file
+    # straight from disk and pushes it to Telegram itself, over MTProto - which on this
+    # network is relayed through a SOCKS5 proxy. A 5.5 MB album therefore needs several
+    # seconds of work upstream *after* the request body has been written, so the 5s
+    # read timeout fired, the send looked failed, and the fallback delivered the same
+    # artwork again.
+    #
+    # media_write_timeout is set separately and matters: PTB applies it to the upload
+    # itself and its default is 20s, which is already longer than read_timeout but still
+    # short for a large archive over a throttled relay.
+    #
+    # Raising the ceiling does not slow anything down: a timeout is an upper bound, and a
+    # normal send returns as soon as it is done.
+    request_timeout = max(1.0, float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "180") or 180))
+    request_kwargs = dict(
+        read_timeout=request_timeout,
+        write_timeout=request_timeout,
+        connect_timeout=min(request_timeout, 30.0),
+        pool_timeout=30.0,
+        media_write_timeout=request_timeout,
+    )
+    builder = builder.get_updates_request(
+        HTTPXRequest(**request_kwargs)
+    ).request(
+        HTTPXRequest(**request_kwargs)
+    )
+
+    return builder.post_init(post_init).build()
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in {"--check", "--selfcheck"}:
         raise SystemExit(run_self_check())
@@ -6254,48 +6404,7 @@ def main():
     # at worst and runs before polling begins.
     sweep_stale_work_dirs()
 
-    builder = Application.builder().token(BOT_TOKEN)
-    if telegram_base_url():
-        # Points every request at the self-hosted server. api.telegram.org stays the
-        # default when TELEGRAM_API_BASE is unset.
-        builder = builder.base_url(telegram_base_url())
-
-    # Timeouts are raised well above PTB's defaults, which are 5.0s for read, write and
-    # connect, 1.0s for pool, and 20.0s for a media write.
-    #
-    # THIS IS THE FIX FOR A REPORTED DUPLICATION BUG. With a self-hosted server the
-    # upload does not finish when the HTTP request does: the server takes the file
-    # straight from disk and pushes it to Telegram itself, over MTProto - which on this
-    # network is relayed through a SOCKS5 proxy. A 5.5 MB album therefore needs several
-    # seconds of work upstream *after* the request body has been written, so the 5s
-    # read timeout fired, the send looked failed, and the fallback delivered the same
-    # artwork again.
-    #
-    # media_write_timeout is set separately and matters: PTB applies it to the upload
-    # itself and its default is 20s, which is already longer than read_timeout but still
-    # short for a large archive over a throttled relay.
-    #
-    # Raising the ceiling does not slow anything down: a timeout is an upper bound, and a
-    # normal send returns as soon as it is done.
-    request_timeout = max(1.0, float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "180") or 180))
-    request_kwargs = dict(
-        read_timeout=request_timeout,
-        write_timeout=request_timeout,
-        connect_timeout=min(request_timeout, 30.0),
-        pool_timeout=30.0,
-        media_write_timeout=request_timeout,
-    )
-    builder = builder.get_updates_request(
-        HTTPXRequest(**request_kwargs)
-    ).request(
-        HTTPXRequest(**request_kwargs)
-    )
-
-    application = (
-        builder
-        .post_init(post_init)
-        .build()
-    )
+    application = build_application()
 
     # Registered first, so no handler's failure can go unreported.
     application.add_error_handler(on_error)

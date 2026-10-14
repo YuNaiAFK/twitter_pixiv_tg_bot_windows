@@ -1426,15 +1426,56 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### The 停止 button did nothing, and the reason was one missing line
+
+PTB processes **one update at a time** by default, and a button press is an update. While a
+long download held the single slot, the press was never dispatched, so it could not set the
+stop flag until the download had already finished and cleared it. The message the user got
+was "目前沒有進行中的下載" - while the download was still running.
+
+Reproduced against PTB's own update processor before changing anything:
+
+    current (1 at a time)      stop dispatched while download ran: False
+    concurrent_updates(4)      stop dispatched while download ran: True
+
+The fix is `concurrent_updates(MAX_CONCURRENT_UPDATES)`, which also removes a denial of
+service: one 15-minute request used to freeze **every** other user, not just the button.
+
+#### The first attempt at admission control was wrong, and measuring showed it
+
+Concurrency alone would multiply the per-request worker pools, which were sized against
+serial execution, so heavy gallery work is bounded by `gallery_semaphore`. The first version
+made a request **wait** for a slot. Measured with six jobs submitted:
+
+    stop dispatched while 6 jobs queued: False
+    peak concurrent heavy jobs: 2 (bound is 2)
+
+A job parked on the semaphore is still inside its handler, and a handler holds one of the
+`MAX_CONCURRENT_UPDATES` slots for the whole wait - so every slot was occupied by a job doing
+nothing, and the stop press was not dispatched until one finished. **The same dead button,
+moved to a different trigger.** The code now takes the slot without waiting and refuses a
+third request immediately:
+
+    stop dispatched while others run/queue : True
+    peak concurrent jobs : 2 (bound 2)
+    served / refused     : 2 / 4
+
+"Busy, try again" beats a frozen bot, and the refusal arrives at once instead of minutes
+later.
+
+#### The tests for this were wrong first, too
+
+The initial tests built their **own** `Application` with `concurrent_updates`, so deleting the
+call from the bot left them all passing - they were asserting on the test's code, not the
+bot's. That is why `build_application()` now exists: it is the one place the Application is
+assembled, and the tests go through it. Removing the line now fails three checks, including
+the end-to-end one that presses stop and asserts the running job observes the flag.
+
+### The official archive has no total bound (still open)
+
 #### Known and NOT fixed
-- **One update is processed at a time.** PTB's default is `max_concurrent_updates=1`, and
-  `.concurrent_updates()` is never called, so a single long request (up to 15 minutes for
-  an e-hentai fallback) blocks every other user. **The 停止 button is therefore also
-  ineffective during a long operation**: the button press is itself an update, so it is not
-  dispatched until the blocking handler finishes, by which time the stop flag has been
-  cleared. Raising concurrency is the fix, and it is not a one-line change — the per-request
-  worker pools and shared state were sized against serial execution, so it needs its own
-  pass rather than being bolted on during an audit.
+- **The official-archive download has no total size or wall-clock bound** (still open;
+  see below).
 - **The official-archive download has no total size or wall-clock bound.** It is bounded
   per read (300s) but a hostile or mis-sized `Content-Range` drives `truncate()`. A cap is
   worth adding before the bot is given a large disk.
