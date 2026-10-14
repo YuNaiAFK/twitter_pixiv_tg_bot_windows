@@ -1426,6 +1426,63 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+## Windows shows "Open File - Security Warning" every time
+
+Double-clicking `run.bat` (or a shortcut to it) prompts:
+
+    打开文件 - 安全警告
+    你要打开此文件吗？
+    发行商: 未知发布者
+    来自 Internet 的文件可能对你有所帮助，但此文件类型可能危害你的计算机。
+
+**The cause is not a zone mark.** Verified absent on this machine: no `Zone.Identifier`
+stream (checked with `dir /r` and the `FindFirstStreamW` API), SmartScreen off
+(`SmartScreenEnabled=off`, `EnableSmartScreen=0`), Smart App Control off
+(`VerifiedAndReputablePolicyState=0`), no AppLocker/WDAC policy, D: is a local NTFS drive
+with no reparse points or cloud sync.
+
+### What it actually is
+
+The project folder carries an **inheritable Low integrity label**:
+
+    D:\TG_Bot\twitter_pixiv_tg_bot_windows
+      Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)
+
+`(OI)(CI)` makes it inherit to every file, so all 746+ files were `Low Mandatory Level`.
+Low integrity is the level sandboxes and browsers write at, so Windows treats those files as
+untrusted and warns before running them - **without needing a zone mark**. It is a second,
+independent mechanism, which is why searching for a zone mark found nothing.
+
+Confirm it with:
+
+    icacls "D:\TG_Bot\twitter_pixiv_tg_bot_windows"
+
+### The fix
+
+An **Administrator** PowerShell, once:
+
+    icacls "D:\TG_Bot\twitter_pixiv_tg_bot_windows" /setintegritylevel m /t /c
+
+To undo it:
+
+    icacls "D:\TG_Bot\twitter_pixiv_tg_bot_windows" /setintegritylevel l /t /c
+
+A non-elevated attempt changes only some files (139 of 3703 here) and reports
+`Access is denied` for the rest, so elevation is required. After the fix every file reads
+`Medium Mandatory Level`, and the bot's cache, archive cache and download directories were
+re-tested as writable.
+
+### If it comes back
+
+The label can return when the project is copied or extracted again. Check with the `icacls`
+command above and re-apply.
+
+Also worth checking, since it produces a very similar prompt: **火绒安全软件** (Huorong
+Security) was installed on this machine with `HipsDaemon` running. Its HIPS module intercepts
+script execution and shows an unknown-publisher warning of its own. If the integrity label is
+already `Medium` and the prompt persists, add the project folder to its trust list
+(防護中心 → 信任區 → 新增資料夾).
+
 ### A restart left no window, and every start waited six seconds
 
 Two symptoms with **one root cause**, which is why they are together.
