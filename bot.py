@@ -807,19 +807,78 @@ ARCHIVE_CACHE_ENABLED = env_text("ARCHIVE_CACHE", "1").lower() not in {"0", "fal
 GALLERY_URL_TTL_SECONDS = env_number("GALLERY_URL_TTL_SECONDS", 2 * 3600)
 
 
+# Hosts this bot fetches, and every alias that serves the same content. Verified against the
+# live sites rather than assumed:
+#
+#     https://twitter.com/...  -> 301 -> https://x.com/...        (same post)
+#     https://pixiv.net/...    -> 301 -> https://www.pixiv.net/... (same artwork)
+#     https://www.e-hentai.org/... -> 302 -> https://e-hentai.org/... (same gallery)
+#     http://...               -> 301 -> https://...              (same resource)
+#
+# So all these forms reach one resource, and treating them as different produced a second
+# download and a second cache entry for one link. The table is explicit rather than
+# rule-based because the canonical form differs per site: pixiv's is the `www` one.
+_HOST_CANONICAL = {
+    "twitter.com": "x.com",
+    "www.twitter.com": "x.com",
+    "www.x.com": "x.com",
+    "x.com": "x.com",
+    "pixiv.net": "www.pixiv.net",
+    "www.pixiv.net": "www.pixiv.net",
+    "e-hentai.org": "e-hentai.org",
+    "www.e-hentai.org": "e-hentai.org",
+    "exhentai.org": "e-hentai.org",
+    "www.exhentai.org": "e-hentai.org",
+}
+
+# Every alias above is http->https for these, so an http link is upgraded.
+_FIRST_PARTY_HOSTS = frozenset(_HOST_CANONICAL)
+
+
+def canonical_host(host: str) -> str:
+    """
+    Reduce a host to the form this bot treats as canonical.
+
+    A known alias resolves through the table above - which is where the erasure of
+    ``exhentai.org`` into ``e-hentai.org`` happens, because the two serve one gallery and
+    caching them separately meant neither entry was reused.
+
+    An unknown host is returned unchanged apart from a leading ``www.``, which is dropped
+    only when the remainder is a host the bot already accepts. Nothing else can be renamed,
+    so a host outside the supported set is never guessed at.
+    """
+    host = (host or "").lower().rstrip(".")
+    if host in _HOST_CANONICAL:
+        return _HOST_CANONICAL[host]
+    if host.startswith("www.") and host[4:] in _FIRST_PARTY_HOSTS:
+        return _HOST_CANONICAL[host[4:]]
+    return host
+
+
 def normalize_cache_key(url: str) -> str:
     """
     The key a parse is stored under.
 
-    The URL is already cleaned by the time it arrives, so this only removes the
-    parts that do not change which artwork is meant - a query string or fragment
-    such as `?s=20` or `#comments`. Without that, the same artwork reached through
-    two links would be downloaded twice.
+    Removes the parts that do not change which resource is meant - a query string or
+    fragment such as `?s=20` or `#comments`, a trailing slash, and the host aliases listed
+    above. Without that canonicalisation the same post reached through two links was
+    downloaded twice and cached twice.
+
+    **This function is the single source of truth for cache identity**, so the media and
+    gallery paths get the same answer. The media cache had no canonicalisation of its own
+    beyond this, so `twitter.com` and `x.com` links to one post were two separate entries
+    with two separate copies of the same files on disk.
     """
     parsed = urlparse(url)
     if not parsed.scheme or not parsed.netloc:
         return url.strip()
-    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+    host = canonical_host(parsed.netloc)
+    # http is upgraded because every supported host redirects it to https. Restricted to
+    # the known hosts, so an http-only site is not rewritten into an unreachable URL.
+    scheme = parsed.scheme.lower()
+    if scheme == "http" and host in _FIRST_PARTY_HOSTS:
+        scheme = "https"
+    return f"{scheme}://{host}{parsed.path.rstrip('/')}"
 
 
 class ParseCache:
@@ -1171,6 +1230,79 @@ def media_cache_payload(files: list[Path], url: str) -> dict:
     return {"files": names}
 
 
+def orphaned_cache_files() -> list[Path]:
+    """
+    Cache files that no cache entry refers to any more.
+
+    These accumulate whenever a URL is re-cached with a different file set: the media
+    cache names files ``<url hash>_<index><suffix>``, so a re-parse that yields fewer pages
+    - or the same pages in a different format - indexes the new names and abandons the old
+    ones. ``store()`` replaces the whole entry, so nothing is left pointing at them and
+    nothing ever deletes them. They survive ``/cache clear`` only because that clears the
+    index too, and otherwise sit on disk until the entry happens to be pruned with them.
+
+    Bounded in practice by the cache's entry limit, but it is a leak, and the fix is cheap
+    because the index is the complete list of what is legitimate.
+    """
+    try:
+        cache_root = CACHE_DIR.resolve()
+    except OSError:
+        return []
+
+    referenced: set[str] = set()
+    for entry in PARSE_CACHE.entries.values():
+        for name in (entry.get("payload") or {}).get("files") or []:
+            if isinstance(name, str):
+                referenced.add(name)
+
+    orphans: list[Path] = []
+    try:
+        candidates = list(CACHE_DIR.glob("*"))
+    except OSError:
+        return []
+    for path in candidates:
+        try:
+            # Direct children of the cache directory only: the archive cache lives in a
+            # subdirectory and manages its own entries.
+            if not path.is_file() or path.parent.resolve() != cache_root:
+                continue
+        except OSError:
+            continue
+        name = path.name
+        # The index is the complete list of what is legitimate, so a referenced name is
+        # never touched.
+        if name in referenced:
+            continue
+        # A leftover from an interrupted atomic write is garbage too, and is named with the
+        # ".part" suffix rather than by the generator. Anything else must look like a name
+        # this bot writes, so a stray file dropped in the directory is left alone.
+        if name.endswith(".part") or cache_file_path(name) is not None:
+            orphans.append(path)
+    return orphans
+
+
+def prune_orphaned_cache_files() -> int:
+    """
+    Delete cache files that no entry refers to. Returns how many were removed.
+
+    Never raises: housekeeping must not fail a request that already succeeded.
+    """
+    removed = 0
+    freed = 0
+    for path in orphaned_cache_files():
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            removed += 1
+            freed += size
+        except OSError:
+            continue
+    if removed:
+        logger.info("清除 %s 個沒有索引的快取檔案（%s）", removed,
+                    ehentai.format_filesize(freed))
+    return removed
+
+
 def remember_media_parse(url: str, files: list[Path]) -> None:
     """
     Cache a successful media parse, then keep the cache bounded.
@@ -1187,6 +1319,10 @@ def remember_media_parse(url: str, files: list[Path]) -> None:
         removed = PARSE_CACHE.prune()
         if removed:
             logger.info("解析快取清除 %s 筆過期項目", removed)
+    # Storing replaces the entry, so a parse that produced a different file set has just
+    # orphaned the previous one's files. This is the write path, so they are reclaimed at
+    # the moment they become unreachable rather than never.
+    prune_orphaned_cache_files()
     PARSE_CACHE.save()
 
 
@@ -1379,11 +1515,13 @@ def gallery_cache_key(url: str, gallery=None) -> str:
 
     So submitting an exhentai link and then pressing a button produced a cache miss, and
     the second entry - written by the button's own ``remember_gallery`` under
-    ``gallery.page_url`` - never satisfied the first. Whichever host a gallery is first seen
-    through, only that one entry was ever reused.
+    ``gallery.page_url`` - never satisfied the first. Whichever host a gallery was first
+    seen through, only that one entry was ever reused.
 
-    Keying on ``gid``/``token`` removes the host from the identity entirely, which also
-    collapses the query-string, trailing-slash and pagination variants of the same URL.
+    Host aliases are already collapsed by :func:`canonical_host`, so ``normalize_cache_key``
+    would do here; the ``gid``/``token`` form is used instead because it is the gallery's
+    actual identity and also collapses the ``?p=N`` pagination variants that a URL-only key
+    keeps.
     """
     gid = getattr(gallery, "gid", "") or ""
     token = getattr(gallery, "token", "") or ""
@@ -1392,6 +1530,7 @@ def gallery_cache_key(url: str, gallery=None) -> str:
     match = re.search(r"/(?:g|gallery)/(\d+)/([0-9a-zA-Z]+)", url or "")
     if match:
         return f"https://e-hentai.org/g/{match.group(1)}/{match.group(2)}/"
+    # Falls back to the general normaliser, which already erases the host aliases.
     return normalize_cache_key(url)
 
 
@@ -1454,6 +1593,10 @@ def remember_gallery(url: str, gallery, image_urls=None) -> None:
         removed = PARSE_CACHE.prune()
         if removed:
             logger.info("解析快取清除 %s 筆過期項目", removed)
+    # Reclaims files an earlier store orphaned. Galleries write no files of their own, but
+    # the same URL can be cached as both a gallery and a media item, and the media side is
+    # where the files come from.
+    prune_orphaned_cache_files()
     PARSE_CACHE.save()
 
 
@@ -6852,11 +6995,16 @@ def main():
     else:
         logger.warning("Bot API 來源：%s", api_info.get("detail"))
 
-    # Clear staging directories abandoned by earlier runs. Housekeeping only - it is
-    # wrapped internally and never raises, so it cannot stop the bot starting. Called
-    # synchronously because main() is not a coroutine; it does a few thousand stat calls
-    # at worst and runs before polling begins.
+    # Clear staging directories abandoned by earlier runs, and cache files nothing points
+    # at any more. Housekeeping only - wrapped internally and never raising, so neither can
+    # stop the bot starting. Called synchronously because main() is not a coroutine; both
+    # are a few thousand stat calls at worst and run before polling begins.
     sweep_stale_work_dirs()
+    try:
+        prune_orphaned_cache_files()
+        prune_archive_cache()
+    except Exception:  # noqa: BLE001
+        logger.debug("啟動清理時發生問題", exc_info=True)
 
     application = build_application()
 

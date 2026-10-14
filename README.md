@@ -1426,6 +1426,66 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### Cache audit: two more ways one resource was cached twice
+
+Following the archive-cache report, every cache in the codebase was checked for the same
+class of defect - a store and a lookup that do not agree on the key. Two more were real.
+
+#### Host aliases were separate cache entries
+
+`normalize_cache_key` lowercased the scheme and host and dropped the query, fragment and
+trailing slash, but it did not know that some hosts are the same site. Verified against the
+live sites rather than assumed:
+
+    https://twitter.com/...      -> 301 -> https://x.com/...          (same post)
+    https://pixiv.net/...        -> 301 -> https://www.pixiv.net/...  (same artwork)
+    https://www.e-hentai.org/... -> 302 -> https://e-hentai.org/...   (same gallery)
+    http://...                   -> 301 -> https://...                (same resource)
+
+The media cache has no canonicalisation of its own beyond this function, so a post reached
+through `twitter.com` and then `x.com` was **two entries with two copies of the same files
+on disk**. Six forms of one tweet now collapse to one key:
+
+    https://x.com/u/status/1          \
+    https://twitter.com/u/status/1     |
+    https://www.x.com/u/status/1       |  all ->  https://x.com/u/status/1
+    http://twitter.com/u/status/1      |
+    https://twitter.com/u/status/1?s=20|
+    https://x.com/u/status/1/         /
+
+The alias table is explicit rather than rule-based, because the canonical form differs per
+site - pixiv's is the `www` one - and because **a host outside the supported set must never
+be renamed**. A suffix match would have merged `notx.com` with `x.com`; a test pins that it
+does not.
+
+#### Files an earlier store orphaned were never reclaimed
+
+The media cache names files `<url hash>_<index><suffix>`. `store()` replaces the whole
+entry, so a re-parse that produced a different file set - fewer pages, or the same pages in
+a different format - indexed the new names and abandoned the old ones, which nothing then
+deleted. The measured cache had no orphans, so this had not bitten yet; the mechanism was
+there.
+
+`orphaned_cache_files()` treats the index as the complete list of what is legitimate and
+removes the rest, at the moment they become unreachable (the write path) and once at
+startup for anything written before this existed. It is deliberately narrow, and the test
+asserts the dangerous direction: the live files, the archive cache in its subdirectory, and
+an unrelated file dropped in the cache directory all survive.
+
+#### Checked and found sound
+
+- **`ParseCache.store`/`lookup`/`age` all key through `normalize_cache_key`**, so they agree
+  by construction; the defects above were all in *what* the key was given.
+- **The viewer-URL TTL gate is correct at both boundaries** (7195s reuses, 7205s refreshes),
+  and `GALLERY_URL_TTL_SECONDS` (2h) is properly shorter than `CACHE_STALE_SECONDS` (14d) -
+  the signed URLs expire long before the entry that carries them.
+- **The archive cache is hit before the resolve**, so the 3s round trip is saved too.
+- **`_regenerate_cache`** is bounded (200) and keyed by `(chat, user)`, so one person cannot
+  regenerate another's page.
+- **`_requests_in_flight`** is bounded to one entry per user and popped by `end_request`.
+- **A gallery entry cannot be overwritten by a media entry**: e-hentai URLs never reach the
+  media store, which is only called from the X/Pixiv handler.
+
 ### The e-hentai archive cache did not work: one gallery was stored twice
 
 Reported as "归档下载快取功能没有作用". Measuring where an archive request spends its time

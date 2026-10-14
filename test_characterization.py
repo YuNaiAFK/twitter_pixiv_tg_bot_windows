@@ -59,6 +59,51 @@ def check(name: str, condition, detail: str = "") -> bool:
     return ok
 
 
+def _orphan_cleanup_is_safe() -> bool:
+    """
+    Orphan cleanup must remove exactly the unreferenced files, and nothing else.
+
+    The dangerous direction is deleting too much: the live files, the archive cache in its
+    subdirectory, or an unrelated file dropped in the cache directory. All three are
+    asserted here, not just the removal.
+    """
+    import shutil as _sh
+    import tempfile as _tf
+    import time as _tm
+    real_dir, real_cache = bot.CACHE_DIR, bot.PARSE_CACHE
+    try:
+        work = Path(_tf.mkdtemp(prefix="dsh-orph-"))
+        bot.CACHE_DIR = work
+        (work / "archives").mkdir()
+        (work / "archives" / "keep_orig.zip").write_bytes(b"archive cache")
+        (work / "aaaa0000bbbb_001.jpg").write_bytes(b"live")
+        (work / "aaaa0000bbbb_002.jpg").write_bytes(b"orphan")
+        (work / ".aaaa0000bbbb_003.jpg.1.2.part").write_bytes(b"partial")
+        (work / "random-notes.txt").write_bytes(b"not ours")
+        bot.PARSE_CACHE = bot.ParseCache(work / "c.json")
+        bot.PARSE_CACHE.entries = {
+            "https://x.com/u/status/1": {
+                "kind": "media",
+                "payload": {"files": ["aaaa0000bbbb_001.jpg"]},
+                "at": _tm.time(),
+            }
+        }
+        found = {p.name for p in bot.orphaned_cache_files()}
+        bot.prune_orphaned_cache_files()
+        left = {p.name for p in work.rglob("*") if p.is_file()}
+        return (found == {"aaaa0000bbbb_002.jpg", ".aaaa0000bbbb_003.jpg.1.2.part"}
+                and "aaaa0000bbbb_001.jpg" in left          # live file kept
+                and "aaaa0000bbbb_002.jpg" not in left      # orphan removed
+                and "keep_orig.zip" in left                 # archive cache untouched
+                and "random-notes.txt" in left              # foreign file untouched
+                and "keep_orig.zip" not in found)           # subdirectory not scanned
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.CACHE_DIR, bot.PARSE_CACHE = real_dir, real_cache
+        _sh.rmtree(work, ignore_errors=True)
+
+
 class _FakeGallery:
     """The minimum a gallery needs to have for cache-key purposes."""
 
@@ -1173,6 +1218,56 @@ check("the archive cache is excluded from the media cache figure",
       "ARCHIVE_CACHE_DIR not in path.parents"
       in inspect.getsource(bot.cache_command),
       "it lives inside CACHE_DIR, so it would be counted twice")
+
+# --- Host aliases were separate cache entries, so one link downloaded twice ---
+
+# Verified against the live sites rather than assumed:
+#   twitter.com -> 301 -> x.com          (same post)
+#   pixiv.net   -> 301 -> www.pixiv.net  (same artwork)
+#   www.e-hentai.org -> 302 -> e-hentai.org, and exhentai.org serves the same gallery
+#   http://     -> 301 -> https://
+# The media cache had no canonicalisation beyond normalize_cache_key, so a post reached
+# through two of these forms was two entries with two copies of the same files on disk.
+for _label, _urls in (
+        ("a tweet", ["https://x.com/u/status/1", "https://twitter.com/u/status/1",
+                     "https://www.x.com/u/status/1", "http://twitter.com/u/status/1",
+                     "https://twitter.com/u/status/1?s=20", "https://x.com/u/status/1/"]),
+        ("a pixiv artwork", ["https://www.pixiv.net/artworks/1",
+                             "https://pixiv.net/artworks/1",
+                             "http://www.pixiv.net/artworks/1?foo=1"]),
+        ("an e-hentai gallery", ["https://e-hentai.org/g/1/a/",
+                                 "https://www.e-hentai.org/g/1/a/",
+                                 "https://exhentai.org/g/1/a/"]),
+):
+    _got = {bot.normalize_cache_key(u) for u in _urls}
+    check(f"equivalent links share one cache key: {_label}",
+          len(_got) == 1,
+          f"{len(_got)} keys: {sorted(_got)}")
+check("an unrelated host is never rewritten",
+      all(bot.normalize_cache_key(u) == u
+          for u in ("https://github.com/a/b", "https://www.cloudflare.com/a",
+                    "https://notx.com/u/status/1", "http://example.com/x/y")),
+      "only hosts the bot already accepts may be renamed")
+check("a lookalike host is not treated as an alias",
+      bot.normalize_cache_key("https://notx.com/u/status/1")
+      != bot.normalize_cache_key("https://x.com/u/status/1"),
+      "suffix matching would merge an unrelated domain")
+
+# --- Files an earlier store orphaned were never reclaimed ---
+
+check("orphaned cache files are detected and removed",
+      _orphan_cleanup_is_safe(),
+      "a re-cache with a different file set abandoned the previous files")
+check("the orphan sweep runs on the cache write path",
+      "prune_orphaned_cache_files()" in inspect.getsource(bot.remember_media_parse)
+      and "prune_orphaned_cache_files()" in inspect.getsource(bot.remember_gallery),
+      "on write is when they become unreachable")
+check("the orphan sweep also runs at startup",
+      "prune_orphaned_cache_files()" in inspect.getsource(bot.main),
+      "entries written before this existed left orphans behind")
+check("the viewer-URL TTL is shorter than the cache entry lifetime",
+      bot.GALLERY_URL_TTL_SECONDS < bot.CACHE_STALE_SECONDS,
+      "a reused signed URL would make every page fail together")
 
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
