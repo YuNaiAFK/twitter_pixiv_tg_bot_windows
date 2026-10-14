@@ -16,7 +16,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import unquote, urlparse, urlsplit
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 # Optional local dependency folder. It exists because this project can run on a
 # host where packages cannot be installed into site-packages; a wheel unpacked
@@ -299,10 +299,21 @@ BOT_SHORT_DESCRIPTION = os.getenv(
     "傳送 X/Twitter、Pixiv 或 e-hentai 連結，我把內容整理好傳回給你。",
 ).strip()[:120]
 
-# Reply to a link on an unsupported site. Set to 0 to stay silent instead, which
-# suits a busy public group where the notice would just be noise.
+# Whether to answer a link the bot cannot parse.
+#
+# **Default is silent.** A link that resolves to nothing gets no reply at all: not the
+# generic "only X/Twitter, Pixiv and e-hentai are supported" notice, and not the X-specific
+# explanation of what the page is. In a public group every unsupported link would otherwise
+# produce a message, which is noise in a conversation the bot was not invited into.
+#
+# Set REPLY_UNSUPPORTED_LINKS=1 to restore the notices, which is useful while checking that
+# a link really is unsupported rather than misdetected.
+#
+# Note this is only about *speaking*. An unparseable X link is still detected and dropped
+# before the downloader runs - see classify_twitter_url - because that is what avoids a
+# 180-second stall, and silence would otherwise mean waiting three minutes quietly.
 REPLY_UNSUPPORTED_LINKS = os.getenv(
-    "REPLY_UNSUPPORTED_LINKS", "1").strip().lower() not in {"0", "false", "no", "off"}
+    "REPLY_UNSUPPORTED_LINKS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # Where downloads are staged before sending. Set this to a drive with free
 # space; the default (system TEMP, usually C:) can fill up on large artworks.
@@ -1875,6 +1886,110 @@ _X_PROFILE_TABS = {
     "articles": "文章",
     "affiliates": "聯盟",
 }
+
+
+def classify_pixiv_url(url: str) -> tuple[str, str]:
+    """
+    What a Pixiv link actually is, with a message for when notices are enabled.
+
+    Returns ``("work", "")`` when the link should be parsed.
+
+    **The same problem as X, with worse symptoms.** Measured with gallery-dl:
+
+        /artworks/150824857                2 files in 46.7s   -> parse
+        /en/artworks/150824857             2 files in 31.0s   -> parse
+        /member_illust.php?...illust_id=…  2 files in 20.8s   -> parse
+        /users/12345                       0 files in  2.5s   -> silently nothing
+        /search?word=cat                   TIMEOUT after 180s
+        /tags/cat                          TIMEOUT after 180s
+        /ranking.php                       TIMEOUT after 180s
+        /discover                          "Unsupported URL" in 0.6s
+
+    So a Pixiv user page produced no reply at all - the downloader found nothing and the
+    failure message was the only thing that could have explained it, which is now off by
+    default. Catching it here means no wasted request and no orphaned status message.
+
+    Conservative, like the X classifier: only the shapes that certainly are not one work
+    are classified, and anything unrecognised is passed to the downloader.
+    """
+    parsed = urlparse(url)
+    path = unquote(parsed.path or "")
+    # A language prefix (/en/, /ja/) is part of the URL but not of the resource.
+    segments = [s for s in path.strip("/").split("/") if s]
+    if segments and re.fullmatch(r"[a-z]{2}", segments[0]) and len(segments) > 1:
+        segments = segments[1:]
+    if not segments:
+        return "home", "這是 Pixiv 的首頁，不是作品連結。\n請貼上單一作品的網址。"
+
+    first = segments[0]
+    lowered = first.lower()
+
+    # The two shapes that are a single work.
+    if lowered in {"artworks", "artwork"} and len(segments) > 1:
+        return "work", ""
+    if lowered in {"novel", "novels"}:
+        return "work", ""
+    if lowered.startswith("member_illust.php") or lowered.startswith("member.php"):
+        # The legacy form. Query params carry the target, so inspect the whole thing.
+        query = parse_qs(parsed.query or "")
+        if query.get("illust_id") or query.get("id"):
+            return "work", ""
+        return "member_page", ("這是 Pixiv 的舊版會員頁面，不是單一作品連結。\n"
+                               "請貼上單一作品的網址。")
+
+    if lowered in {"users", "user"}:
+        who = f"（ID {segments[1]}）" if len(segments) > 1 else ""
+        return "user", (f"這是 Pixiv 的使用者頁面{who}，不是單一作品連結。\n"
+                        "使用者頁面會包含該帳號的所有作品，無法在這裡一次解析，"
+                        "請貼上單一作品的網址。")
+    if lowered == "search":
+        return "search", ("這是 Pixiv 的搜尋結果頁，不是作品連結。\n"
+                          "搜尋頁會列出很多作品，請改成貼上單一作品的網址。")
+    if lowered == "tags":
+        tag = segments[1] if len(segments) > 1 else ""
+        return "tag", (f"這是 Pixiv 的標籤頁（{tag}），不是作品連結。\n"
+                       "標籤頁會列出很多作品，請改成貼上單一作品的網址。")
+    if lowered.startswith("ranking"):
+        return "ranking", ("這是 Pixiv 的排行榜頁面，不是作品連結。\n"
+                           "排行榜會列出很多作品，請改成貼上單一作品的網址。")
+    if lowered == "discover":
+        return "discover", "這是 Pixiv 的探索頁，不是作品連結。\n請貼上單一作品的網址。"
+    if lowered in {"bookmark", "bookmarks", "mypage", "following", "followers",
+                   "request", "requests", "stacc", "pixivision", "event", "contest"}:
+        return "collection", ("這是 Pixiv 的列表／個人頁面，會包含很多作品，"
+                              "不是單一作品連結。\n請改成貼上單一作品的網址。")
+
+    if lowered in {"artworks", "artwork"}:
+        # /artworks with no id - a listing, not a work.
+        return "listing", ("這個 Pixiv 網址缺少作品 ID，不是單一作品連結。\n"
+                           "請貼上完整作品的網址。")
+
+    return "other", ("這個 Pixiv 網址看起來不是單一作品連結。\n"
+                     "請貼上作品的網址（例如 /artworks/數字）。")
+
+
+def classify_link(url: str) -> tuple[str, str]:
+    """
+    Classify a supported-site link. Returns ``(kind, explanation)``.
+
+    ``kind`` is the parser's "this is a single work" verdict - ``"tweet"`` for X,
+    ``"work"`` for Pixiv - and everything else means the link should be dropped. The
+    explanation is only used when notices are enabled.
+
+    Dispatched from one place so the handler has a single check rather than one per
+    platform, which is how Pixiv was missed when only X was handled.
+    """
+    platform = detect_media_platform(url)
+    if platform == "twitter":
+        return classify_twitter_url(url)
+    if platform == "pixiv":
+        return classify_pixiv_url(url)
+    return "unsupported", ""
+
+
+def is_parseable_kind(kind: str) -> bool:
+    """Whether a classification verdict means "download this"."""
+    return kind in {"tweet", "work"}
 
 
 def user_is_admin(user_id: int) -> bool:
@@ -6657,32 +6772,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not media_url:
-        # Only the supported sites are resolved. Any other link is answered with a
-        # short notice rather than being fetched, so the bot never becomes a
+        # Only the supported sites are resolved. Any other link - another site, or a Pixiv
+        # user page - is dropped without being fetched, so the bot never becomes a
         # general-purpose link fetcher.
+        #
+        # **Silent by default**, and no reply of any kind: in a public group a notice for
+        # every unparseable link is noise in a conversation the bot was not invited into.
+        # REPLY_UNSUPPORTED_LINKS=1 restores the notice.
         if REPLY_UNSUPPORTED_LINKS:
             await send_status(message, SUPPORTED_SITES_NOTICE)
         return
 
-    platform = detect_media_platform(media_url)
+    # A supported-site link is classified **before anything is downloaded**, and a link
+    # that is not a single work is dropped here.
+    #
+    # **This is not about the message; it is about the stall and the wasted request.**
+    # Measured with gallery-dl, before this check existed:
+    #
+    #     x.com/pohitashi        killed after 180s
+    #     x.com/u/media          killed after 180s
+    #     pixiv.net/search?word  killed after 180s
+    #     pixiv.net/users/12345  0 files in 2.5s  (so a status message was left behind)
+    #
+    # With notices now off by default, an unclassified link would mean waiting three minutes
+    # in silence - so the classification stays even though the reply usually does not.
+    #
+    # Placed before the cache lookup and the cooldown because it costs nothing - a few string
+    # comparisons - and must not be delayed behind either.
+    kind, explanation = classify_link(media_url)
+    if not is_parseable_kind(kind):
+        platform_name = detect_media_platform(media_url)
+        logger.info("%s 連結不是單一作品（%s），已忽略：%s",
+                    platform_name or "不明", kind, media_url)
+        if REPLY_UNSUPPORTED_LINKS:
+            # Off by default. The explanation is kept for the operator who turns it on to
+            # check whether a link is genuinely unsupported or simply misdetected.
+            await send_status(message,
+                              f"{explanation}\n\n{SUPPORTED_SITES_NOTICE}")
+        return
 
-    # An X/Twitter link is classified before anything is downloaded.
-    #
-    # **Not every x.com URL is a post.** A profile is a timeline, and gallery-dl treats it
-    # as "download everything this account ever posted" - measured, that ran for 180 seconds
-    # before being killed, and the user was then told only "沒有找到可傳送的圖片或影片",
-    # which says nothing about the page they sent. Checking the shape first answers in
-    # milliseconds and names the page.
-    #
-    # Placed here, before the cache lookup and the cooldown, because it costs nothing and
-    # must not be delayed behind either. A "tweet" verdict falls through to the normal path
-    # unchanged.
-    if platform == "twitter":
-        kind, explanation = classify_twitter_url(media_url)
-        if kind != "tweet":
-            logger.info("推特連結不是貼文（%s）：%s", kind, media_url)
-            await send_status(message, f"{explanation}\n\n{SUPPORTED_SITES_NOTICE}")
-            return
+    platform = detect_media_platform(media_url)
 
     # A link that has been parsed before is served from the cache: the files were
     # copied aside, so this costs no download at all.

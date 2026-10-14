@@ -1426,6 +1426,54 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### Notices are silent, and a Pixiv page is not a work either
+
+Two changes that belong together: an unparseable link now produces **no reply at all**, and
+the classification that makes silence safe was extended to Pixiv.
+
+#### Silent by default
+
+`REPLY_UNSUPPORTED_LINKS` now defaults to **0**. A link the bot cannot parse gets no
+message - not the generic "只支援 X/Twitter、Pixiv 與 e-hentai" notice, and not the
+X-specific explanation of what the page is. In a public group a reply for every unparseable
+link is noise in a conversation the bot was not invited into.
+
+The explanation strings are kept, because `REPLY_UNSUPPORTED_LINKS=1` restores them and that
+is what an operator wants while checking whether a link is genuinely unsupported or simply
+misdetected.
+
+**Silence is only safe because the classification runs anyway.** A non-post X link is still
+detected and dropped before the downloader starts; without that, "silent" would mean waiting
+**three minutes** and then hearing nothing. The tests assert this ordering.
+
+#### Pixiv had the same problem, with worse symptoms
+
+Extending the check to Pixiv was not optional once notices went quiet. Measured with
+gallery-dl:
+
+    /artworks/150824857                2 files in 46.7s   -> parse
+    /en/artworks/150824857             2 files in 31.0s   -> parse
+    /member_illust.php?...illust_id=…  2 files in 20.8s   -> parse
+    /users/12345                       0 files in  2.5s   -> nothing at all
+    /search?word=cat                   TIMEOUT after 180s
+    /tags/cat                          TIMEOUT after 180s
+    /ranking.php                       TIMEOUT after 180s
+    /discover                          "Unsupported URL" in 0.6s
+
+A Pixiv user page produced **no reply even before** the notices were turned off: the
+downloader found nothing there, so the failure message was the only thing that could have
+explained it. Worse, it left the status message behind - measured as two messages for a link
+that resolves to nothing. The other shapes ran the full three minutes.
+
+`classify_link()` now dispatches to a per-platform classifier, so the handler has **one**
+check rather than one per site. Handling only X is precisely how Pixiv was missed. Both
+classifiers stay conservative: anything not positively identified as a page is passed to the
+downloader, because a wrong "not supported" would refuse a link that works.
+
+After the change every one of the shapes above answers in **0.0s with no message**, while
+`/artworks/N`, `/en/artworks/N`, `member_illust.php?illust_id=N` and `/novel/show.php?id=N`
+still parse.
+
 ### An x.com profile was handed to the downloader, which spent 180 seconds on it
 
 Every x.com URL used to go straight to gallery-dl, and only some of them lead to media.

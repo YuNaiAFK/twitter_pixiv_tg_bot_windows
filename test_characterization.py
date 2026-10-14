@@ -59,6 +59,127 @@ def check(name: str, condition, detail: str = "") -> bool:
     return ok
 
 
+def _drop_is_silent(notices: bool = False) -> bool:
+    """
+    Run a non-work link through handle_message and report whether the chat was written to.
+
+    Driven directly rather than by inspecting the source, because the environment
+    overrides the code default: flipping the default in code left a source-based check
+    passing while the setting was still 0 in .env.
+    """
+    import asyncio
+
+    class Msg:
+        def __init__(self):
+            self.text = "https://www.pixiv.net/users/12345"
+            self.caption = None
+            self.chat_id = 1
+            self.message_id = 1
+            self.chat = type("C", (), {"type": "private"})()
+            self.wrote = 0
+
+        async def reply_text(self, *a, **k):
+            self.wrote += 1
+            return self
+
+        async def edit_text(self, *a, **k):
+            self.wrote += 1
+            return self
+
+        async def delete(self):
+            return
+
+    class U:
+        id = 111
+        full_name = "T"
+        username = "t"
+        is_bot = False
+
+    class Upd:
+        def __init__(self):
+            self.effective_message = Msg()
+            self.effective_user = U()
+            self.message = self.effective_message
+
+    saved = bot.REPLY_UNSUPPORTED_LINKS
+    saved_allowed = set(bot.AUTHORIZATION.allowed)
+    try:
+        # The gate is fail-closed, so an empty allow list would answer "not allowed"
+        # instead of exercising the classifier.
+        bot.AUTHORIZATION.allowed = {111}
+        bot.REPLY_UNSUPPORTED_LINKS = notices
+        update = Upd()
+        asyncio.run(asyncio.wait_for(bot.handle_message(update, None), timeout=30))
+        return update.effective_message.wrote == 0
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.REPLY_UNSUPPORTED_LINKS = saved
+        bot.AUTHORIZATION.allowed = saved_allowed
+
+
+def _drop_explains_when_enabled() -> bool:
+    """The same link must produce a message when notices are on."""
+    import asyncio
+
+    class Msg:
+        def __init__(self):
+            self.text = "https://www.pixiv.net/users/12345"
+            self.caption = None
+            self.chat_id = 1
+            self.message_id = 1
+            self.chat = type("C", (), {"type": "private"})()
+            self.texts = []
+
+        async def reply_text(self, text, **k):
+            self.texts.append(text)
+            return self
+
+        async def edit_text(self, text, **k):
+            self.texts.append(text)
+            return self
+
+        async def delete(self):
+            return
+
+    class U:
+        id = 111
+        full_name = "T"
+        username = "t"
+        is_bot = False
+
+    class Upd:
+        def __init__(self):
+            self.effective_message = Msg()
+            self.effective_user = U()
+            self.message = self.effective_message
+
+    saved = bot.REPLY_UNSUPPORTED_LINKS
+    saved_allowed = set(bot.AUTHORIZATION.allowed)
+    try:
+        bot.AUTHORIZATION.allowed = {111}
+        bot.REPLY_UNSUPPORTED_LINKS = True
+        update = Upd()
+        asyncio.run(asyncio.wait_for(bot.handle_message(update, None), timeout=30))
+        said = " ".join(update.effective_message.texts)
+        return "使用者頁面" in said
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        # Both restored: leaving the allow list modified would leak into every later test.
+        bot.REPLY_UNSUPPORTED_LINKS = saved
+        bot.AUTHORIZATION.allowed = saved_allowed
+
+
+def _env_flag_documented(name: str) -> bool:
+    """Whether a configuration flag appears in .env.example, so it can be discovered."""
+    try:
+        text = (HERE / ".env.example").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return name in text
+
+
 def _order_in(source: str, first: str, second: str) -> bool:
     """
     Whether `first` appears before `second` in `source`, without raising when one is absent.
@@ -1428,17 +1549,86 @@ check("the classifier runs before the downloader",
       # The download itself happens inside a thread helper, so the marker for "work has
       # begun" is the semaphore, not the helper's own name.
       _order_in(inspect.getsource(bot.handle_message),
-                "classify_twitter_url(", "download_semaphore"),
+                "classify_link(", "download_semaphore"),
       "classifying after the download would keep the 180s wait")
 check("the classifier runs before the cache and the cooldown",
       # It costs nothing and must not be delayed behind either. A missing needle fails the
       # check rather than raising, which is what caught the wiring being removed.
       _order_in(inspect.getsource(bot.handle_message),
-                "classify_twitter_url(", "PARSE_CACHE.lookup(media_url"),
-      "an explanation should not wait on a cooldown")
-check("only twitter links are classified",
-      "platform == \"twitter\"" in inspect.getsource(bot.handle_message),
-      "Pixiv links must be untouched")
+                "classify_link(", "PARSE_CACHE.lookup(media_url"),
+      "a drop should not wait on a cooldown")
+check("every supported platform is classified",
+      # Dispatched from one place: handling only X is how Pixiv was missed for a whole
+      # round, leaving a Pixiv user page answering with two messages.
+      all(bot.classify_link(u)[0] == k for u, k in (
+          ("https://x.com/u/status/1", "tweet"),
+          ("https://x.com/u", "profile"),
+          ("https://www.pixiv.net/artworks/1", "work"),
+          ("https://www.pixiv.net/users/1", "user"),
+      )),
+      "the handler must have a single check, not one per platform")
+check("the handler classifies before downloading",
+      _order_in(inspect.getsource(bot.handle_message),
+                "classify_link(", "download_semaphore"),
+      "an unclassified link means a silent three-minute wait")
+
+# --- Notices are silent by default, and Pixiv pages had to be classified too ---
+
+# A Pixiv user page produced NO reply even before the notices were turned off: measured,
+# gallery-dl finds 0 files there in 2.5s, so the only thing that could have explained it was
+# the failure message. The other Pixiv shapes are worse - search, tags and ranking all ran
+# for the full 180s before being killed:
+#
+#   /artworks/150824857                2 files in 46.7s   -> parse
+#   /en/artworks/150824857             2 files in 31.0s   -> parse
+#   /member_illust.php?...illust_id=…  2 files in 20.8s   -> parse
+#   /users/12345                       0 files in  2.5s   -> nothing
+#   /search?word=cat                   TIMEOUT after 180s
+#   /ranking.php                       TIMEOUT after 180s
+for _url, _kind in (
+        ("https://www.pixiv.net/artworks/150824857", "work"),
+        ("https://www.pixiv.net/en/artworks/150824857", "work"),
+        ("https://www.pixiv.net/ja/artworks/150824857", "work"),
+        ("https://www.pixiv.net/member_illust.php?mode=medium&illust_id=1", "work"),
+        ("https://www.pixiv.net/novel/show.php?id=1", "work"),
+        ("https://www.pixiv.net/users/12345", "user"),
+        ("https://www.pixiv.net/users/1/bookmarks/artworks", "user"),
+        ("https://www.pixiv.net/search?word=cat", "search"),
+        ("https://www.pixiv.net/tags/cat", "tag"),
+        ("https://www.pixiv.net/ranking.php", "ranking"),
+        ("https://www.pixiv.net/discover", "discover"),
+        ("https://www.pixiv.net/", "home"),
+):
+    _got, _ = bot.classify_pixiv_url(_url)
+    check(f"pixiv shape {_kind}: {_url.split('pixiv.net')[1][:28]}",
+          _got == _kind, f"classified as {_got!r}, expected {_kind!r}")
+check("a pixiv work is never classified as a page",
+      # The dangerous direction is refusing a link that works.
+      all(bot.is_parseable_kind(bot.classify_pixiv_url(u)[0]) for u in (
+          "https://www.pixiv.net/artworks/1",
+          "https://www.pixiv.net/en/artworks/1",
+          "https://www.pixiv.net/artworks/1?foo=1",
+          "https://www.pixiv.net/member_illust.php?illust_id=1",
+      )),
+      "a wrong 'not supported' would reject a working link")
+check("a pixiv language prefix is not treated as the path",
+      bot.classify_pixiv_url("https://www.pixiv.net/en/artworks/1")[0] == "work",
+      "the /en/ prefix is part of the URL, not of the resource")
+check("notices are silent by default",
+      bot.REPLY_UNSUPPORTED_LINKS is False,
+      "an unsupported link must produce no message at all")
+check("the notice is a documented opt-in",
+      _env_flag_documented("REPLY_UNSUPPORTED_LINKS"),
+      "an operator needs a way to see why a link was dropped")
+# Asserted as BEHAVIOUR, not as the presence of an `if`. Flipping the code default while
+# .env still said 0 left the earlier check passing, because the environment wins - so the
+# question that matters is whether a drop reaches the chat, and that is driven directly.
+check("a dropped link sends nothing to the chat when notices are off",
+      _drop_is_silent(),
+      "the point of the change is that no message appears at all")
+check("the same drop DOES explain itself when notices are on",
+      _drop_explains_when_enabled(),
+      "an operator needs a way to see why a link was dropped")
 
 # --- Host aliases were separate cache entries, so one link downloaded twice ---
 
