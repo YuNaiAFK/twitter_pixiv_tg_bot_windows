@@ -280,6 +280,43 @@ def _lock_call_uses_the_setting() -> bool:
     return False
 
 
+def _uses_base_interpreter() -> bool:
+    """
+    The interpreter chosen for children must be the base one, not the venv launcher.
+
+    Asserted against ``sys._base_executable`` rather than on the absence of "Scripts": the venv
+    could live anywhere.
+    """
+    import sys as _sys
+    try:
+        chosen = bot.detached_interpreter()
+    except Exception:  # noqa: BLE001
+        return False
+    base = getattr(_sys, "_base_executable", None)
+    if base:
+        return os.path.normcase(chosen) == os.path.normcase(base)
+    return "Scripts" not in chosen
+
+
+def _child_imports_telegram() -> bool:
+    """
+    A child started the way the bot starts them must import the venv's packages.
+
+    Run for real, because the failure mode is an ImportError inside the child, which no
+    source inspection would catch. Without the PYTHONPATH that child_environment() adds, this
+    fails: measured, httpx and telegram both give FAIL.
+    """
+    import subprocess as _sp
+    try:
+        result = _sp.run(
+            [bot.detached_interpreter(), "-c", "import telegram, httpx"],
+            capture_output=True, text=True, timeout=90, env=bot.child_environment(),
+        )
+    except (OSError, _sp.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def _lock_acquires_immediately() -> bool:
     """With nothing holding it, the lock must be taken at once."""
     import time as _tm
@@ -2100,6 +2137,28 @@ check("the lock is released explicitly, not only at process exit",
       # wait for the OS to reap the old process.
       "release_instance_lock()" in inspect.getsource(bot.main),
       "an explicit release shortens the next start")
+# --- A stray python window appeared next to the bot's own console ---
+
+# The cause was the interpreter used to start background processes:
+# .venv\Scripts\python.exe is a venv *launcher* that re-executes the real one as a child, and
+# that pair put a visible, empty console on screen. Measured, and not suppressed by
+# CREATE_NO_WINDOW either:
+#
+#   venv stub        (python.exe): NEW windows = [(33140, '.../.venv/Scripts/python.exe')]
+#   base interpreter (python.exe): NEW windows = []
+check("background processes use the base interpreter",
+      _uses_base_interpreter(),
+      "the venv launcher is what creates the stray window")
+check("the child environment still reaches the venv packages",
+      # The base interpreter does not know about the venv, so without this the child cannot
+      # import telegram and dies at once - verified by importing it in a real child.
+      _child_imports_telegram(),
+      "a win on windows must not cost the packages")
+check("the relay is started with the base interpreter too",
+      "detached_interpreter()" in inspect.getsource(
+          __import__("run_local_api").start_relay),
+      "the relay was the window that was actually reported")
+
 check("only a real replacement waits",
       # **This was wrong once, and it was the whole bug.** The wait keyed off
       # RESTART_STARTUP_DELAY, which is also a documented .env value - so load_dotenv()
@@ -2109,8 +2168,9 @@ check("only a real replacement waits",
       and "os.getenv(\"RESTART_STARTUP_DELAY\")" not in inspect.getsource(bot.main),
       "the marker must come from the spawner, not from a .env setting")
 check("the spawner sets the replacement marker",
-      '"BOT_IS_REPLACEMENT": "1"' in inspect.getsource(bot.spawn_replacement_process)
-      or "'BOT_IS_REPLACEMENT': '1'" in inspect.getsource(bot.spawn_replacement_process),
+      # The environment moved into child_environment(...) when the venv launcher was replaced,
+      # so this matches the keyword form rather than a dict literal.
+      "BOT_IS_REPLACEMENT=\"1\"" in inspect.getsource(bot.spawn_replacement_process),
       "nothing else may set it")
 check("the marker is the only thing that decides the wait",
       # Asserted on how `is_replacement` is DECIDED. A search for the name alone was not

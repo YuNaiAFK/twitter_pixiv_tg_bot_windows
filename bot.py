@@ -3314,6 +3314,47 @@ def admin_only(handler):
     return wrapper
 
 
+def detached_interpreter() -> str:
+    """
+    The interpreter a long-lived child process should be started with.
+
+    **``sys.executable`` is the wrong choice, and the cost is a stray window.**
+    ``.venv\\Scripts\\python.exe`` is a venv *launcher*: it re-executes the real interpreter as
+    a child. Spawning that pair produced an extra, empty console window - measured, and not
+    suppressed by ``CREATE_NO_WINDOW`` either, which was the first thing tried:
+
+        venv stub        (python.exe): NEW windows = [(33140, '...\\.venv\\Scripts\\python.exe')]
+        base interpreter (python.exe): NEW windows = []
+
+    ``sys._base_executable`` is the real interpreter and starts with no window. The base
+    interpreter does not know about the venv, so ``child_environment()`` adds the venv's
+    ``site-packages`` - without it the child cannot import ``telegram`` and dies at once.
+    """
+    exe = getattr(sys, "_base_executable", None) or sys.executable
+    if not os.path.exists(exe):
+        exe = sys.executable
+    return exe
+
+
+def child_environment(**extra: str) -> dict[str, str]:
+    """
+    An environment for a child process started with ``detached_interpreter()``.
+
+    Carries whatever ``extra`` names, plus the venv on ``PYTHONPATH`` so the base interpreter
+    resolves the installed packages.
+    """
+    env = {**os.environ, **extra}
+    site_packages = [p for p in sys.path if p.endswith("site-packages") and os.path.isdir(p)]
+    if site_packages:
+        parts = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
+        for path in site_packages:
+            if path not in parts:
+                parts.append(path)
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+    env["VIRTUAL_ENV"] = sys.prefix
+    return env
+
+
 def spawn_replacement_process() -> subprocess.Popen:
     """
     Start a second copy of this bot, detached from the current one.
@@ -3381,22 +3422,35 @@ def spawn_replacement_process() -> subprocess.Popen:
     # request" - which is how a restart can end with no bot running. The wait is
     # cheap and removes the race entirely, rather than relying on the replacement
     # surviving a Conflict.
-    environment = {
-        **os.environ,
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONUTF8": "1",
-        "RESTART_STARTUP_DELAY": str(RESTART_STARTUP_DELAY_SECONDS),
+    environment = child_environment(
+        PYTHONIOENCODING="utf-8",
+        PYTHONUTF8="1",
+        RESTART_STARTUP_DELAY=str(RESTART_STARTUP_DELAY_SECONDS),
         # Tells the child to keep a copy of its own log, since its output now goes to a
         # console window rather than a redirected file.
-        "BOT_RESTART_LOG": "1",
+        BOT_RESTART_LOG="1",
         # **Marks this process as a replacement, and it is the only thing that does.**
         #
         # The startup wait used to key off RESTART_STARTUP_DELAY, which is also a documented
         # .env setting - so load_dotenv() set it for EVERY start, every start believed it was
         # a replacement, and run.bat waited six seconds for nothing while the refusal guard
         # below was skipped. A marker that only the spawner sets cannot be confused that way.
-        "BOT_IS_REPLACEMENT": "1",
-    }
+        BOT_IS_REPLACEMENT="1",
+    )
+
+    # **The base interpreter, not the venv launcher, and this is not a detail.**
+    #
+    # ``.venv\Scripts\python.exe`` is a launcher that re-executes the real interpreter as a
+    # child. Spawning that pair with CREATE_NEW_CONSOLE produced an extra, empty console
+    # window, and with DETACHED_PROCESS it produced one anyway - measured: the launcher's
+    # child creates a visible console that no creation flag suppresses.
+    #
+    #     venv stub        (python.exe): NEW windows = [(33140, '...\.venv\Scripts\python.exe')]
+    #     base interpreter (python.exe): NEW windows = []
+    #
+    # So ``sys._base_executable`` is what gets spawned; ``environment`` below carries the venv
+    # on PYTHONPATH so the replacement can still import ``telegram``.
+    child_python = detached_interpreter()
 
     try:
         # stdout/stderr are NOT redirected when a console is used: the child owns that
@@ -3405,14 +3459,14 @@ def spawn_replacement_process() -> subprocess.Popen:
         # a live window and a file exist.
         if use_console:
             return subprocess.Popen(
-                [sys.executable, str(BASE_DIR / "bot.py")],
+                [child_python, str(BASE_DIR / "bot.py")],
                 cwd=str(BASE_DIR),
                 creationflags=flags,
                 close_fds=True,
                 env=environment,
             )
         return subprocess.Popen(
-            [sys.executable, str(BASE_DIR / "bot.py")],
+            [child_python, str(BASE_DIR / "bot.py")],
             cwd=str(BASE_DIR),
             stdin=subprocess.DEVNULL,
             stdout=log_handle,

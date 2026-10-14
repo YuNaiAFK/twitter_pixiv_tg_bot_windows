@@ -506,6 +506,48 @@ def upstream_proxy_port(env: dict[str, str]) -> int:
     return DEFAULT_PROXY_PORT
 
 
+def detached_interpreter() -> tuple[str, dict[str, str]]:
+    """
+    The interpreter to start a background process with, and the environment it needs.
+
+    **``sys.executable`` is the wrong choice, and the reason is a visible window.**
+    ``.venv\\Scripts\\python.exe`` is a venv *launcher*, not the interpreter: it re-executes
+    the real one as a child. When that pair is spawned with ``DETACHED_PROCESS``, the child
+    still ends up with a **visible, empty console window** - measured, and not suppressed by
+    ``CREATE_NO_WINDOW`` either, which was the first thing tried:
+
+        venv stub        (python.exe): NEW windows = [(33140, '...\\.venv\\Scripts\\python.exe')]
+        base interpreter (python.exe): NEW windows = []
+
+    That stray window is what sat next to the bot's own console and prompted "why does a
+    python window pop up as well?". ``sys._base_executable`` is the real interpreter and
+    starts with no window at all.
+
+    The cost is that the base interpreter does not know about the venv, so its
+    ``site-packages`` has to be passed explicitly - verified: without this, ``httpx`` and
+    ``telegram`` both fail to import in the child.
+
+    Returns the executable and an environment dict to pass to ``Popen``.
+    """
+    exe = getattr(sys, "_base_executable", None) or sys.executable
+    if not os.path.exists(exe):
+        exe = sys.executable
+
+    env = dict(os.environ)
+    site_packages = [p for p in sys.path if p.endswith("site-packages") and os.path.isdir(p)]
+    if site_packages:
+        existing = env.get("PYTHONPATH", "")
+        parts = [p for p in existing.split(os.pathsep) if p]
+        for path in site_packages:
+            if path not in parts:
+                parts.append(path)
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+    # Not required for imports, but it is what makes a child believe it is inside the venv
+    # rather than a bare interpreter.
+    env["VIRTUAL_ENV"] = sys.prefix
+    return exe, env
+
+
 def start_relay(proxy_port: int, relay_port: int) -> bool:
     """
     Start the host relay if it is not already listening. Returns whether it is up.
@@ -518,7 +560,7 @@ def start_relay(proxy_port: int, relay_port: int) -> bool:
         print(f"  轉接埠 {relay_port}：已在執行")
         return True
 
-    python = sys.executable
+    python, child_env = detached_interpreter()
     if not RELAY_SCRIPT.is_file():
         print(f"  找不到 {RELAY_SCRIPT.name}，容器將無法連上 Telegram。")
         return False
@@ -526,15 +568,19 @@ def start_relay(proxy_port: int, relay_port: int) -> bool:
     print(f"  啟動轉接（{relay_port} -> 127.0.0.1:{proxy_port}）……")
     creation = 0
     if os.name == "nt":
-        # DETACHED_PROCESS so it is not killed with this console, and no window.
-        # The name has no CREATE_ prefix; CREATE_DETACHED_PROCESS does not exist.
-        creation = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        # DETACHED_PROCESS so it is not killed with this console, and CREATE_NO_WINDOW so it
+        # has no window. The pair is what the base interpreter needs; see
+        # detached_interpreter for why the venv launcher is not used here.
+        creation = (subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NEW_PROCESS_GROUP
+                    | subprocess.CREATE_NO_WINDOW)
     try:
         subprocess.Popen(
             [python, str(RELAY_SCRIPT),
              "--list-port", str(relay_port), "--proxy-port", str(proxy_port)],
             cwd=str(HERE),
             creationflags=creation,
+            env=child_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
