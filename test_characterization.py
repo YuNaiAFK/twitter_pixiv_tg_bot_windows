@@ -59,6 +59,19 @@ def check(name: str, condition, detail: str = "") -> bool:
     return ok
 
 
+def _order_in(source: str, first: str, second: str) -> bool:
+    """
+    Whether `first` appears before `second` in `source`, without raising when one is absent.
+
+    `str.index` raises ValueError, which aborts the run instead of failing the check that
+    asked the question - and a missing needle is exactly the regression these assertions
+    exist to catch, so it has to report rather than crash.
+    """
+    a = source.find(first)
+    b = source.find(second)
+    return a != -1 and b != -1 and a < b
+
+
 def _resolver_code() -> str:
     """The resolver's code with its docstring removed, so prose cannot satisfy a check."""
     import ast
@@ -1342,6 +1355,90 @@ check("the archive cache is excluded from the media cache figure",
       "ARCHIVE_CACHE_DIR not in path.parents"
       in inspect.getsource(bot.cache_command),
       "it lives inside CACHE_DIR, so it would be counted twice")
+
+# --- An x.com profile was handed to the downloader, which spent 180s on it ---
+
+# Every x.com URL was passed to gallery-dl and only some lead to media. Measured:
+#   /status/123          1 file in 3.9s   -> parse
+#   /i/status/123        1 file in 3.3s   -> parse
+#   /status/123/photo/1  1 file in 3.8s   -> parse
+#   /pohitashi          TIMEOUT after 180s
+#   /pohitashi/media    TIMEOUT after 180s
+# So a profile made the user wait three minutes for "沒有找到可傳送的圖片或影片", which says
+# nothing about the page they sent.
+for _url, _kind in (
+        ("https://x.com/u/status/123", "tweet"),
+        ("https://x.com/i/status/123", "tweet"),
+        ("https://x.com/u/status/123/photo/1", "tweet"),
+        ("https://x.com/u/status/123/video/1", "tweet"),
+        ("https://twitter.com/u/status/123", "tweet"),
+        ("https://x.com/u", "profile"),
+        ("https://x.com/u/", "profile"),
+        ("https://x.com/u/media", "tab"),
+        ("https://x.com/u/with_replies", "tab"),
+        ("https://x.com/u/likes", "tab"),
+        ("https://x.com/", "home"),
+        ("https://x.com/search?q=cat", "search"),
+        ("https://x.com/hashtag/cat", "hashtag"),
+        ("https://x.com/i/lists/123", "list"),
+        ("https://x.com/i/communities/123", "community"),
+        ("https://x.com/i/broadcasts/abc", "broadcast"),
+        ("https://x.com/i/user/123", "user_id"),
+        ("https://twitter.com/intent/tweet?text=hi", "intent"),
+        ("https://x.com/explore", "explore"),
+        ("https://x.com/settings/profile", "settings"),
+):
+    _got_kind, _msg = bot.classify_twitter_url(_url)
+    check(f"twitter shape {_kind}: {_url.split('//')[1][:34]}",
+          _got_kind == _kind,
+          f"classified as {_got_kind!r}, expected {_kind!r}")
+
+check("a post is never classified as a page",
+      # The dangerous direction: refusing a link that works. Anything post-shaped must be
+      # passed through, including forms whose exact behaviour was not measured.
+      all(bot.classify_twitter_url(u)[0] == "tweet" for u in (
+          "https://x.com/u/status/123",
+          "https://x.com/u/status/123?s=20&t=abc",
+          "https://x.com/i/status/123",
+          "https://x.com/u/status/123/photo/2",
+          "https://x.com/a_b.c-d/status/123",
+      )),
+      "a wrong 'not supported' would reject a working link")
+check("every non-tweet verdict comes with an explanation",
+      # A kind without a message would reach the chat as an empty bubble.
+      all(bot.classify_twitter_url(u)[1].strip()
+          for u in ("https://x.com/u", "https://x.com/u/media", "https://x.com/search",
+                    "https://x.com/hashtag/x", "https://x.com/", "https://x.com/i/lists/1",
+                    "https://x.com/i/communities/1", "https://x.com/i/broadcasts/x",
+                    "https://x.com/i/user/1", "https://x.com/explore",
+                    "https://x.com/settings/x", "https://x.com/i/unknown")),
+      "the point of this change is to say what the page is")
+check("the explanation names the page rather than saying unsupported",
+      "@pohitashi" in bot.classify_twitter_url("https://x.com/pohitashi")[1]
+      and "主頁" in bot.classify_twitter_url("https://x.com/pohitashi")[1],
+      "a generic message is what this replaces")
+check("a tab is reported with its tab name",
+      "媒體" in bot.classify_twitter_url("https://x.com/u/media")[1],
+      "matching the tab against the first segment missed every tab")
+check("a user named like a page is still a profile",
+      # /media is a real account name too; only /<user>/<tab> is a tab.
+      bot.classify_twitter_url("https://x.com/media")[0] == "profile",
+      "the second segment is the tab, not the first")
+check("the classifier runs before the downloader",
+      # The download itself happens inside a thread helper, so the marker for "work has
+      # begun" is the semaphore, not the helper's own name.
+      _order_in(inspect.getsource(bot.handle_message),
+                "classify_twitter_url(", "download_semaphore"),
+      "classifying after the download would keep the 180s wait")
+check("the classifier runs before the cache and the cooldown",
+      # It costs nothing and must not be delayed behind either. A missing needle fails the
+      # check rather than raising, which is what caught the wiring being removed.
+      _order_in(inspect.getsource(bot.handle_message),
+                "classify_twitter_url(", "PARSE_CACHE.lookup(media_url"),
+      "an explanation should not wait on a cooldown")
+check("only twitter links are classified",
+      "platform == \"twitter\"" in inspect.getsource(bot.handle_message),
+      "Pixiv links must be untouched")
 
 # --- Host aliases were separate cache entries, so one link downloaded twice ---
 

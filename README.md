@@ -1426,6 +1426,51 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### An x.com profile was handed to the downloader, which spent 180 seconds on it
+
+Every x.com URL used to go straight to gallery-dl, and only some of them lead to media.
+Measured on the real thing:
+
+    /status/123          1 file in 3.9s   -> parse
+    /i/status/123        1 file in 3.3s   -> parse
+    /status/123/photo/1  1 file in 3.8s   -> parse
+    /pohitashi          TIMEOUT after 180s
+    /pohitashi/media    TIMEOUT after 180s
+
+A profile is a timeline, and gallery-dl treats it as "download everything this account ever
+posted". So pasting one made the user wait **three minutes** and then read a generic
+"沒有找到可傳送的圖片或影片" - which says nothing about the page they sent.
+
+`classify_twitter_url()` identifies the shape before anything is downloaded and answers with
+what the page actually is:
+
+    這是 X（Twitter）的使用者主頁（@pohitashi），不是單一貼文連結。
+    主頁會包含該帳號的所有貼文，無法在這裡一次解析，請貼上單一貼文的網址。
+
+Answered in **0.0s** instead of 180s, and the same for the other non-post shapes: profile
+tabs (媒體, 含回覆的貼文, 喜歡的內容, 追蹤者…), search results, hashtag pages, lists,
+communities, broadcasts, `/i/user`, intent/share links, and the home, explore, settings,
+notifications, messages and legal pages.
+
+#### Conservative on purpose
+
+The dangerous direction is refusing a link that works, so anything post-shaped is passed
+through untouched - including forms whose exact behaviour was not measured. Only shapes that
+are certainly not a single post are classified as other, and a `tweet` verdict falls through
+to the normal path unchanged.
+
+Two details that are easy to get wrong, both pinned by tests:
+
+- **The tab is the second path segment** (`/<user>/media`), not the first. Matching the first
+  segment looked right and silently missed every tab - they fell through to the vague
+  catch-all instead of naming the tab.
+- **A user may be named like a page.** `/media` is a real account name, and so is `/search`;
+  only `/<user>/<tab>` is a tab. The reserved words are checked first, so `/search` is a
+  search page and `/media` is a profile.
+
+Verified end to end through the real handler: a post still downloads its media, pixiv is
+untouched, and every non-post shape answers in 0.0s.
+
 ### A Telegraph page's images were all broken: the original URLs need a session
 
 Reported as "生成的链接点开后图片无法加载". Fetching the page and testing every embedded image

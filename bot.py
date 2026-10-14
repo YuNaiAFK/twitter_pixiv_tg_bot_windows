@@ -1744,6 +1744,139 @@ def user_is_allowed(user_id: int, chat_id: int | None = None,
     return AUTHORIZATION.is_allowed(user_id, chat_id, chat_type)
 
 
+def classify_twitter_url(url: str) -> tuple[str, str]:
+    """
+    What an X/Twitter link actually is, with a message to show the user.
+
+    Returns ``("tweet", "")`` when the link should be parsed, or ``(kind, message)`` where
+    the message explains what the page is and why it is not parsed.
+
+    **Why this exists.** Every x.com URL used to be handed to gallery-dl, and only some of
+    them lead to media. Measured on the real thing:
+
+        /status/123          1 file in 3.9s   -> parse
+        /i/status/123        1 file in 3.3s   -> parse
+        /status/123/photo/1  1 file in 3.8s   -> parse
+        /pohitashi          TIMEOUT after 180s
+        /pohitashi/media    TIMEOUT after 180s
+
+    So pasting a profile made the user wait three minutes and then read a generic
+    "沒有找到可傳送的圖片或影片", which says nothing about the page they sent. A profile is a
+    timeline - gallery-dl treats it as "download everything this account ever posted" - and
+    that is not what this bot does.
+
+    **Conservative by design.** Anything not positively identified is treated as a tweet
+    and passed to the downloader, because a wrong "not supported" would refuse a link that
+    works. Only shapes that are certainly not a single post are classified as other.
+    """
+    parsed = urlparse(url)
+    path = unquote(parsed.path or "").strip("/")
+    parts = [p for p in path.split("/") if p]
+
+    if not parts:
+        return "home", "這是 X（Twitter）的首頁，不是貼文連結。\n請貼上單一貼文的網址。"
+
+    # /<user>/status/<id> and /i/status/<id>. The media sub-path and any query belong to
+    # one post, so they are parsed - measured to work.
+    if len(parts) >= 2 and parts[1] == "status":
+        return "tweet", ""
+    if len(parts) >= 2 and parts[0] == "i" and parts[1] == "status":
+        return "tweet", ""
+
+    # Everything below is a page rather than a post, and none of them produce a single
+    # artwork. Messages name the page, because "unsupported" is not an answer.
+    flags = set(parts[1:])
+    first = parts[0]
+
+    if first == "search":
+        return "search", ("這是 X（Twitter）的搜尋結果頁，不是貼文連結。\n"
+                          "搜尋頁會列出很多貼文，請改成貼上單一貼文的網址。")
+    if first == "hashtag":
+        tag = parts[1] if len(parts) > 1 else ""
+        return "hashtag", (f"這是 X（Twitter）的標籤頁（#{tag}），不是貼文連結。\n"
+                           "標籤頁會列出很多貼文，請改成貼上單一貼文的網址。")
+    if first == "explore":
+        return "explore", "這是 X（Twitter）的探索頁，不是貼文連結。\n請貼上單一貼文的網址。"
+    if first == "notifications":
+        return "notifications", "這是 X（Twitter）的通知頁，不是貼文連結。"
+    if first == "messages":
+        return "messages", "這是 X（Twitter）的訊息頁，不是貼文連結。"
+    if first == "settings":
+        return "settings", "這是 X（Twitter）的設定頁，不是貼文連結。"
+    if first == "compose":
+        return "compose", "這是 X（Twitter）的發文頁，不是貼文連結。"
+    if first == "intent":
+        return "intent", "這是 X（Twitter）的分享／互動連結，不是貼文本身。\n請貼上貼文的網址。"
+    if first == "share":
+        return "share", "這是 X（Twitter）的分享連結，不是貼文本身。\n請貼上貼文的網址。"
+    if first == "login" or first == "logout" or first == "signup":
+        return "auth", "這是 X（Twitter）的登入頁，不是貼文連結。"
+    if first == "tos" or first == "privacy":
+        return "legal", "這是 X（Twitter）的條款頁面，不是貼文連結。"
+    if first == "about":
+        return "about", "這是 X（Twitter）的說明頁面，不是貼文連結。"
+
+    if first == "i":
+        second = parts[1] if len(parts) > 1 else ""
+        if second == "lists":
+            return "list", ("這是 X（Twitter）的列表頁，會包含多位使用者的貼文，"
+                            "不是單一貼文連結。\n請改成貼上單一貼文的網址。")
+        if second == "communities":
+            return "community", ("這是 X（Twitter）的社群頁，會包含很多貼文，"
+                                 "不是單一貼文連結。\n請改成貼上單一貼文的網址。")
+        if second == "broadcasts":
+            return "broadcast", "這是 X（Twitter）的直播頁，不是貼文連結。"
+        if second == "user":
+            return "user_id", ("這是 X（Twitter）的使用者頁面，不是貼文連結。\n"
+                               "請貼上單一貼文的網址。")
+        return "i_page", "這個 X（Twitter）網址不是貼文連結。\n請貼上單一貼文的網址。"
+
+    # A profile page, or one of its tabs.
+    #
+    # The tab is the SECOND path segment (/<user>/media), so it is matched there and not
+    # against the first segment - matching the first segment looked right and silently
+    # missed every tab, which then fell through to the vague catch-all below.
+    #
+    # The reserved words above are checked first, so a tab that shares a name with a
+    # reserved page cannot be misread as one.
+    if len(parts) == 1:
+        return "profile", (f"這是 X（Twitter）的使用者主頁（@{first}），"
+                           "不是單一貼文連結。\n"
+                           "主頁會包含該帳號的所有貼文，無法在這裡一次解析，"
+                           "請貼上單一貼文的網址。")
+
+    if len(parts) >= 2 and parts[1] in _X_PROFILE_TABS:
+        tab_name = _X_PROFILE_TABS[parts[1]]
+        return "tab", (f"這是 X（Twitter）使用者 @{first} 的「{tab_name}」頁面，"
+                       "會列出很多貼文，不是單一貼文連結。\n"
+                       "請改成貼上單一貼文的網址。")
+
+    if "status" in flags:
+        # An unusual but post-shaped URL. Passed through rather than refused, because a
+        # wrong "not supported" would reject a link the downloader can handle.
+        return "tweet", ""
+
+    return "other", ("這個 X（Twitter）網址看起來不是單一貼文連結。\n"
+                     "請貼上貼文的網址（結尾是 /status/數字）。")
+
+
+# The tab names X uses under a profile. Mapped to the wording shown to a user, because
+# "with_replies" is not something to put in a chat message.
+_X_PROFILE_TABS = {
+    "with_replies": "含回覆的貼文",
+    "media": "媒體",
+    "likes": "喜歡的內容",
+    "following": "追蹤中",
+    "followers": "追蹤者",
+    "verified_followers": "已驗證的追蹤者",
+    "lists": "列表",
+    "topics": "主題",
+    "highlights": "精選",
+    "articles": "文章",
+    "affiliates": "聯盟",
+}
+
+
 def user_is_admin(user_id: int) -> bool:
     """
     True only for an explicitly listed administrator.
@@ -6532,6 +6665,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     platform = detect_media_platform(media_url)
+
+    # An X/Twitter link is classified before anything is downloaded.
+    #
+    # **Not every x.com URL is a post.** A profile is a timeline, and gallery-dl treats it
+    # as "download everything this account ever posted" - measured, that ran for 180 seconds
+    # before being killed, and the user was then told only "沒有找到可傳送的圖片或影片",
+    # which says nothing about the page they sent. Checking the shape first answers in
+    # milliseconds and names the page.
+    #
+    # Placed here, before the cache lookup and the cooldown, because it costs nothing and
+    # must not be delayed behind either. A "tweet" verdict falls through to the normal path
+    # unchanged.
+    if platform == "twitter":
+        kind, explanation = classify_twitter_url(media_url)
+        if kind != "tweet":
+            logger.info("推特連結不是貼文（%s）：%s", kind, media_url)
+            await send_status(message, f"{explanation}\n\n{SUPPORTED_SITES_NOTICE}")
+            return
 
     # A link that has been parsed before is served from the cache: the files were
     # copied aside, so this costs no download at all.
