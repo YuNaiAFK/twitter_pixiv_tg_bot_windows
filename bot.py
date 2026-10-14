@@ -55,6 +55,21 @@ load_dotenv(BASE_DIR / ".env")
 
 # -------------------- Configuration --------------------
 
+# Logging is configured **first**, before anything that logs.
+#
+# It used to be set up hundreds of lines further down, but `logger` is used by code that
+# runs at import time well above it - `Authorization.load()` and `Authorization.save()`
+# both log warnings from their failure paths. During a normal start neither path is taken,
+# so the missing name never showed. The moment one was taken, the bot died at import with
+# `NameError: name 'logger' is not defined`, pointing at the warning call rather than at
+# the cause. **A warning must never be able to stop the bot from starting.**
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("twitter_pixiv_bot")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 COOKIES_FILE = os.getenv("GALLERY_DL_COOKIES", "").strip()
 
@@ -75,30 +90,77 @@ LOCAL_API_SERVER = False
 SERVER_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
 SERVER_CAN_UPLOAD_BY_PATH = False
 
-MAX_DOWNLOAD_SECONDS = int(os.getenv("MAX_DOWNLOAD_SECONDS", "180"))
-MAX_FILES = int(os.getenv("MAX_FILES", "20"))
+
+def env_text(name: str, default: str = "") -> str:
+    """
+    Read a string from the environment, treating blank as unset.
+
+    The same trap as :func:`env_number`, but it failed more quietly and therefore lasted
+    longer: ``os.getenv("AUTH_FILE", default)`` returns ``""`` when the key exists with an
+    empty value, so the default is **skipped** - and ``Path("")`` is the current
+    directory. A blank optional key in ``.env`` therefore turned the authorization file and
+    the cache directory into the repository folder itself. Not a crash, just the wrong
+    path, surfacing as a "Permission denied" warning that pointed nowhere useful.
+
+    Returns the default for a missing, blank or whitespace-only value.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = str(raw).strip()
+    return text if text else default
+
+
+def env_number(name: str, default, *, kind=int):
+    """
+    Read a number from the environment, treating blank as unset.
+
+    **`os.getenv("X", "180")` is not a default for an empty value.** ``.env`` is usually
+    created by copying ``.env.example``, where every optional key is present with an empty
+    value - and ``int("")`` raises ``ValueError``, so the bot failed to start at import
+    time with a message pointing at a line far from the cause. That is a configuration
+    file the documentation tells people to copy, so the combination was one paste away.
+
+    Blank, whitespace, and an unparseable value all fall back to the default with a
+    warning. A number is always returned, so no caller has to guard against it.
+    """
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    text = str(raw).strip()
+    try:
+        return kind(text)
+    except (TypeError, ValueError):
+        # The module logger is not created until much later, and this runs during import,
+        # so it is obtained here rather than referenced by name.
+        logging.getLogger("twitter_pixiv_bot").warning(
+            "%s=%r 不是有效的數字，改用預設值 %s", name, raw, default)
+        return default
+
+
+MAX_DOWNLOAD_SECONDS = env_number("MAX_DOWNLOAD_SECONDS", 180)
+MAX_FILES = env_number("MAX_FILES", 20)
 # Kept as its own name as well as the byte form: the operator summary reports it in
 # MB, and deriving that from the bytes at each call site is how a report ends up
 # referencing a name that does not exist.
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "45"))
+MAX_UPLOAD_MB = env_number("MAX_UPLOAD_MB", 45)
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
-USER_COOLDOWN_SECONDS = int(os.getenv("USER_COOLDOWN_SECONDS", "10"))
+MAX_CONCURRENT_DOWNLOADS = env_number("MAX_CONCURRENT_DOWNLOADS", 2)
+USER_COOLDOWN_SECONDS = env_number("USER_COOLDOWN_SECONDS", 10)
 
 # How long a claimed processing slot stays valid. If a request dies without
 # releasing it, the slot is ignored after this so a user cannot be locked out.
-REQUEST_STALE_SECONDS = int(os.getenv("REQUEST_STALE_SECONDS", "1800"))
+REQUEST_STALE_SECONDS = env_number("REQUEST_STALE_SECONDS", 1800)
 
 # A restart's output is appended here by each replacement process, so it is rotated
 # once it passes this size to keep it from growing without limit.
-RESTART_LOG_MAX_BYTES = int(os.getenv("RESTART_LOG_MAX_MB", "2")) * 1024 * 1024
+RESTART_LOG_MAX_BYTES = env_number("RESTART_LOG_MAX_MB", 2) * 1024 * 1024
 
 # How long a replacement waits before it starts polling. The process being replaced
 # needs a moment to release Telegram's getUpdates lock; without this wait the two
 # briefly poll at once and the new one is killed by
 # "Conflict: terminated by other getUpdates request".
-RESTART_STARTUP_DELAY_SECONDS = float(
-    os.getenv("RESTART_STARTUP_DELAY", "6"))
+RESTART_STARTUP_DELAY_SECONDS = env_number("RESTART_STARTUP_DELAY", 6, kind=float)
 
 # -------------------- Login credentials --------------------
 #
@@ -119,7 +181,7 @@ CHECK_COOKIES = os.getenv("CHECK_COOKIES", "1").strip().lower() not in {
 
 # Warn once a credential has this many days or fewer left, so the cookies can be
 # re-exported before downloads start failing.
-EXPIRY_WARN_DAYS = int(os.getenv("EXPIRY_WARN_DAYS", "14"))
+EXPIRY_WARN_DAYS = env_number("EXPIRY_WARN_DAYS", 14)
 
 # Remove the clutter a request creates once it succeeds: the "parsing..." notice,
 # and the original message that carried the link.
@@ -156,20 +218,20 @@ TELEGRAPH_ALLOW_ADULT = os.getenv(
 TELEGRAPH_AUTHOR = os.getenv("TELEGRAPH_AUTHOR", "e-hentai 解析").strip()
 # The gallery page is fetched directly, which takes about a second; the timeout is
 # generous only to absorb a slow network or e-hentai rate limiting.
-EHENTAI_TIMEOUT_SECONDS = int(os.getenv("EHENTAI_TIMEOUT", "60"))
+EHENTAI_TIMEOUT_SECONDS = env_number("EHENTAI_TIMEOUT", 60)
 
 # Downloading every page is much slower than reading metadata: a 53-page original
 # set transfers hundreds of megabytes. This is separate on purpose, so a slow
 # network does not make the fast metadata path look broken.
-EHENTAI_DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("EHENTAI_DOWNLOAD_TIMEOUT", "900"))
+EHENTAI_DOWNLOAD_TIMEOUT_SECONDS = env_number("EHENTAI_DOWNLOAD_TIMEOUT", 900)
 
 # Parallel image downloads from e-hentai's CDN. Measured on a 5-page gallery:
 # 5 images took 5.5s at 5 workers, against 29s for gallery-dl's default pacing.
-EHENTAI_DOWNLOAD_WORKERS = int(os.getenv("EHENTAI_DOWNLOAD_WORKERS", "6"))
+EHENTAI_DOWNLOAD_WORKERS = env_number("EHENTAI_DOWNLOAD_WORKERS", 6)
 
 # Viewer pages are plain page views rather than metered image downloads, so a
 # handful of workers is fine; measured 1.91s sequential vs 0.44s at 8.
-EHENTAI_VIEWER_WORKERS = int(os.getenv("EHENTAI_VIEWER_WORKERS", "6"))
+EHENTAI_VIEWER_WORKERS = env_number("EHENTAI_VIEWER_WORKERS", 6)
 
 # Connections used to fetch one official archive. e-hentai's CDN throttles each
 # connection hard, so one stream leaves the link idle. Measured on a 16 MiB prefix of
@@ -179,12 +241,11 @@ EHENTAI_VIEWER_WORKERS = int(os.getenv("EHENTAI_VIEWER_WORKERS", "6"))
 #     8 connections   3.38 MiB/s   (saturated - no gain past 4)
 # Four is the point past which it stops paying, so the default sits there and the code
 # caps itself at 8 regardless of what is configured.
-EHENTAI_ARCHIVE_WORKERS = int(os.getenv("EHENTAI_ARCHIVE_WORKERS", "4"))
+EHENTAI_ARCHIVE_WORKERS = env_number("EHENTAI_ARCHIVE_WORKERS", 4)
 
 # Below this, parallel range requests cost more in round trips than they save, so a
 # small archive is fetched in one stream.
-ARCHIVE_PARALLEL_MIN_BYTES = int(
-    os.getenv("ARCHIVE_PARALLEL_MIN_BYTES", str(8 * 1024 * 1024)))
+ARCHIVE_PARALLEL_MIN_BYTES = env_number("ARCHIVE_PARALLEL_MIN_BYTES", 8 * 1024 * 1024)
 
 # **Total** wall-clock budget for one official-archive download, across all connections.
 #
@@ -196,8 +257,7 @@ ARCHIVE_PARALLEL_MIN_BYTES = int(
 #
 # This is a deadline for the whole download, not a per-read timeout: the clock starts when
 # the transfer does, and it covers every range worker together.
-ARCHIVE_DEADLINE_SECONDS = int(
-    os.getenv("ARCHIVE_DEADLINE_SECONDS", str(5 * 60)))
+ARCHIVE_DEADLINE_SECONDS = env_number("ARCHIVE_DEADLINE_SECONDS", 5 * 60)
 
 # e-hentai's own namespace display names, overridable so a Chinese-only page can
 # be produced without editing the module.
@@ -253,7 +313,7 @@ WORK_DIR = os.getenv("WORK_DIR", "").strip()
 # and then breaks X/Twitter and Pixiv outright. A generated config repoints it
 # next to the bot instead. Set GALLERY_DL_CONFIG to use your own config file.
 GALLERY_DL_CONFIG = os.getenv("GALLERY_DL_CONFIG", "").strip()
-GALLERY_DL_CACHE_DIR = os.getenv("GALLERY_DL_CACHE", ".gallery-dl-cache").strip()
+GALLERY_DL_CACHE_DIR = env_text("GALLERY_DL_CACHE", ".gallery-dl-cache")
 
 # Pixiv artwork pages are fetched through Pixiv's App API, which authenticates
 # with an OAuth refresh token rather than a cookie. A PHPSESSID cookie alone is
@@ -274,8 +334,8 @@ ATTACH_SOURCE_LINK = os.getenv("ATTACH_SOURCE_LINK", "1").strip().lower() not in
 SOURCE_LABEL = os.getenv("SOURCE_LABEL", "原始連結")
 
 # Optional Pillow-based downscale for photos over Telegram's photo limit.
-PHOTO_DOWNSCALE_MAX_EDGE = int(os.getenv("PHOTO_DOWNSCALE_MAX_EDGE", "2560"))
-PHOTO_DOWNSCALE_QUALITY = int(os.getenv("PHOTO_DOWNSCALE_QUALITY", "88"))
+PHOTO_DOWNSCALE_MAX_EDGE = env_number("PHOTO_DOWNSCALE_MAX_EDGE", 2560)
+PHOTO_DOWNSCALE_QUALITY = env_number("PHOTO_DOWNSCALE_QUALITY", 88)
 
 # Empty means everyone can use the bot. Otherwise, list numeric Telegram user IDs.
 ALLOWED_USER_IDS = {
@@ -288,7 +348,7 @@ ALLOWED_USER_IDS = {
 # (and a bootstrap for the first administrator, which cannot be granted in-chat
 # for the obvious reason); everything else can be managed with /grant, /revoke,
 # /promote, /demote and /lock, and survives restarts through this file.
-AUTH_FILE = Path(os.getenv("AUTH_FILE", str(BASE_DIR / "authorized.json")))
+AUTH_FILE = Path(env_text("AUTH_FILE", str(BASE_DIR / "authorized.json")))
 
 # Whether the authorized list is a restriction. With False - the default - an empty
 # list means everyone may parse, so enabling the list would otherwise silently cut
@@ -599,13 +659,6 @@ VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
 ANIMATION_EXTENSIONS = {".gif"}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | ANIMATION_EXTENSIONS
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger("twitter_pixiv_bot")
-
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 last_request_time = {}
 
@@ -695,14 +748,14 @@ def get_host(url: str) -> str:
 # What is deliberately NOT cached is the failure case: a link that failed is
 # retried, because the usual cause is a transient one or a credential that the
 # operator has since fixed.
-CACHE_FILE = Path(os.getenv("CACHE_FILE", str(BASE_DIR / "parse_cache.json")))
-CACHE_DIR = Path(os.getenv("CACHE_DIR", str(BASE_DIR / ".cache")))
+CACHE_FILE = Path(env_text("CACHE_FILE", str(BASE_DIR / "parse_cache.json")))
+CACHE_DIR = Path(env_text("CACHE_DIR", str(BASE_DIR / ".cache")))
 
 # A media cache is a copy of files the bot already downloaded. Kept bounded so it
 # cannot fill the disk: entries older than this are dropped when the cache is
 # pruned, and the oldest are evicted first.
-CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", str(14 * 24 * 3600)))
-CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "300"))
+CACHE_STALE_SECONDS = env_number("CACHE_STALE_SECONDS", 14 * 24 * 3600)
+CACHE_MAX_ENTRIES = env_number("CACHE_MAX_ENTRIES", 300)
 
 # A count bound alone does not bound the disk. 300 entries x MAX_FILES files x any size
 # is unbounded in bytes, and the measured cache was already 101 MB from 29 files. A
@@ -712,7 +765,7 @@ CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "300"))
 # Entries are evicted whole rather than by file: half an artwork in the cache would be
 # served as the complete work, which the completeness check refuses anyway - so the entry
 # must go together or not at all.
-CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
+CACHE_MAX_BYTES = env_number("CACHE_MAX_BYTES", 2 * 1024 * 1024 * 1024)
 
 # e-hentai's page images are served from signed, time-limited URLs, and the signature
 # lives far less long than the 14-day cache entry that carries it. A cached sweep that
@@ -720,7 +773,7 @@ CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
 # the serial gallery-dl fallback - the "補齊缺少的頁面" step. Keeping the URL list on a
 # much shorter clock means a stale list is refreshed instead of being discovered by
 # failing.
-GALLERY_URL_TTL_SECONDS = int(os.getenv("GALLERY_URL_TTL_SECONDS", str(2 * 3600)))
+GALLERY_URL_TTL_SECONDS = env_number("GALLERY_URL_TTL_SECONDS", 2 * 3600)
 
 
 def normalize_cache_key(url: str) -> str:
@@ -6430,7 +6483,7 @@ def build_application() -> Application:
     #
     # Raising the ceiling does not slow anything down: a timeout is an upper bound, and a
     # normal send returns as soon as it is done.
-    request_timeout = max(1.0, float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "180") or 180))
+    request_timeout = max(1.0, env_number("TELEGRAM_TIMEOUT_SECONDS", 180, kind=float))
     request_kwargs = dict(
         read_timeout=request_timeout,
         write_timeout=request_timeout,

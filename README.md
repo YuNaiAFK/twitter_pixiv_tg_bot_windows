@@ -1426,6 +1426,49 @@ though the bot **id** is now permanently public and should be treated as such.
 | LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
 | LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
 
+### A warning could stop the bot from starting, and a blank `.env` would
+
+Found while testing the change above, and both are the same mistake in two forms:
+**a failure path that was never taken during development.**
+
+#### `logger` was defined below code that used it
+
+`logger` was created hundreds of lines into the file, but `Authorization.load()` runs at
+import time well above it - and both `load()` and `save()` log warnings from their failure
+paths. On a normal start neither path is taken, so the missing name never showed. The
+moment one was taken, the bot died at import with:
+
+    NameError: name 'logger' is not defined
+
+pointing at a warning call rather than at the cause. Logging is now configured before
+anything that logs. **A warning must never be able to stop the bot from starting.**
+
+#### `os.getenv("X", default)` does not default for an empty value
+
+`.env.example` lists every optional key, and the instructions say to copy it. Every
+optional value in it was blank - and `int("")` raises:
+
+    ValueError: invalid literal for int() with base 10: ''
+
+so copying the template produced a bot that would not start, with an error naming a line
+far from the cause. There was a quieter version of the same trap for paths: `Path("")` is
+the current directory, so a blank `AUTH_FILE` or `CACHE_DIR` silently pointed at the
+repository folder instead of the intended file.
+
+Both are handled now by `env_number()` and `env_text()`, which treat a missing, blank or
+whitespace-only value as unset. A test copies `.env.example` verbatim into a scratch
+directory, blanks **every** value, and asserts the bot still imports:
+
+    AUTH_FILE  = authorized.json
+    CACHE_FILE = parse_cache.json
+    CACHE_DIR  = .cache
+    MAX_FILES  = 20   DEADLINE = 300
+
+Writing that test caught two more mistakes of my own: a helper referenced `time` where the
+module imports it as `_time`, so it threw `NameError` and silently returned `False`; and a
+mechanical regex that rewrote `int(os.getenv(...))` matched across a `try/except` boundary
+and produced a syntax error. Fixed sites by hand after that.
+
 ### The archive had no total time bound, and page images sat in memory
 
 **Two separate problems in the same download path.**

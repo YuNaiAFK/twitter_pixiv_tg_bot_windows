@@ -59,6 +59,67 @@ def check(name: str, condition, detail: str = "") -> bool:
     return ok
 
 
+def _unguarded_number_reads() -> int:
+    """
+    Count `int(...)`/`float(...)` applied directly to an environment value.
+
+    Only the two inside try/except blocks are acceptable: they already fall back on a bad
+    value. Anywhere else, `int("")` raises at import.
+    """
+    import re as _r
+    source = Path(HERE / "bot.py").read_text(encoding="utf-8")
+    lines = source.splitlines()
+    total = 0
+    for match in _r.finditer(r"(int|float)\(\s*(?:\n\s*)?os\.getenv", source):
+        start = source[:match.start()].count("\n")
+        # In scope if an indented `try:` appears within the few lines above it.
+        window = lines[max(0, start - 6):start]
+        if not any(l.strip() == "try:" for l in window):
+            total += 1
+    return total
+
+
+def _imports_with_blank_env() -> bool:
+    """
+    Run the real bot module in a scratch copy with every optional key set to blank.
+
+    A subprocess, not an import: this has to observe import-time behaviour, and the module
+    is already imported in this process. `.env.example` verbatim is the realistic input,
+    because that is the file the documentation tells people to copy.
+    """
+    import os as _os
+    import shutil as _sh
+    import subprocess as _sp
+    import sys as _sys
+    import tempfile as _tf
+    try:
+        work = Path(_tf.mkdtemp(prefix="dsh-blankenv-"))
+        try:
+            for path in HERE.glob("*.py"):
+                (work / path.name).write_text(
+                    path.read_text(encoding="utf-8"), encoding="utf-8")
+            example = (HERE / ".env.example").read_text(encoding="utf-8")
+            blanked = "\n".join(
+                (line.split("=")[0] + "=")
+                if ("=" in line and not line.strip().startswith("#")) else line
+                for line in example.splitlines())
+            (work / ".env").write_text(blanked, encoding="utf-8")
+            env = dict(_os.environ,
+                       PYTHONPATH=str(HERE / "vendor"),
+                       PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+            result = _sp.run(
+                [_sys.executable, "-c",
+                 "import sys; sys.path.insert(0,'.'); import bot;"
+                 "print('OK', bot.MAX_FILES, bot.ARCHIVE_DEADLINE_SECONDS)"],
+                cwd=work, env=env, stdout=_sp.PIPE, stderr=_sp.PIPE,
+                encoding="utf-8", errors="replace", timeout=180)
+            return result.returncode == 0 and "OK" in (result.stdout or "")
+        finally:
+            _sh.rmtree(work, ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _deadline_reports_to_user() -> bool:
     """
     The timeout must be an EhentaiError so run_gallery_archive shows it in the chat.
@@ -932,6 +993,60 @@ check("a failed or stopped page leaves no partial behind",
 check("streamed pages are byte-identical to the source",
       _streamed_pages_are_identical(),
       "the download must produce exactly the original bytes")
+
+# --- A blank .env must not stop the bot starting ---
+
+# `.env.example` lists every optional key with an EMPTY value, and the README tells people
+# to copy it. `os.getenv("X", "180")` does NOT default for an empty value, so `int("")`
+# raised ValueError at import and the bot would not start - one paste away, with the error
+# pointing at a line far from the cause. There was a second, quieter version of the same
+# trap: `Path("")` is the current directory, so a blank path setting silently became the
+# repository folder.
+check("a blank numeric setting falls back to its default",
+      bot.env_number("DEFINITELY_UNSET_FOR_TESTS", 42) == 42,
+      "a missing value must not raise")
+for _blank in ("", "   ", "not-a-number"):
+    os.environ["DSH_TEST_NUMBER"] = _blank
+    try:
+        _got = bot.env_number("DSH_TEST_NUMBER", 7)
+        check(f"env_number({_blank!r}) -> default", _got == 7, f"got {_got!r}")
+    finally:
+        os.environ.pop("DSH_TEST_NUMBER", None)
+os.environ["DSH_TEST_NUMBER"] = "13"
+try:
+    check("a real numeric setting is still honoured",
+          bot.env_number("DSH_TEST_NUMBER", 7) == 13)
+finally:
+    os.environ.pop("DSH_TEST_NUMBER", None)
+
+check("a blank path setting falls back to its default",
+      bot.env_text("DEFINITELY_UNSET_FOR_TESTS", "fallback") == "fallback")
+os.environ["DSH_TEST_TEXT"] = ""
+try:
+    check("an empty string is treated as unset, not as a value",
+          bot.env_text("DSH_TEST_TEXT", "fallback") == "fallback",
+          "Path('') is the current directory - the wrong file, not a crash")
+finally:
+    os.environ.pop("DSH_TEST_TEXT", None)
+
+check("the credential paths do not depend on a bare getenv",
+      'env_text(\"AUTH_FILE\"' in inspect.getsource(bot)
+      and 'env_text(\"CACHE_DIR\"' in inspect.getsource(bot),
+      "a blank key would turn the cache directory into the repository")
+check("every numeric setting is read through env_number",
+      # Two raw conversions remain, both inside try/except blocks that already handle a
+      # bad value; anything else would be an unguarded int("").
+      _unguarded_number_reads() == 0,
+      f"{_unguarded_number_reads()} unguarded int()/float() of an environment value")
+check("logging is configured before anything that logs",
+      # AUTHORIZATION is built at import and its failure paths log. When logger was
+      # defined below that, taking one of those paths killed the bot with NameError.
+      inspect.getsource(bot).index('logger = logging.getLogger("twitter_pixiv_bot")')
+      < inspect.getsource(bot).index("AUTHORIZATION = Authorization.load"),
+      "a warning must never stop the bot from starting")
+check("the bot imports with every optional setting blank",
+      _imports_with_blank_env(),
+      "this is what copying .env.example produces")
 
 # The cookie reader sent EVERY cookie in the file to e-hentai, including the .x.com and
 # .pixiv.net entries a multi-site cookie export carries - another site's session cookies
