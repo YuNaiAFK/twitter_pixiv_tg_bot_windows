@@ -1453,6 +1453,31 @@ cannot import `telegram` and dies immediately:
 console window and its owning process, so "which process put that window there" is answered by
 running it rather than by guessing.
 
+## A refused group is answered with silence, not a refusal
+
+The authorization refusal is a useful answer in a **private** chat: the person who added the
+bot sees why nothing happened and can ask to be authorized. In a **group** it is the opposite -
+the bot answers every link anyone posts in a chat it was told not to serve, which is noise in
+someone else's conversation, and it advertises the bot's presence to people who were not asking
+it anything. The members cannot act on the refusal either.
+
+So the refusal is now decided by the chat type:
+
+| the chat | the answer |
+| --- | --- |
+| group, not authorized | **silence** |
+| supergroup, not authorized | **silence** |
+| private, not authorized | 此機器人目前不允許你的帳號使用。 |
+| authorized group | the files, as before |
+
+The guard is the first thing `handle_message` does, so a refused group never reaches any other
+reply - the cooldown notice, the unsupported-link notice and the failure messages are all
+unreachable for it. The button callbacks are gated by the same rule with `show_alert`, which is
+a popup only the person who pressed sees, and a refused group was never sent a message with
+buttons to press in the first place.
+
+## A legacy pixiv link was served another artwork's files
+
 ## A legacy pixiv link was served another artwork's files
 
 Reported from a log: a `member_illust.php?...&illust_id=...` link failed with

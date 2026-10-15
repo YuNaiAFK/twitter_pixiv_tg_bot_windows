@@ -7315,11 +7315,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # The chat is passed too, because in a group the group's own authorization
     # decides, not the member's - which is what makes authorizing a group enough for
     # everyone in it.
-    if not user_is_allowed(
-            user.id,
-            getattr(message, "chat_id", None),
-            getattr(getattr(message, "chat", None), "type", None)):
-        await send_status(message, "此機器人目前不允許你的帳號使用。")
+    chat_type = getattr(getattr(message, "chat", None), "type", None)
+    if not user_is_allowed(user.id, getattr(message, "chat_id", None), chat_type):
+        # **A group that is not allowed gets silence, not a refusal.**
+        #
+        # The refusal is a useful answer in a private chat: the person who added the bot can
+        # see why nothing happened and can ask to be authorized. In a group it is the opposite
+        # - the bot answers every link anyone posts in a chat it was told not to serve, which
+        # is noise in someone else's conversation, and it advertises the bot's presence to
+        # people who were not asking it anything. The group's members cannot act on it either.
+        if chat_type not in {"group", "supergroup"}:
+            await send_status(message, "此機器人目前不允許你的帳號使用。")
         return
 
     # Telegram links are identified separately and never sent to the downloader.

@@ -280,6 +280,110 @@ def _lock_call_uses_the_setting() -> bool:
     return False
 
 
+def _refused_chat_replies(chat_type: str, chat_id: int) -> int:
+    """
+    How many messages the bot sends when a chat is not authorized.
+
+    The authorization state is forced to refuse every group and every user, then restored.
+    """
+    import asyncio
+
+    class Msg:
+        def __init__(self, ctype, cid):
+            self.text = "https://www.pixiv.net/artworks/150824857"
+            self.caption = None
+            self.chat_id = cid
+            self.message_id = 1
+            self.chat = type("C", (), {"type": ctype})()
+            self.sent = 0
+
+        async def reply_text(self, *_a, **_k):
+            self.sent += 1
+            return self
+
+        async def edit_text(self, *_a, **_k):
+            self.sent += 1
+            return self
+
+        async def reply_document(self, *_a, **_k):
+            self.sent += 1
+            return self
+
+        async def reply_media_group(self, *_a, **_k):
+            self.sent += 1
+            return self
+
+        async def reply_photo(self, *_a, **_k):
+            self.sent += 1
+            return self
+
+        async def edit_media(self, *_a, **_k):
+            return self
+
+        async def delete(self):
+            return self
+
+    class User:
+        def __init__(self, uid):
+            self.id = uid
+            self.full_name = "T"
+            self.username = "t"
+            self.is_bot = False
+
+    class Update:
+        def __init__(self, ctype, cid, uid):
+            self.effective_message = Msg(ctype, cid)
+            self.effective_user = User(uid)
+            self.message = self.effective_message
+
+    saved_groups = set(bot.AUTHORIZATION.groups)
+    saved_allowed = set(bot.AUTHORIZATION.allowed)
+    saved_locked = bot.AUTHORIZATION.group_locked
+    try:
+        bot.AUTHORIZATION.groups = set()
+        bot.AUTHORIZATION.group_locked = True
+        bot.AUTHORIZATION.allowed = set()
+        update = Update(chat_type, chat_id, chat_id)
+        asyncio.run(asyncio.wait_for(bot.handle_message(update, None), timeout=30))
+        return update.effective_message.sent
+    except Exception:  # noqa: BLE001
+        return -1
+    finally:
+        bot.AUTHORIZATION.groups = saved_groups
+        bot.AUTHORIZATION.allowed = saved_allowed
+        bot.AUTHORIZATION.group_locked = saved_locked
+
+
+def _refused_group_is_silent() -> bool:
+    return (_refused_chat_replies("group", -1001234567890) == 0
+            and _refused_chat_replies("supergroup", -1009876543210) == 0)
+
+
+def _refused_private_still_explains() -> bool:
+    return _refused_chat_replies("private", 555003) == 1
+
+
+def _refusal_checks_chat_type() -> bool:
+    """The refusal branch must be conditional on the chat type."""
+    import ast
+    import inspect as _i
+    import textwrap
+    src = textwrap.dedent(_i.getsource(bot.handle_message))
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return False
+    # Find `if not user_is_allowed(...)` and require a chat-type test in the same statement
+    # or the statement immediately after it.
+    text = ast.unparse(tree)
+    marker = "if not user_is_allowed("
+    at = text.find(marker)
+    if at == -1:
+        return False
+    following = text[at:at + 700]
+    return "chat_type" in following and "supergroup" in following
+
+
 def _identity_query_survives() -> bool:
     """The id in a legacy pixiv query must be part of the key."""
     key = bot.normalize_cache_key(
@@ -2459,6 +2563,24 @@ check("the work-state check retries before giving up",
 check("a persistent failure still reports unknown",
       _work_state_gives_up_as_unknown(),
       "retrying must not turn an unverifiable state into an accusation")
+# --- A refused group was answered with a refusal ---
+
+# The refusal is a useful answer in a private chat: the person who added the bot sees why
+# nothing happened. In a group it is the opposite - the bot answers every link anyone posts in
+# a chat it was told not to serve, which is noise in someone else's conversation and
+# advertises the bot to people who were not asking it anything. The members cannot act on it
+# either.
+check("a refused group is answered with silence",
+      _refused_group_is_silent(),
+      "replying in a group it must not serve is noise in someone else's chat")
+check("a refused private chat is still told why",
+      _refused_private_still_explains(),
+      "in private the person who added the bot can act on the message")
+check("the refusal is decided from the chat type",
+      # Asserted on the condition, because a search for "group" would match the comment.
+      _refusal_checks_chat_type(),
+      "the silence must apply to groups and not to private chats")
+
 check("a verification run is not refused by the instance guard",
       # verify_boot.py never reaches polling, so it cannot be a second poller - but it used to
       # be refused whenever the bot was running, which read as a boot-path regression.
