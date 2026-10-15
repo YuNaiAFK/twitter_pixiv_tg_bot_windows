@@ -1506,8 +1506,6 @@ same legacy path downloads normally instead of inheriting the poisoned cache ent
 
 ## Windows shows "Open File - Security Warning" every time
 
-## Windows shows "Open File - Security Warning" every time
-
 Double-clicking `run.bat` (or a shortcut to it) prompts:
 
     打开文件 - 安全警告
