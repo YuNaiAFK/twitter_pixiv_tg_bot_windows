@@ -374,30 +374,30 @@ SOURCE_LABEL = os.getenv("SOURCE_LABEL", "原始連結")
 PHOTO_DOWNSCALE_MAX_EDGE = env_number("PHOTO_DOWNSCALE_MAX_EDGE", 2560)
 PHOTO_DOWNSCALE_QUALITY = env_number("PHOTO_DOWNSCALE_QUALITY", 88)
 
-# Empty means everyone can use the bot. Otherwise, list numeric Telegram user IDs.
-ALLOWED_USER_IDS = {
+# Private-chat **blocklist**: numeric Telegram user IDs who may NOT parse. Empty means
+# everyone can, which is the intended default - parsing is open to any visitor and the list
+# exists to exclude the occasional abuser.
+#
+# `ALLOWED_USER_IDS` is still read as a fallback so an existing `.env` is not silently
+# ignored. Its ids now mean "blocked" - the opposite of what the name promised. See the
+# Authorization docstring for why that direction is the safe one.
+BLOCKED_USER_IDS = {
     int(item.strip())
-    for item in os.getenv("ALLOWED_USER_IDS", "").split(",")
+    for item in (os.getenv("BLOCKED_USER_IDS") or os.getenv("ALLOWED_USER_IDS") or "").split(",")
     if item.strip().isdigit()
 }
 
 # Runtime-managed authorization. The .env values above are the starting point
 # (and a bootstrap for the first administrator, which cannot be granted in-chat
-# for the obvious reason); everything else can be managed with /grant, /revoke,
-# /promote, /demote and /lock, and survives restarts through this file.
+# for the obvious reason); everything else can be managed with /block, /unblock,
+# /blocked, /promote, /demote and /grant, and survives restarts through this file.
 AUTH_FILE = Path(env_text("AUTH_FILE", str(BASE_DIR / "authorized.json")))
 
-# Whether the authorized list is a restriction. With False - the default - an empty
-# list means everyone may parse, so enabling the list would otherwise silently cut
-# off every existing user. With True, an empty list means nobody may parse, which
-# is a deliberate choice an operator has to make.
-LOCKED_DEFAULT = os.getenv("AUTH_LOCKED", "0").strip().lower() in {
-    "1", "true", "yes", "on",
-}
-
-# The same choice for group chats, kept separate because it answers a different
-# question. With only AUTH_LOCKED set, private chats were gated while every group
-# stayed usable - the bot looked restricted and was not.
+# Group chats keep a gate mode, because "which groups may use this" is genuinely a choice:
+# with no groups authorized, this decides whether every group is welcome or none is.
+#
+# Private chats have no equivalent: the blocklist is never a gate, so AUTH_LOCKED is gone.
+# An .env that still sets it is simply ignored, which is why nothing has to be migrated.
 GROUP_LOCKED_DEFAULT = os.getenv("AUTH_GROUP_LOCKED", "0").strip().lower() in {
     "1", "true", "yes", "on",
 }
@@ -417,53 +417,56 @@ class Authorization:
     to change it while the bot runs: editing `.env` requires host access, which is
     exactly what an operator in Telegram does not have.
 
-    `locked` decides what an empty **user** list means, and that is the one decision
-    here a reader is most likely to get wrong:
+    **The private-chat list is a BLOCKLIST.** A listed user is refused; everyone else may
+    parse. Administrators always pass, so a mistake cannot lock the operator out of their own
+    bot.
 
-        locked=False (default)  empty list -> everyone may parse
-                                a non-empty list -> only those users may parse
-        locked=True             empty list -> nobody may parse
-                                a non-empty list -> only those users may parse
+        blocked = {5}       users 5 is refused, everyone else may parse
+        blocked = {}        everyone may parse
 
-    **The list is an allowlist in both modes, not a blocklist.** The docs and the mode
-    label used to describe it as a restriction on the listed users, which reads as "these
-    users are the ones being blocked". The code has always done the opposite: once the
-    list has any entry, everyone *not* on it is refused. The behaviour is fail-closed and
-    therefore the safer of the two, but an operator who added one user expecting to block
-    that user would instead have locked out everybody else. Both the wording and the label
-    now say what actually happens.
+    It used to be an allowlist, where one entry cut off everybody who was not on it. That is
+    the wrong shape for this bot: parsing is meant to be **open to any visitor**, and the list
+    exists to exclude the occasional abuser. With an allowlist, adding one abusive user locked
+    out every ordinary visitor instead - the opposite of the intent, and a mistake that is only
+    noticed when people complain.
 
-    Being locked out entirely is worse than being open, so an empty list means
-    "open" unless that meaning was chosen on purpose. Administrators always pass,
-    in both modes, so a locked bot can still be unlocked from within.
+    The field is still called ``allowed`` internally and in the JSON, so an existing
+    ``authorized.json`` keeps loading; only its meaning changed. An old file holding the
+    allowed users therefore arrives here as a blocklist and **those users are blocked**. That
+    is the safer reading of the two - a list of ids is far more likely to be abusers than the
+    complete set of everyone permitted - and ``/blocked`` shows plainly who ended up on it.
+    The JSON is written with a ``blocked`` key as well, which takes precedence when present.
 
-    Group chats are a separate list **and a separate mode**, because "which groups may
-    use this" is a different question from "which people may use this":
+    Group chats keep their own list **and their own mode**, because "which groups may use
+    this" is a different question from "which people may use this":
 
         no groups authorized, group_locked=False   every group may parse
         no groups authorized, group_locked=True    no group may parse
         some groups authorized                     only those groups may parse
 
-    The list wins once it has anything in it. `locked` does **not** govern groups:
-    with only `locked=True`, every group stayed wide open, which is how a bot could
-    look restricted in private chats while any group could still use it.
+    Groups stay an allowlist on purpose: a bot in a public group should serve the groups it
+    was added to deliberately, not every group that happens to contain it. The group list
+    wins once it has anything in it.
     """
 
     def __init__(self, allowed=None, admins=None, groups=None,
-                 locked: bool = False, group_locked: bool = False):
-        self.allowed: set[int] = set(allowed or ())
+                 group_locked: bool = False):
+        # Named `allowed` for the JSON it still reads, but it is a blocklist - see the class
+        # docstring. Renaming it would have been the tidy choice and would have made every
+        # existing authorized.json load as an empty blocklist, silently unblocking exactly the
+        # people an operator had listed.
+        self.blocked: set[int] = set(allowed or ())
         self.admins: set[int] = set(admins or ())
         # Group chat IDs. Telegram gives groups negative IDs, and supergroups are
         # represented as -100…, so these are stored as they arrive.
         self.groups: set[int] = set(groups or ())
-        self.locked: bool = bool(locked)
         self.group_locked: bool = bool(group_locked)
 
     # -------------------- persistence --------------------
 
     @classmethod
     def load(cls, path: Path, *, allowed=None, admins=None, groups=None,
-             locked: bool = False, group_locked: bool = False) -> "Authorization":
+             group_locked: bool = False) -> "Authorization":
         """
         Read the file, falling back to the .env values.
 
@@ -472,7 +475,7 @@ class Authorization:
         failure is treated as "no runtime overrides", which is the state the .env
         alone describes.
         """
-        state = cls(allowed=allowed, admins=admins, groups=groups, locked=locked,
+        state = cls(allowed=allowed, admins=admins, groups=groups,
                     group_locked=group_locked)
         if not path.exists():
             return state
@@ -493,10 +496,13 @@ class Authorization:
                     or (isinstance(v, str) and v.strip().lstrip("-").isdigit()
                         and v.strip().lstrip("-").isdigit())}
 
-        state.allowed = ids("allowed")
+        # `blocked` first, and `allowed` only as the older name for the same list. Both are
+        # read so a file written before this change keeps its ids; see the class docstring for
+        # why an old allowlist arriving as a blocklist is the safe direction.
+        blocked = ids("blocked") if "blocked" in raw else ids("allowed")
+        state.blocked = blocked
         state.admins = ids("admins")
         state.groups = ids("groups")
-        state.locked = bool(raw.get("locked", locked))
         state.group_locked = bool(raw.get("group_locked", group_locked))
 
         # An empty admin set from a *valid* file is a permanent lockout, so it is refused
@@ -530,10 +536,11 @@ class Authorization:
         the next start as a truncated authorization list.
         """
         payload = {
-            "allowed": sorted(self.allowed),
+            # Written under the new name, and `allowed` is no longer emitted: both keys would
+            # be two sources of truth for one list, and the loader prefers `blocked`.
+            "blocked": sorted(self.blocked),
             "admins": sorted(self.admins),
             "groups": sorted(self.groups),
-            "locked": self.locked,
             "group_locked": self.group_locked,
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -560,18 +567,14 @@ class Authorization:
 
     def user_allowed(self, user_id: int) -> bool:
         """
-        Whether this user may parse, judging only the user-level lists.
+        Whether this user may parse a private-chat request.
 
-        Administrators always pass, even in locked mode, so a mistake in the list
-        cannot leave nobody able to fix it.
+        **The list blocks; it does not admit.** Only a listed user is refused. Administrators
+        always pass, so a mistake in the list cannot leave the operator unable to fix it.
         """
         if self.is_admin(user_id):
             return True
-        if self.locked:
-            return user_id in self.allowed
-        if not self.allowed:
-            return True
-        return user_id in self.allowed
+        return user_id not in self.blocked
 
     def group_allowed(self, chat_id: int) -> bool:
         """
@@ -581,6 +584,10 @@ class Authorization:
         False means every group is welcome (the original behaviour), True means no
         group is. The list wins once it has anything in it, so a locked bot with
         authorized groups serves exactly those.
+
+        Groups stay an **allowlist** while private chats are a blocklist: a bot in a public
+        group should serve the groups it was deliberately added to, not every group that
+        happens to contain it.
         """
         if chat_id in self.groups:
             return True
@@ -595,8 +602,8 @@ class Authorization:
 
         In a group, the group's authorization is what counts: that is the whole
         point of authorizing a group, and it is why a member of an authorized group
-        is admitted even when the user list is locked down. A private chat has no
-        group to speak for it, so the user-level rules apply there.
+        is admitted whatever the private blocklist says. A private chat has no group
+        to speak for it, so the blocklist applies there.
 
         An administrator passes everywhere, including in a group that is not on the
         list, so an operator is never locked out of their own bot.
@@ -609,9 +616,9 @@ class Authorization:
 
     @property
     def mode_label(self) -> str:
-        if self.locked:
-            return "守門模式（只有名單內的人可解析）"
-        return "開放模式（所有人可解析，但名單一旦有內容就只有名單內的人可用）"
+        if self.blocked:
+            return f"黑名單模式（已封鎖 {len(self.blocked)} 人，其他人可解析）"
+        return "黑名單模式（目前沒有人被封鎖，所有人都可解析）"
 
     @property
     def group_mode_label(self) -> str:
@@ -629,25 +636,26 @@ class Authorization:
 
     # -------------------- mutations --------------------
 
-    def grant(self, user_id: int) -> bool:
-        """Allow a user. Returns whether anything changed."""
-        if user_id in self.allowed:
+    def block(self, user_id: int) -> bool:
+        """Refuse this user. Returns whether anything changed."""
+        if user_id in self.blocked:
             return False
-        self.allowed.add(user_id)
+        self.blocked.add(user_id)
         return True
 
-    def revoke(self, user_id: int) -> bool:
-        if user_id not in self.allowed:
+    def unblock(self, user_id: int) -> bool:
+        """Stop refusing this user. Returns whether anything changed."""
+        if user_id not in self.blocked:
             return False
-        self.allowed.discard(user_id)
+        self.blocked.discard(user_id)
         return True
 
     def promote(self, user_id: int) -> bool:
         changed = user_id not in self.admins
         self.admins.add(user_id)
-        # An administrator is implicitly allowed, so a stale entry would only be
-        # confusing in the listing.
-        self.allowed.discard(user_id)
+        # An administrator passes regardless, so a stale block entry would only be
+        # confusing in the listing - and worse, would look like the operator is blocked.
+        self.blocked.discard(user_id)
         return changed
 
     def demote(self, user_id: int) -> bool:
@@ -671,8 +679,8 @@ class Authorization:
 
 
 AUTHORIZATION = Authorization.load(
-    AUTH_FILE, allowed=ALLOWED_USER_IDS, admins=ADMIN_USER_IDS,
-    locked=LOCKED_DEFAULT, group_locked=GROUP_LOCKED_DEFAULT,
+    AUTH_FILE, allowed=BLOCKED_USER_IDS, admins=ADMIN_USER_IDS,
+    group_locked=GROUP_LOCKED_DEFAULT,
 )
 
 # Administrators are declared above, beside the authorization store that owns both
@@ -2462,15 +2470,10 @@ def user_is_admin(user_id: int) -> bool:
     return AUTHORIZATION.is_admin(user_id)
 
 
-def user_can_manage_list(user_id: int) -> bool:
-    """
-    Whether a user may change the authorized list.
-
-    Administrators can, and so can anyone already on the list: an authorized user
-    is trusted to pass the access on. Administrators themselves are handled by
-    user_is_admin, so this is not a route to creating more administrators.
-    """
-    return AUTHORIZATION.is_admin(user_id) or user_id in AUTHORIZATION.allowed
+# `user_can_manage_list` used to live here: administrators *or* authorized users could change
+# the list, which was sound while the list admitted people. The private list refuses them now,
+# so that rule would have handed the blocklist to the users it blocks - a blocked user could
+# unblock themselves and block anyone else. The list commands are `admin_only`.
 
 
 # -------------------- Source link and caption helpers --------------------
@@ -3743,10 +3746,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 連結冷卻時間：{USER_COOLDOWN_SECONDS} 秒（按鈕不受此限制）",
         "• 同一使用者同時只能有一個請求在處理中",
     ]
-    if ALLOWED_USER_IDS:
-        lines.append(f"• .env 白名單：{len(ALLOWED_USER_IDS)} 人（啟動時的起始值）")
-    lines.append(f"• 授權模式：{AUTHORIZATION.mode_label}")
-    lines.append(f"• 已授權使用者：{len(AUTHORIZATION.allowed)} 人")
+    if BLOCKED_USER_IDS:
+        lines.append(f"• .env 封鎖名單：{len(BLOCKED_USER_IDS)} 人（啟動時的起始值）")
+    lines.append(f"• 私訊模式：{AUTHORIZATION.mode_label}")
+    lines.append(f"• 已封鎖使用者：{len(AUTHORIZATION.blocked)} 人")
     lines.append(f"• 管理員：{len(AUTHORIZATION.admins)} 人")
     if not AUTHORIZATION.admins:
         lines.append("　（未設定管理員，所有管理命令對所有人關閉）")
@@ -3775,41 +3778,15 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # alternative is editing .env, which needs host access - exactly what an operator
 # in Telegram does not have.
 
-def list_manager_only(handler):
-    """
-    Wrap a handler so only administrators and authorized users may run it.
-
-    Chosen over admin_only for the list commands: an authorized user is trusted to
-    pass the access on, but creating another administrator is not part of that and
-    stays behind admin_only.
-
-    Inside a group the bar is higher - administrators only. Group authorization is
-    decided in a group, and if any authorized member could run it then any member of
-    an authorized group could change the lists, which would make the lists
-    self-service for everyone the bot already admits.
-    """
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        message = update.effective_message
-        if not user or not message:
-            return
-        chat_type = getattr(getattr(update, "effective_chat", None), "type", None)
-        in_group = chat_type in {"group", "supergroup"}
-
-        if in_group:
-            if user_is_admin(user.id):
-                return await handler(update, context)
-            await message.reply_text("在群組中只有管理員可以管理授權名單。")
-            return
-
-        if user_can_manage_list(user.id):
-            return await handler(update, context)
-        await message.reply_text("只有管理員或已授權使用者可以管理名單。")
-        return
-
-    wrapper.__name__ = getattr(handler, "__name__", "list_command")
-    wrapper.__doc__ = handler.__doc__
-    return wrapper
+# The interface for who may parse and who may administer. It exists because the
+# alternative is editing .env, which needs host access - exactly what an operator
+# in Telegram does not have.
+#
+# **`list_manager_only` used to live here and is deliberately gone.** It let administrators
+# *and authorized users* change the list, which was sound while the list admitted people. The
+# list now refuses them, so that rule would have handed the blocklist to the users it blocks:
+# a blocked user could unblock themselves and block anyone else. The list commands are
+# `admin_only` now, which is the same rule the admin commands already use.
 
 
 def parse_target_user(context) -> int | None:
@@ -3822,7 +3799,7 @@ def parse_target_user(context) -> int | None:
     ID is what Telegram guarantees, and /id prints it.
 
     The caller's own ID is returned when no argument is given, which makes
-    /grant with no argument a self-service opt-in for the open mode.
+    /block with no argument a self-service way to stop being served.
     """
     args = getattr(context, "args", None) or []
     if not args:
@@ -3839,7 +3816,7 @@ def parse_target_user(context) -> int | None:
 def authorization_report() -> str:
     """The current lists and what they mean, for an operator to read."""
     lines = [
-        f"• 模式：{AUTHORIZATION.mode_label}",
+        f"• 私訊模式：{AUTHORIZATION.mode_label}",
     ]
     if AUTHORIZATION.admins:
         lines.append("• 管理員：" + ", ".join(
@@ -3847,11 +3824,11 @@ def authorization_report() -> str:
     else:
         lines.append("• 管理員：（未設定，所有管理命令對所有人關閉）")
 
-    if AUTHORIZATION.allowed:
-        lines.append(f"• 已授權使用者（{len(AUTHORIZATION.allowed)}）：" +
-                     ", ".join(str(uid) for uid in sorted(AUTHORIZATION.allowed)))
+    if AUTHORIZATION.blocked:
+        lines.append(f"• 已封鎖使用者（{len(AUTHORIZATION.blocked)}）：" +
+                     ", ".join(str(uid) for uid in sorted(AUTHORIZATION.blocked)))
     else:
-        lines.append("• 已授權使用者：無")
+        lines.append("• 已封鎖使用者：無（所有人都可以解析）")
 
     if AUTHORIZATION.groups:
         lines.append(f"• 已授權群組（{len(AUTHORIZATION.groups)}）：" +
@@ -3861,12 +3838,10 @@ def authorization_report() -> str:
     lines.append(f"• 群組模式：{AUTHORIZATION.group_mode_label}")
     lines.append(f"　群組解析權限：{AUTHORIZATION.group_label}")
 
-    if AUTHORIZATION.locked:
-        lines.append("　私訊解析權限：只有管理員與已授權使用者可用")
-    elif AUTHORIZATION.allowed:
-        lines.append("　私訊解析權限：所有人可用，但名單外的人會被擋下")
+    if AUTHORIZATION.blocked:
+        lines.append("　私訊解析權限：所有人可用，除了上面被封鎖的人")
     else:
-        lines.append("　私訊解析權限：所有人可用（名單為空）")
+        lines.append("　私訊解析權限：所有人可用（沒有人被封鎖）")
 
     lines.append(f"• 授權檔：{AUTH_FILE}")
     return "\n".join(lines)
@@ -3877,27 +3852,26 @@ async def authorized_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     Show who may parse and who may administer.
 
     **Admins only, for the admin part.** This used to be reachable by every allow-listed
-    user through ``list_manager_only``, and the report lists every administrator's numeric
-    ID. Those IDs are not secrets on their own, but there is no reason for an ordinary
-    authorized user to be able to enumerate the admin roster - that is the list an
-    attacker most wants, and it costs nothing to withhold. A non-admin still sees the
-    lists they can act on.
+    user, and the report lists every administrator's numeric ID. Those IDs are not secrets on
+    their own, but there is no reason for an ordinary user to be able to enumerate the admin
+    roster - that is the list an attacker most wants, and it costs nothing to withhold. The
+    command itself is admin_only now, since the list it reports on is the blocklist.
     """
     user = update.effective_user
     if user is not None and not user_is_admin(user.id):
         # Everything except the admin roster.
         extra = []
-        if AUTHORIZATION.allowed:
-            extra.append(f"• 已授權使用者（{len(AUTHORIZATION.allowed)}）：" +
-                         ", ".join(str(uid) for uid in sorted(AUTHORIZATION.allowed)))
+        if AUTHORIZATION.blocked:
+            extra.append(f"• 已封鎖使用者（{len(AUTHORIZATION.blocked)}）：" +
+                         ", ".join(str(uid) for uid in sorted(AUTHORIZATION.blocked)))
         else:
-            extra.append("• 已授權使用者：無")
+            extra.append("• 已封鎖使用者：無（所有人都可以解析）")
         if AUTHORIZATION.groups:
             extra.append(f"• 已授權群組（{len(AUTHORIZATION.groups)}）：" +
                          ", ".join(str(cid) for cid in sorted(AUTHORIZATION.groups)))
         else:
             extra.append("• 已授權群組：無")
-        extra.append(f"• 模式：{AUTHORIZATION.mode_label}")
+        extra.append(f"• 私訊模式：{AUTHORIZATION.mode_label}")
         extra.append(f"• 群組模式：{AUTHORIZATION.group_mode_label}")
         await update.effective_message.reply_text(
             "授權狀態：\n" + "\n".join(extra) +
@@ -3910,14 +3884,16 @@ async def authorized_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Authorize a user or the current group chat.
+    Unblock a user, or authorize the current group chat.
 
-    In a group with no argument this authorizes **that group**, so every member of
-    it may parse - which is the intended way to use it, since a chat ID is awkward
-    to obtain by hand. In a private chat with no argument it authorizes the caller.
+    **Two meanings, one per list, because the two lists work in opposite directions.** The
+    private list is a blocklist, so granting means *removing* a block. The group list is an
+    allowlist, so granting means *adding* a group. Both are "let this one in", which is why
+    one command covers them.
 
-    Granting is what lifts a restriction in the open mode, and what admits someone
-    in the locked mode.
+    In a group with no argument this authorizes **that group**, so every member of it may
+    parse - which is the intended way to use it, since a chat ID is awkward to obtain by
+    hand. In a private chat with no argument it unblocks the caller.
     """
     user = update.effective_user
     message = update.effective_message
@@ -3948,29 +3924,33 @@ async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(
                 "用法：/grant <數字 ID>\n"
                 "• 在群組裡不帶參數：授權這個群組\n"
-                "• 帶數字 ID：授權該使用者\n"
-                "不接受 @username（使用者名稱可以改，授權會指到別人）。"
+                "• 帶數字 ID：解除封鎖該使用者\n"
+                "不接受 @username（使用者名稱可以改，名單會指到別人）。"
             )
             return
         target = user.id
 
     if user_is_admin(target):
-        await message.reply_text(f"{target} 已經是管理員，不需要授權。")
+        await message.reply_text(f"{target} 是管理員，本來就沒有被封鎖。")
         return
 
-    changed = AUTHORIZATION.grant(target)
+    changed = AUTHORIZATION.unblock(target)
     saved = save_authorization()
-    note = "已加入授權名單。" if changed else "本來就在授權名單中。"
+    note = "已解除封鎖。" if changed else "本來就沒有被封鎖。"
     warning = "" if saved else "\n⚠ 無法寫入授權檔，這個變更在重新啟動後會消失。"
     await message.reply_text(f"{target}：{note}{warning}\n\n{authorization_report()}")
 
 
 async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Remove a user, or the current group chat, from the authorized lists.
+    Block a user, or remove the current group chat from the authorized list.
 
-    In a group with no argument this revokes **that group**. Use it to cut off a
-    specific user or group without locking the bot down for everyone.
+    In a group with no argument this removes **that group's** authorization. In a private
+    chat it adds the user to the **blocklist**, which is the whole point of the list: cutting
+    off one abuser without touching anyone else.
+
+    Administrators cannot be blocked, because they pass the check regardless - a block entry
+    for one would only look like it worked.
     """
     message = update.effective_message
     chat = getattr(update, "effective_chat", None)
@@ -3999,22 +3979,46 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(
                 "用法：/revoke <數字 ID>\n"
                 "• 在群組裡不帶參數：移除這個群組的授權\n"
-                "• 帶數字 ID：移除該使用者的授權"
+                "• 帶數字 ID：封鎖該使用者的私訊解析"
             )
             return
         target = update.effective_user.id
 
     if user_is_admin(target):
         await message.reply_text(
-            f"{target} 是管理員，無法用 /revoke 移除。請先用 /demote 取消管理員身分。"
+            f"{target} 是管理員，無法封鎖。請先用 /demote 取消管理員身分。"
         )
         return
 
-    changed = AUTHORIZATION.revoke(target)
+    changed = AUTHORIZATION.block(target)
     saved = save_authorization()
-    note = "已移出授權名單。" if changed else "本來就不在授權名單中。"
+    note = "已加入封鎖名單，該使用者的私訊解析會被拒絕。" if changed \
+        else "本來就在封鎖名單中。"
     warning = "" if saved else "\n⚠ 無法寫入授權檔，這個變更在重新啟動後會消失。"
     await message.reply_text(f"{target}：{note}{warning}\n\n{authorization_report()}")
+
+
+async def blocked_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    List the blocked users. Administrator only.
+
+    A separate command from /authorized because it is the list an operator actually asks
+    about: "who is blocked right now" is the question behind every complaint, and reading it
+    out of the full report meant scrolling past the group and admin lists to find it.
+    """
+    message = update.effective_message
+    if not AUTHORIZATION.blocked:
+        await message.reply_text(
+            "目前沒有人被封鎖。\n\n"
+            "私訊解析對所有人開放；用 /revoke <ID> 封鎖特定使用者。"
+        )
+        return
+    listing = "\n".join(
+        f"• {uid}" for uid in sorted(AUTHORIZATION.blocked))
+    await message.reply_text(
+        f"已封鎖 {len(AUTHORIZATION.blocked)} 人：\n{listing}\n\n"
+        "用 /grant <ID> 解除封鎖。"
+    )
 
 
 async def promote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4074,54 +4078,22 @@ async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def lock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Choose what an empty authorized list means. Administrator only.
+    Retired: the private list is a blocklist now, so there is no gate mode to choose.
 
-    This is the one setting that can lock the bot down for everybody, so it says
-    plainly which direction it is switching to and refuses nothing else.
+    Kept as a registered command rather than deleted, because an operator who has `/lock`
+    in their notes will type it and deserves an answer instead of silence. It explains what
+    replaced it and shows the current state.
     """
-    message = update.effective_message
-    args = [str(a).lower() for a in (getattr(context, "args", None) or [])]
-
-    if not args or args[0] not in {"on", "off", "status"}:
-        await message.reply_text(
-            "用法：/lock on|off\n"
-            "• on：守門模式 — 只有管理員與已授權使用者可以解析連結\n"
-            "• off：開放模式 — 所有人可以解析，名單變成限制\n\n"
-            + authorization_report()
-        )
-        return
-
-    if args[0] == "status":
-        await message.reply_text(authorization_report())
-        return
-
-    want_locked = args[0] == "on"
-    if want_locked and not AUTHORIZATION.allowed and not AUTHORIZATION.admins:
-        await message.reply_text(
-            "拒絕切換：目前沒有任何管理員或已授權使用者，"
-            "開啟守門模式後沒有人能使用解析功能。\n"
-            "請先 /grant 或 /promote 至少一個人。"
-        )
-        return
-
-    if want_locked == AUTHORIZATION.locked:
-        await message.reply_text(
-            f"已經是{'守門' if want_locked else '開放'}模式。\n\n"
-            + authorization_report()
-        )
-        return
-
-    AUTHORIZATION.locked = want_locked
-    saved = save_authorization()
-    warning = "" if saved else "\n⚠ 無法寫入授權檔，這個變更在重新啟動後會消失。"
-    if want_locked:
-        summary = (
-            "已切換為守門模式：只有管理員與已授權使用者可以解析連結。\n"
-            f"目前名單有 {len(AUTHORIZATION.allowed)} 人。"
-        )
-    else:
-        summary = "已切換為開放模式：所有使用者都可以解析連結。"
-    await message.reply_text(f"{summary}{warning}\n\n{authorization_report()}")
+    await update.effective_message.reply_text(
+        "/lock 已停用。\n\n"
+        "私訊名單現在是**封鎖名單**：名單上的人被拒絕，其他人一律可以解析。\n"
+        "因此沒有「守門模式」可以切換，也就沒有需要設定的地方。\n\n"
+        "• /revoke <ID>：封鎖一個人\n"
+        "• /grant <ID>：解除封鎖\n"
+        "• /blocked：列出目前被封鎖的人\n\n"
+        "群組仍可設定守門模式，請用 /lockgroup。\n\n"
+        + authorization_report()
+    )
 
 
 async def lock_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7627,21 +7599,19 @@ async def post_init(application: Application):
         BotCommand("id", "顯示你的 ID"),
     ])
 
-    # A scoped menu, per administrator. This is why the management commands can
-    # exist without appearing in the public list: Telegram shows a chat its own
-    # scope in preference to the default.
-    operator_commands = [
+    # The admin menu. There is no longer a separate "operator" tier: the list commands became
+    # admin-only when the private list turned into a blocklist, so everything past /id is for
+    # administrators.
+    admin_commands = [
         BotCommand("start", "開始使用"),
         BotCommand("help", "使用說明"),
         BotCommand("id", "顯示你的 ID"),
         BotCommand("authorized", "查看授權狀態"),
-        BotCommand("grant", "授權使用者（/grant <ID>）"),
-        BotCommand("revoke", "移除授權（/revoke <ID>）"),
-    ]
-    admin_commands = operator_commands + [
+        BotCommand("blocked", "列出被封鎖的使用者"),
+        BotCommand("grant", "解除封鎖／授權群組（/grant <ID>）"),
+        BotCommand("revoke", "封鎖使用者（/revoke <ID>）"),
         BotCommand("promote", "設為管理員（/promote <ID>）"),
         BotCommand("demote", "取消管理員（/demote <ID>）"),
-        BotCommand("lock", "私訊守門／開放模式"),
         BotCommand("lockgroup", "群組守門／開放模式"),
         BotCommand("cookies", "登入憑證狀態"),
         BotCommand("status", "執行狀態"),
@@ -7649,9 +7619,13 @@ async def post_init(application: Application):
         BotCommand("restart", "重新啟動機器人"),
     ]
 
-    for user_id in sorted(AUTHORIZATION.allowed | AUTHORIZATION.admins):
-        commands = (admin_commands if user_is_admin(user_id)
-                    else operator_commands)
+    # **Scoped menus go to administrators only.** This used to include `AUTHORIZATION.allowed`
+    # so that authorized users saw the list-management commands. That list is the blocklist
+    # now, so the same line would have advertised operator commands to the users it blocks.
+    # They would have been refused by admin_only, but showing a command that always fails is
+    # still wrong - and it would confirm to a blocked user that the bot is watching.
+    for user_id in sorted(AUTHORIZATION.admins):
+        commands = admin_commands
         try:
             await application.bot.set_my_commands(
                 commands, scope=BotCommandScopeChat(chat_id=user_id)
@@ -7669,9 +7643,9 @@ def log_startup_configuration():
     logger.info("e-hentai 成人畫廊建立 Telegraph：%s", TELEGRAPH_ALLOW_ADULT)
     logger.info("其他連結回覆提示：%s", REPLY_UNSUPPORTED_LINKS)
     logger.info("附上原始連結：%s", ATTACH_SOURCE_LINK)
-    logger.info("授權模式：%s", AUTHORIZATION.mode_label)
+    logger.info("私訊模式：%s", AUTHORIZATION.mode_label)
     logger.info("群組模式：%s", AUTHORIZATION.group_mode_label)
-    logger.info("已授權使用者：%s 人", len(AUTHORIZATION.allowed))
+    logger.info("已封鎖使用者：%s 人", len(AUTHORIZATION.blocked))
     logger.info("已授權群組：%s 個", len(AUTHORIZATION.groups))
     if AUTHORIZATION.admins:
         logger.info("管理員命令可用（%s 位管理員）。", len(AUTHORIZATION.admins))
@@ -8106,16 +8080,21 @@ def main():
     )
 
     # --- Authorization management ---
-    # Authorized users may change the list; only administrators may create another
-    # administrator, which is why /promote and /demote use admin_only instead.
+    # **All admin-only now.** These used to be reachable by authorized users too, which was
+    # sound while the list admitted people. The private list refuses them now, so that rule
+    # would have handed the blocklist to the users it blocks - a blocked user could unblock
+    # themselves and block anyone else.
     application.add_handler(
-        CommandHandler("authorized", list_manager_only(authorized_command))
+        CommandHandler("authorized", admin_only(authorized_command))
     )
     application.add_handler(
-        CommandHandler("grant", list_manager_only(grant_command))
+        CommandHandler("grant", admin_only(grant_command))
     )
     application.add_handler(
-        CommandHandler("revoke", list_manager_only(revoke_command))
+        CommandHandler("revoke", admin_only(revoke_command))
+    )
+    application.add_handler(
+        CommandHandler("blocked", admin_only(blocked_command))
     )
     application.add_handler(
         CommandHandler("promote", admin_only(promote_command))
@@ -8126,9 +8105,9 @@ def main():
     application.add_handler(
         CommandHandler("lock", admin_only(lock_command))
     )
-    # Separate from /lock: that one governs private chats and the user list, and said
+    # Separate from /lock: that one governed private chats and the user list, and said
     # nothing about groups, so a bot that looked locked in private was still usable
-    # from any group.
+    # from any group. Groups keep a gate mode; private chats have none now.
     application.add_handler(
         CommandHandler("lockgroup", admin_only(lock_group_command))
     )

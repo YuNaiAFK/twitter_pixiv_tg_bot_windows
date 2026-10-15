@@ -102,11 +102,12 @@ def _drop_is_silent(notices: bool = False) -> bool:
             self.message = self.effective_message
 
     saved = bot.REPLY_UNSUPPORTED_LINKS
-    saved_allowed = set(bot.AUTHORIZATION.allowed)
+    saved_blocked = set(bot.AUTHORIZATION.blocked)
     try:
-        # The gate is fail-closed, so an empty allow list would answer "not allowed"
-        # instead of exercising the classifier.
-        bot.AUTHORIZATION.allowed = {111}
+        # The user must be allowed for the classifier to be reached at all. With a blocklist
+        # that means an EMPTY list - the old code added the user to an allowlist here, which
+        # under the new model would block exactly the user the test needs to admit.
+        bot.AUTHORIZATION.blocked = set()
         bot.REPLY_UNSUPPORTED_LINKS = notices
         update = Upd()
         asyncio.run(asyncio.wait_for(bot.handle_message(update, None), timeout=30))
@@ -115,7 +116,7 @@ def _drop_is_silent(notices: bool = False) -> bool:
         return False
     finally:
         bot.REPLY_UNSUPPORTED_LINKS = saved
-        bot.AUTHORIZATION.allowed = saved_allowed
+        bot.AUTHORIZATION.blocked = saved_blocked
 
 
 def _drop_explains_when_enabled() -> bool:
@@ -155,9 +156,10 @@ def _drop_explains_when_enabled() -> bool:
             self.message = self.effective_message
 
     saved = bot.REPLY_UNSUPPORTED_LINKS
-    saved_allowed = set(bot.AUTHORIZATION.allowed)
+    saved_blocked = set(bot.AUTHORIZATION.blocked)
     try:
-        bot.AUTHORIZATION.allowed = {111}
+        # Empty blocklist: the user must be admitted for the notice to be reached.
+        bot.AUTHORIZATION.blocked = set()
         bot.REPLY_UNSUPPORTED_LINKS = True
         update = Upd()
         asyncio.run(asyncio.wait_for(bot.handle_message(update, None), timeout=30))
@@ -166,9 +168,9 @@ def _drop_explains_when_enabled() -> bool:
     except Exception:  # noqa: BLE001
         return False
     finally:
-        # Both restored: leaving the allow list modified would leak into every later test.
+        # Both restored: leaving the blocklist modified would leak into every later test.
         bot.REPLY_UNSUPPORTED_LINKS = saved
-        bot.AUTHORIZATION.allowed = saved_allowed
+        bot.AUTHORIZATION.blocked = saved_blocked
 
 
 def _spawn_flags() -> bool:
@@ -280,11 +282,15 @@ def _lock_call_uses_the_setting() -> bool:
     return False
 
 
-def _refused_chat_replies(chat_type: str, chat_id: int) -> int:
+def _refused_chat_replies(chat_type: str, chat_id: int, *, blocked: bool = False) -> int:
     """
-    How many messages the bot sends when a chat is not authorized.
+    How many messages the bot sends to a chat that may not be served.
 
-    The authorization state is forced to refuse every group and every user, then restored.
+    A **group** is refused by locking groups down (`group_locked`), which is how groups work:
+    an allowlist with a gate. A **private** chat is refused only by blocking that exact user,
+    because the private list is a blocklist and being unlisted means being welcome.
+
+    The state is forced inside the call and restored afterwards.
     """
     import asyncio
 
@@ -337,12 +343,14 @@ def _refused_chat_replies(chat_type: str, chat_id: int) -> int:
             self.message = self.effective_message
 
     saved_groups = set(bot.AUTHORIZATION.groups)
-    saved_allowed = set(bot.AUTHORIZATION.allowed)
+    saved_blocked = set(bot.AUTHORIZATION.blocked)
     saved_locked = bot.AUTHORIZATION.group_locked
     try:
         bot.AUTHORIZATION.groups = set()
         bot.AUTHORIZATION.group_locked = True
-        bot.AUTHORIZATION.allowed = set()
+        # A group is refused by the group gate; a private chat only by the blocklist, so the
+        # user is blocked for that case and the list is left empty for the group cases.
+        bot.AUTHORIZATION.blocked = {chat_id} if blocked else set()
         update = Update(chat_type, chat_id, chat_id)
         asyncio.run(asyncio.wait_for(bot.handle_message(update, None), timeout=30))
         return update.effective_message.sent
@@ -350,7 +358,7 @@ def _refused_chat_replies(chat_type: str, chat_id: int) -> int:
         return -1
     finally:
         bot.AUTHORIZATION.groups = saved_groups
-        bot.AUTHORIZATION.allowed = saved_allowed
+        bot.AUTHORIZATION.blocked = saved_blocked
         bot.AUTHORIZATION.group_locked = saved_locked
 
 
@@ -360,7 +368,9 @@ def _refused_group_is_silent() -> bool:
 
 
 def _refused_private_still_explains() -> bool:
-    return _refused_chat_replies("private", 555003) == 1
+    """A blocked user gets one message in private; an unblocked one is served."""
+    return (_refused_chat_replies("private", 555003, blocked=True) == 1
+            and _refused_chat_replies("private", 555004) != 1)
 
 
 def _refusal_checks_chat_type() -> bool:
@@ -612,6 +622,113 @@ def _lock_waits_for_the_holder() -> bool:
         return got_text == "True" and float(elapsed_text) >= 0.5
     except ValueError:
         return False
+
+
+def _scoped_menus_skip_the_blocklist() -> bool:
+    """
+    post_init must set scoped menus from the admin list only.
+
+    Walked as an AST so the comment above the loop - which explains that the blocklist used to
+    be included - cannot satisfy or break the check.
+    """
+    import ast
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(bot.post_init))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    # No attribute access to AUTHORIZATION.blocked or .allowed may appear in the loop guard.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in {"allowed", "blocked"}:
+            return False
+    return "AUTHORIZATION.admins" in ast.unparse(tree)
+
+
+def _list_commands_are_admin_only() -> bool:
+    """Every list-management command must be wrapped in admin_only."""
+    import ast
+    import textwrap
+
+    source = textwrap.dedent(
+        Path(HERE / "bot.py").read_text(encoding="utf-8"))
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    wanted = {"authorized", "grant", "revoke", "blocked"}
+    seen = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "CommandHandler"):
+            continue
+        if not node.args or not isinstance(node.args[0], ast.Constant):
+            continue
+        name = node.args[0].value
+        if name not in wanted:
+            continue
+        # The handler argument must be admin_only(...)
+        if len(node.args) >= 2:
+            handler = ast.unparse(node.args[1])
+            seen[name] = handler.startswith("admin_only(")
+    return bool(seen) and all(seen.get(name) for name in wanted)
+
+
+def _block_and_unblock_round_trip() -> bool:
+    inst = bot.Authorization()
+    first = inst.block(55)
+    again = inst.block(55)
+    removed = inst.unblock(55)
+    missing = inst.unblock(55)
+    return (first is True and again is False
+            and removed is True and missing is False
+            and inst.blocked == set())
+
+
+def _admins_cannot_be_blocked() -> bool:
+    """promote() drops any block entry, and an admin passes even while listed."""
+    inst = bot.Authorization(admins={7})
+    inst.block(7)
+    dropped = inst.promote(7) is False and 7 not in inst.blocked
+    # Even if one were present, the check must not refuse an admin.
+    forced = bot.Authorization(allowed={7}, admins={7})
+    return dropped and forced.user_allowed(7) is True
+
+
+def _blocked_command_lists() -> bool:
+    """Run /blocked with a known list and check the ids are reported."""
+    import asyncio
+
+    class Msg:
+        def __init__(self):
+            self.chat_id = 1
+            self.texts = []
+
+        async def reply_text(self, text, **_k):
+            self.texts.append(text)
+            return self
+
+    class Update:
+        def __init__(self):
+            self.effective_message = Msg()
+
+    saved = set(bot.AUTHORIZATION.blocked)
+    try:
+        bot.AUTHORIZATION.blocked = {31, 32}
+        update = Update()
+        asyncio.run(bot.blocked_command(update, None))
+        said = " ".join(update.effective_message.texts)
+        return "31" in said and "32" in said and "2" in said
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.AUTHORIZATION.blocked = saved
+
+
+def _write_json(path, text: str):
+    """Write literal JSON to a path and return it, for the load tests."""
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def _deletion_is_batched() -> bool:
@@ -1415,7 +1532,7 @@ print("=== 1. Public surface: configuration constants ===")
 # A refactor that drops a constant used only from a rarely-taken branch is a latent
 # crash, so the whole set is pinned.
 EXPECTED_CONSTANTS = [
-    "ADMIN_USER_IDS", "ALBUM_LIMIT", "ALLOWED_USER_IDS", "ANIMATION_EXTENSIONS",
+    "ADMIN_USER_IDS", "ALBUM_LIMIT", "BLOCKED_USER_IDS", "ANIMATION_EXTENSIONS",
     "ARCHIVE_PARALLEL_MIN_BYTES", "ATTACH_SOURCE_LINK", "AUTHORIZATION", "AUTH_FILE",
     "BASE_DIR", "BOT_TOKEN", "CACHE_DIR", "CACHE_FILE", "CACHE_MAX_ENTRIES",
     "CACHE_STALE_SECONDS", "CAPTION_LIMIT", "CHECK_COOKIES", "COOKIES_FILE",
@@ -1424,7 +1541,7 @@ EXPECTED_CONSTANTS = [
     "EHENTAI_DOWNLOAD_WORKERS", "EHENTAI_NAMESPACE_LABELS", "EHENTAI_TIMEOUT_SECONDS",
     "EHENTAI_VIEWER_WORKERS", "EXPIRY_WARN_DAYS", "GALLERY_DL_CACHE_DIR",
     "GALLERY_DL_CONFIG", "GALLERY_URL_TTL_SECONDS", "GROUP_LOCKED_DEFAULT",
-    "IMAGE_EXTENSIONS", "LOCAL_API_SERVER", "LOCKED_DEFAULT",
+    "IMAGE_EXTENSIONS", "LOCAL_API_SERVER",
     "MAX_CONCURRENT_DOWNLOADS", "MAX_DOWNLOAD_SECONDS", "MAX_FILES",
     "MAX_UPLOAD_BYTES", "MAX_UPLOAD_MB", "MEDIA_EXTENSIONS", "PARSE_CACHE",
     "PHOTO_DOWNSCALE_MAX_EDGE", "PHOTO_DOWNSCALE_QUALITY", "PHOTO_LIMIT_BYTES",
@@ -1453,8 +1570,8 @@ print("=== 2. Public surface: commands ===")
 # Every command that existed must still be registered. A dropped CommandHandler is
 # invisible until someone tries the command.
 EXPECTED_COMMANDS = {
-    "authorized", "cache", "cookies", "demote", "grant", "help", "id", "lock",
-    "lockgroup", "promote", "restart", "revoke", "start", "status",
+    "authorized", "blocked", "cache", "cookies", "demote", "grant", "help", "id",
+    "lock", "lockgroup", "promote", "restart", "revoke", "start", "status",
 }
 _found = set()
 for _node in ast.walk(_TREE):
@@ -1586,24 +1703,41 @@ check("the same url normalises consistently",
 print()
 print("=== 9. Behaviour: authorization semantics ===")
 A = bot.Authorization
-_priv = A(allowed=set(), admins={1000}, locked=True, group_locked=True)
-check("an admin passes everywhere", _priv.is_allowed(1000, 999, "private"))
-check("a stranger is refused in private when locked",
-      not _priv.is_allowed(999, 999, "private"))
+# The private list is a BLOCKLIST: everyone is welcome except the ids on it. Groups keep
+# their allowlist and their own gate mode, because "which groups may use this" is a genuinely
+# different question - a bot in a public group should serve the groups it was added to.
+_locked_group = A(allowed=set(), admins={1000}, group_locked=True)
+check("an admin passes everywhere", _locked_group.is_allowed(1000, 999, "private"))
+check("everyone else may use private chats with an empty blocklist",
+      _locked_group.is_allowed(999, 999, "private"))
 check("a stranger is refused in a group when group_locked",
-      not _priv.is_allowed(999, -1009999, "supergroup"))
-_open = A(allowed=set(), admins={1000}, locked=True, group_locked=False)
+      not _locked_group.is_allowed(999, -1009999, "supergroup"))
+_open = A(allowed=set(), admins={1000}, group_locked=False)
 check("with groups open, a stranger may use a group",
       _open.is_allowed(999, -1009999, "supergroup"))
 _listed = A(allowed=set(), admins={1000}, groups={-1001234}, group_locked=False)
 check("a listed group passes", _listed.is_allowed(999, -1001234, "supergroup"))
 check("an unlisted group is refused once a list exists",
       not _listed.is_allowed(999, -1009999, "supergroup"))
-check("an authorized user passes in private",
-      A(allowed={999}, admins={1000}, locked=True).is_allowed(999, 999, "private"))
+# The blocklist itself: listed is refused, unlisted is welcome.
+_blocked = A(allowed={999}, admins={1000})
+check("a blocked user is refused in private",
+      not _blocked.is_allowed(999, 999, "private"))
+check("a user who is not blocked is welcome in private",
+      _blocked.is_allowed(998, 998, "private"))
+check("an admin is never blocked",
+      _blocked.is_allowed(1000, 1000, "private"))
+check("blocking someone does not gate everyone else",
+      # This is the whole point of the change: one entry must not cut off every other user.
+      _blocked.is_allowed(1, 1, "private")
+      and _blocked.is_allowed(2, 2, "private"))
+check("a blocked user is still served in an authorized group",
+      # Group access is decided by the group, not by the private blocklist.
+      A(allowed={999}, admins={1000}, groups={-1001234}).is_allowed(999, -1001234, "supergroup"))
 check("the group mode label reports gated",
       "守門" in A(group_locked=True).group_mode_label)
-check("the mode label reports gated", "守門" in A(locked=True).mode_label)
+check("the private mode label reports a blocklist",
+      "黑名單" in A(allowed={1}).mode_label and "黑名單" in A().mode_label)
 
 print()
 print("=== 10. Danger paths: bugs that already reached the user ===")
@@ -1974,13 +2108,61 @@ check("the archive host is checked before it is fetched",
 check("a non-admin cannot enumerate the admin roster",
       "管理員名單僅限管理員查看" in inspect.getsource(bot.authorized_command),
       "the admin list is what an attacker most wants")
-check("the list semantics are documented as an allowlist",
-      "the list is a blocklist-style restriction" not in
-      inspect.getsource(bot.Authorization).lower(),
-      "the old wording would make an operator lock everyone else out")
-check("the mode label does not claim the list is a blocklist",
-      "名單為限制" not in bot.Authorization(allowed={1}).mode_label,
-      "an operator would think listed users are blocked, when everyone else is")
+# --- The blocklist must not be manageable by the people it blocks ---
+
+# The list commands used to take `list_manager_only`, which admitted administrators *and*
+# authorized users - sound while the list admitted people. With a blocklist the same rule
+# hands control to the blocked: they could unblock themselves and block anyone else. Every
+# list command is admin_only now.
+check("the list commands are administrator only",
+      _list_commands_are_admin_only(),
+      "a blocked user must not be able to unblock themselves")
+check("the old allow-authorized-users helper is gone",
+      # It admitted authorized users, which is the blocklist's own members now.
+      not hasattr(bot, "user_can_manage_list"),
+      "leaving it would invite it being used again")
+check("the retired list-manager wrapper is gone",
+      not hasattr(bot, "list_manager_only"),
+      "leaving it would invite it being used again")
+check("scoped menus are not sent to the blocklist",
+      # Parsed, not searched: the explanatory comment in post_init names
+      # AUTHORIZATION.allowed, so a text search matched the comment and failed against
+      # correct code. This is the same mistake the lock-marker check made.
+      _scoped_menus_skip_the_blocklist(),
+      "advertising operator commands to blocked users is wrong even if they are refused")
+
+# --- blocking and unblocking ---
+
+check("blocking adds to the list and reports the change",
+      _block_and_unblock_round_trip(),
+      "the operator needs to know whether anything changed")
+check("an administrator cannot be blocked",
+      # They pass the check regardless, so a block entry would only look like it worked.
+      _admins_cannot_be_blocked(),
+      "a block that silently does nothing is worse than a refusal")
+check("the blocklist is written under the new key",
+      # Writing both keys would be two sources of truth for one list.
+      '"blocked"' in inspect.getsource(bot.Authorization.save)
+      and '"allowed"' not in inspect.getsource(bot.Authorization.save),
+      "the file must have one name for one list")
+check("/blocked lists the blocked users",
+      _blocked_command_lists(),
+      "the question behind every complaint deserves its own command")
+
+check("the list semantics are documented as a blocklist",
+      # These two assertions used to say the opposite, and were correct then: the list WAS an
+      # allowlist, and the check existed to catch wording that called it a blocklist. The list
+      # is a blocklist now, so they assert that instead.
+      "blocklist" in inspect.getsource(bot.Authorization).lower(),
+      "the wrong wording makes an operator lock everyone else out")
+check("the mode label says the listed users are the blocked ones",
+      "黑名單" in bot.Authorization(allowed={1}).mode_label,
+      "an operator must not think listing a user admits them")
+check("listing one user does not cut off everyone else",
+      # The regression this whole change is about: with an allowlist, one entry refused every
+      # other user.
+      bot.Authorization(allowed={1}).user_allowed(2) is True,
+      "one blocked user must not lock out the rest")
 check("an empty admins file cannot lock the bot out",
       "state.admins = set(admins)" in inspect.getsource(bot.Authorization.load),
       "no admin means every admin command refuses forever")
@@ -2573,7 +2755,10 @@ check("a persistent failure still reports unknown",
 check("a refused group is answered with silence",
       _refused_group_is_silent(),
       "replying in a group it must not serve is noise in someone else's chat")
-check("a refused private chat is still told why",
+check("a blocked user is told why in private",
+      # The refusal survives only for the case that still exists: a user on the blocklist.
+      # There is no longer an "unauthorized private user" - not being listed means being
+      # welcome - so this is the private-chat refusal path now.
       _refused_private_still_explains(),
       "in private the person who added the bot can act on the message")
 check("the refusal is decided from the chat type",
@@ -3325,20 +3510,31 @@ _saved_auth = bot.AUTHORIZATION
 try:
     bot.AUTH_FILE = _work / "authorized.json"
     bot.AUTHORIZATION = bot.Authorization(allowed={5}, admins={1}, groups={-1001},
-                                          locked=True, group_locked=True)
+                                          group_locked=True)
     check("saving the authorization file succeeds", bot.save_authorization())
     _reloaded = bot.Authorization.load(bot.AUTH_FILE, allowed=set(), admins=set())
-    check("users survive a reload", _reloaded.allowed == {5}, str(_reloaded.allowed))
+    check("blocked users survive a reload", _reloaded.blocked == {5}, str(_reloaded.blocked))
     check("admins survive a reload", _reloaded.admins == {1}, str(_reloaded.admins))
     check("groups survive a reload", _reloaded.groups == {-1001}, str(_reloaded.groups))
-    check("the private mode survives a reload", _reloaded.locked is True)
     check("the group mode survives a reload", _reloaded.group_locked is True)
+    # An `authorized.json` written before the blocklist change holds its ids under "allowed".
+    # Those ids must still load, as blocked users - dropping them would silently unblock
+    # exactly the people an operator had listed.
+    _legacy = _work / "legacy.json"
+    _legacy.write_text('{"allowed": [7, 8], "admins": [1]}', encoding="utf-8")
+    _migrated = bot.Authorization.load(_legacy, allowed=set(), admins=set())
+    check("an old allowed list arrives as a blocklist",
+          _migrated.blocked == {7, 8}, str(_migrated.blocked))
+    check("the new key wins when both are present",
+          bot.Authorization.load(
+              _write_json(_work / "both.json", '{"blocked": [9], "allowed": [7]}'),
+              allowed=set(), admins=set()).blocked == {9})
     # A corrupt file must not take the bot down or silently widen access.
     bot.AUTH_FILE.write_text("{not json", encoding="utf-8")
     _broken = bot.Authorization.load(bot.AUTH_FILE, allowed=set(), admins={9})
     check("a corrupt authorization file falls back to the defaults",
-          _broken.admins == {9} and _broken.allowed == set(),
-          f"{_broken.admins} / {_broken.allowed}")
+          _broken.admins == {9} and _broken.blocked == set(),
+          f"{_broken.admins} / {_broken.blocked}")
 finally:
     bot.AUTH_FILE = _saved_file
     bot.AUTHORIZATION = _saved_auth

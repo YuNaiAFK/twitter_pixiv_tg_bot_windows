@@ -1453,6 +1453,65 @@ cannot import `telegram` and dies immediately:
 console window and its owning process, so "which process put that window there" is answered by
 running it rather than by guessing.
 
+## The private list is a blocklist, not an allowlist
+
+It used to be an allowlist: one entry meant **only** those users could parse. That is the wrong
+shape for a bot whose parsing is meant to be open to any visitor. Adding one abusive user cut
+off every ordinary visitor instead - the opposite of the intent, and a mistake nobody notices
+until people complain that the bot stopped working.
+
+    before   blocked = {5}   ->  user 5 allowed, EVERYONE ELSE refused
+    now      blocked = {5}   ->  user 5 refused, everyone else allowed
+
+| the list | empty | with entries |
+| --- | --- | --- |
+| **private chats** (blocklist) | everyone may parse | listed users refused, everyone else welcome |
+| **group chats** (allowlist) | all or none, by `AUTH_GROUP_LOCKED` | only the listed groups |
+
+Groups stay an allowlist on purpose: a bot in a public group should serve the groups it was
+deliberately added to, not every group that happens to contain it. Administrators pass
+everywhere, so a mistake in the list can never lock the operator out of their own bot.
+
+### Commands
+
+| command | private chat | group |
+| --- | --- | --- |
+| `/revoke <ID>` | **block** that user | remove that group's authorization |
+| `/grant <ID>` | **unblock** that user | authorize that group |
+| `/blocked` | list the blocked users | — |
+| `/lock` | retired, explains what replaced it | — |
+| `/lockgroup on\|off` | — | gate mode for groups |
+
+`/lock` is gone as a setting: a blocklist is not a gate, so there is no mode to choose. It is
+still registered, and answers with what replaced it rather than silence, because an operator
+with `/lock` in their notes will type it.
+
+### The security hole the change exposed
+
+The list commands used to take `list_manager_only`, which admitted administrators **and
+authorized users** - sound while the list admitted people, since passing access on was the
+point. With a blocklist the same rule hands control to the people it blocks: **a blocked user
+could unblock themselves, and block anyone else.** Every list command is `admin_only` now, and
+`user_can_manage_list` and `list_manager_only` are both gone rather than left unused.
+
+The same mistake was in `post_init`: the scoped command menus were set for administrators *and*
+`AUTHORIZATION.allowed`, which is the blocklist. Blocked users would have been shown the
+operator commands in their Telegram menu. They would have been refused when used, but
+advertising them is still wrong - and it would confirm to a blocked user that the bot is
+watching.
+
+### An existing authorized.json still loads
+
+The field is still called `allowed` in the file so nothing has to be migrated, and there is a
+`blocked` key that takes precedence when present. An old allowlist therefore arrives as a
+blocklist, which **blocks the users it listed**. That is the deliberate direction: a short list
+of ids is far more likely to be abusers than to be the complete set of everyone permitted, and
+`/blocked` shows plainly who ended up on it. `ALLOWED_USER_IDS` in `.env` is read the same way.
+
+`AUTH_LOCKED` is simply ignored now - there is no gate for it to configure.
+
+## A refused group is answered with silence, not a refusal
+
 ## A refused group is answered with silence, not a refusal
 
 The authorization refusal is a useful answer in a **private** chat: the person who added the
