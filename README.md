@@ -1512,8 +1512,6 @@ of ids is far more likely to be abusers than to be the complete set of everyone 
 
 ## A refused group is answered with silence, not a refusal
 
-## A refused group is answered with silence, not a refusal
-
 The authorization refusal is a useful answer in a **private** chat: the person who added the
 bot sees why nothing happened and can ask to be authorized. In a **group** it is the opposite -
 the bot answers every link anyone posts in a chat it was told not to serve, which is noise in
