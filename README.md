@@ -1478,8 +1478,6 @@ buttons to press in the first place.
 
 ## A legacy pixiv link was served another artwork's files
 
-## A legacy pixiv link was served another artwork's files
-
 Reported from a log: a `member_illust.php?...&illust_id=...` link failed with
 `NotFoundError`, and the operator hint blamed credentials for it. Three separate faults were
 behind that one line.
