@@ -14,6 +14,7 @@ Exit code 0 means the boot path completed and the limits were raised.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -35,6 +36,11 @@ def fake_run_polling(self, *args, **kwargs):
 
 Application.run_polling = fake_run_polling
 bot.Application.run_polling = fake_run_polling
+
+# This never reaches polling, so it cannot be a second poller and must not be refused by the
+# single-instance guard. Without this the check fails whenever the bot is running, which looks
+# like a boot-path regression and is really the guard working correctly.
+os.environ["BOT_SKIP_INSTANCE_LOCK"] = "1"
 
 try:
     bot.main()

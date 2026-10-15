@@ -16,7 +16,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlsplit
 
 # Optional local dependency folder. It exists because this project can run on a
 # host where packages cannot be installed into site-packages; a wheel unpacked
@@ -871,6 +871,19 @@ _HOST_CANONICAL = {
 # Every alias above is http->https for these, so an http link is upgraded.
 _FIRST_PARTY_HOSTS = frozenset(_HOST_CANONICAL)
 
+# Query parameters that decide WHICH resource a URL names, and so must survive cache
+# canonicalisation. Everything else in a query string is presentation or tracking and is
+# removed, which is what used to make one cache entry cover every URL that shared a path.
+#
+# `illust_id` is the important one: pixiv's legacy form is
+# `/member_illust.php?mode=medium&illust_id=...`, so without it every legacy link normalised
+# to `/member_illust.php` and they all shared a single cache entry.
+_IDENTITY_QUERY_KEYS = (
+    "illust_id",
+    "novel_id",
+    "id",
+)
+
 
 def canonical_host(host: str) -> str:
     """
@@ -896,10 +909,21 @@ def normalize_cache_key(url: str) -> str:
     """
     The key a parse is stored under.
 
-    Removes the parts that do not change which resource is meant - a query string or
-    fragment such as `?s=20` or `#comments`, a trailing slash, and the host aliases listed
-    above. Without that canonicalisation the same post reached through two links was
-    downloaded twice and cached twice.
+    Removes the parts that do not change which resource is meant - a trailing slash, the host
+    aliases listed above, and **most** of the query string such as `?s=20` or `#comments`.
+    Without that canonicalisation the same post reached through two links was downloaded twice
+    and cached twice.
+
+    **A few query parameters DO decide identity, and dropping them was a real bug.** Pixiv's
+    legacy form carries the artwork id only in the query:
+
+        https://www.pixiv.net/member_illust.php?mode=medium&illust_id=122010932
+
+    The query was discarded, so every such link normalised to
+    ``https://www.pixiv.net/member_illust.php`` - **one cache entry shared by every artwork
+    that used it.** Reproduced: after parsing one artwork, a different ``illust_id`` on the
+    same path was served that first artwork's files from cache and never downloaded at all.
+    The parameters that carry identity are kept, in a stable order; the rest are dropped.
 
     **This function is the single source of truth for cache identity**, so the media and
     gallery paths get the same answer. The media cache had no canonicalisation of its own
@@ -915,7 +939,22 @@ def normalize_cache_key(url: str) -> str:
     scheme = parsed.scheme.lower()
     if scheme == "http" and host in _FIRST_PARTY_HOSTS:
         scheme = "https"
-    return f"{scheme}://{host}{parsed.path.rstrip('/')}"
+
+    # Only parameters that name a resource. Sorted, so the same resource written in a
+    # different order is still one key.
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    identity = sorted(
+        (key, value)
+        for key in _IDENTITY_QUERY_KEYS
+        for value in (query.get(key) or [])
+        if value
+    )
+    suffix = ""
+    if identity:
+        suffix = "?" + urlencode(identity)
+    # The suffix is always separated, even when empty, so a path cannot collide with a
+    # path-plus-parameter form.
+    return f"{scheme}://{host}{parsed.path.rstrip('/')}{suffix}"
 
 
 class ParseCache:
@@ -2224,8 +2263,24 @@ def pixiv_work_state(illust_id: str, timeout: float = 25.0) -> str:
     gallery-dl cannot tell the two apart, because the public web API answers 404 for both.
 
     ``"unknown"`` is returned when the state cannot be established - an unreadable or absent
-    token - so the caller falls back to silence instead of guessing.
+    token, or a request that never completed - so the caller falls back to silence instead of
+    guessing. **The check is retried before that**, because a single transient failure (a
+    dropped connection, a rate-limited token refresh) would otherwise turn a deletion into
+    silence, and silence is precisely what the caller is trying not to do for a dead link.
+    Observed: a run reported ``unknown`` for a work that answers 404 every other time.
     """
+    for attempt in range(3):
+        state = _pixiv_work_state_once(illust_id, timeout)
+        if state != "unknown":
+            return state
+        if attempt < 2:
+            logger.debug("Pixiv 作品狀態查詢失敗，重試（第 %d 次）", attempt + 2)
+            time.sleep(1.0)
+    return "unknown"
+
+
+def _pixiv_work_state_once(illust_id: str, timeout: float) -> str:
+    """One attempt at the state query. See ``pixiv_work_state`` for what the answers mean."""
     token = pixiv_access_token(timeout=timeout)
     if not token:
         return "unknown"
@@ -2283,8 +2338,16 @@ def pixiv_illust_id(url: str) -> str:
 
 
 def _instance_lock_path() -> Path:
-    """Where the single-instance lock lives, as an absolute path."""
-    path = INSTANCE_LOCK_FILE
+    """
+    Where the single-instance lock lives, as an absolute path.
+
+    Coerces to ``Path`` first: ``INSTANCE_LOCK_FILE`` is a Path here, but anything that sets
+    it - an override in a test, a future env setting - may hand over a string, and
+    ``str.is_absolute()`` does not exist. Measured: passing a string raised
+    ``AttributeError: 'str' object has no attribute 'is_absolute'`` inside the child of the
+    lock-wait test, which is exactly the shape of a bug that would only appear in the field.
+    """
+    path = Path(INSTANCE_LOCK_FILE)
     if not path.is_absolute():
         path = BASE_DIR / path
     return path
@@ -4396,13 +4459,21 @@ def download_with_gallery_dl(url: str, output_dir: Path, platform: str | None = 
         env=gallery_dl_env(platform),
     )
 
+    # **Recorded before the return code is checked, not after.**
+    #
+    # gallery-dl prints the reason and exits non-zero for the cases worth explaining - a
+    # deleted work exits 4 with "NotFoundError: ... could not be found". Recording only on the
+    # success path meant LAST_DOWNLOAD_REASON stayed empty for exactly those runs, so
+    # admin_hint fell through to its per-platform guess and told the operator "可能是憑證問題"
+    # about an artwork that had simply been taken down. Measured against the real failure:
+    #
+    #   classify_download_output(real output) -> 'missing'     (recognised)
+    #   admin_hint('pixiv')                   -> credentials   (because nothing recorded it)
+    record_download_output((result.stderr or "") + (result.stdout or ""))
+
     if result.returncode != 0:
         details = (result.stderr or result.stdout or "没有详细错误信息").strip()
         raise RuntimeError(details[-1200:])
-
-    # A deleted or private item exits 0 with no files, so the reason is only in the
-    # output. Recording it here is what lets the log hint name the real cause.
-    record_download_output((result.stderr or "") + (result.stdout or ""))
 
 
 def collect_media_files(temp_dir: Path) -> list[Path]:
@@ -7958,7 +8029,13 @@ def main():
     if is_replacement:
         await_lock = RESTART_STARTUP_DELAY_SECONDS
 
-    if not acquire_instance_lock(await_lock):
+    # A verification run must not be refused by the refusals that protect a real start: it
+    # builds the application and stops before polling, so it cannot be a second poller. Without
+    # this, verify_boot.py fails whenever the bot happens to be running - which looked like a
+    # boot-path regression and was really the single-instance guard doing its job.
+    skip_lock = bool((os.getenv("BOT_SKIP_INSTANCE_LOCK") or "").strip())
+
+    if not skip_lock and not acquire_instance_lock(await_lock):
         if not is_replacement:
             # **A plain start, and something already holds the lock.** Starting anyway would
             # put two pollers on one token, which Telegram answers with "Conflict: terminated

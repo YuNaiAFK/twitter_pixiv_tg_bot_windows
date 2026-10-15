@@ -1453,6 +1453,59 @@ cannot import `telegram` and dies immediately:
 console window and its owning process, so "which process put that window there" is answered by
 running it rather than by guessing.
 
+## A legacy pixiv link was served another artwork's files
+
+Reported from a log: a `member_illust.php?...&illust_id=...` link failed with
+`NotFoundError`, and the operator hint blamed credentials for it. Three separate faults were
+behind that one line.
+
+### 1. The cache key dropped the artwork id
+
+`normalize_cache_key` removed the whole query string, but pixiv's legacy form carries the id
+**only** there:
+
+    https://www.pixiv.net/member_illust.php?mode=medium&illust_id=122010932
+
+Every such link therefore normalised to `https://www.pixiv.net/member_illust.php` - **one
+cache entry shared by every artwork using that path**. Reproduced: after parsing one artwork,
+a second `illust_id` on the same path was served the first one's files and never downloaded.
+
+Parameters that name a resource (`illust_id`, `novel_id`, `id`) now survive, sorted so order
+cannot split an entry. Everything else - `?s=20`, `&t=abc` - is still dropped, so the
+canonicalisation that stops one post being cached twice still works:
+
+    ...member_illust.php?mode=medium&illust_id=122010932 -> ...member_illust.php?illust_id=122010932
+    ...member_illust.php?mode=medium&illust_id=150824857 -> ...member_illust.php?illust_id=150824857
+    https://x.com/u/status/123?s=20&t=abc               -> https://x.com/u/status/123
+    https://twitter.com/u/status/123                    -> https://x.com/u/status/123
+
+### 2. The reason was recorded only on success
+
+`download_with_gallery_dl` raised on a non-zero exit **before** recording gallery-dl's output,
+so `LAST_DOWNLOAD_REASON` stayed empty for exactly the runs worth explaining - a deleted work
+exits 4 with `NotFoundError`. The hint then fell through to its per-platform guess:
+
+    classify_download_output(real output) -> 'missing'     (recognised)
+    admin_hint('pixiv')                   -> credentials   (nothing had recorded it)
+
+An operator chasing a taken-down artwork was sent to redo an OAuth flow that was never the
+problem. The output is now recorded before the exit code is checked:
+
+    作品不存在或連結已失效（gallery-dl 回報 not found）。這不是憑證問題。
+
+### 3. One transient failure turned a deletion into silence
+
+`pixiv_work_state` returned `unknown` - and `unknown` means silence - when a single request
+failed. Observed on a work that answers 404 every other time. It now retries three times, so a
+dropped connection or a rate-limited token refresh cannot hide a dead link. A state that never
+resolves is still `unknown`, because retrying must not turn "cannot verify" into an accusation.
+
+End to end after all three: the reported link answers
+「這個 Pixiv 作品目前無法瀏覽：可能已被作者刪除，或設為非公開。」, and a **live** work on the
+same legacy path downloads normally instead of inheriting the poisoned cache entry.
+
+## Windows shows "Open File - Security Warning" every time
+
 ## Windows shows "Open File - Security Warning" every time
 
 Double-clicking `run.bat` (or a shortcut to it) prompts:

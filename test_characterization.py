@@ -280,6 +280,114 @@ def _lock_call_uses_the_setting() -> bool:
     return False
 
 
+def _identity_query_survives() -> bool:
+    """The id in a legacy pixiv query must be part of the key."""
+    key = bot.normalize_cache_key(
+        "https://www.pixiv.net/member_illust.php?mode=medium&illust_id=122010932")
+    return "122010932" in key
+
+
+def _reason_recorded_on_failure() -> bool:
+    """
+    A non-zero gallery-dl exit must still record its output.
+
+    Asserted on the source order: ``record_download_output`` has to be called before the
+    ``returncode`` check raises, which is the whole bug. Running gallery-dl for real would
+    need the network and a dead artwork.
+    """
+    import inspect as _i
+    src = _i.getsource(bot.download_with_gallery_dl)
+    record_at = src.find("record_download_output")
+    raise_at = src.find("if result.returncode != 0")
+    return record_at != -1 and raise_at != -1 and record_at < raise_at
+
+
+def _hint_does_not_blame_credentials() -> bool:
+    """With a not-found reason recorded, the hint must not mention credentials."""
+    real = bot.LAST_DOWNLOAD_REASON
+    try:
+        bot.begin_download_diagnosis()
+        bot.record_download_output(
+            "[pixiv][error] NotFoundError: Requested resource (gallery/image) "
+            "could not be found")
+        hint = bot.admin_hint("pixiv")
+        # The correct hint DOES contain the word 憑證, in the sentence "這不是憑證問題" -
+        # so asserting its absence was wrong and failed against correct code. What must be
+        # absent is the advice to redo the OAuth flow.
+        return ("不存在" in hint
+                and "oauth:pixiv" not in hint
+                and "PIXIV_REFRESH_TOKEN" not in hint)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.begin_download_diagnosis()
+        bot.LAST_DOWNLOAD_REASON = real
+
+
+def _hint_is_not_sticky() -> bool:
+    """begin_download_diagnosis must clear the previous run's reason."""
+    real = bot.LAST_DOWNLOAD_REASON
+    try:
+        bot.record_download_output("deleted")
+        before = bot.LAST_DOWNLOAD_REASON
+        bot.begin_download_diagnosis()
+        return before == "deleted" and bot.LAST_DOWNLOAD_REASON == ""
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.LAST_DOWNLOAD_REASON = real
+
+
+def _work_state_retries() -> bool:
+    """Two failures then a 404 must still resolve to unavailable."""
+    saved = bot._pixiv_work_state_once
+    calls = {"n": 0}
+
+    def flaky(_id, _timeout):
+        calls["n"] += 1
+        return "unknown" if calls["n"] < 3 else "unavailable"
+
+    try:
+        bot._pixiv_work_state_once = flaky
+        return bot.pixiv_work_state("1") == "unavailable" and calls["n"] == 3
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot._pixiv_work_state_once = saved
+
+
+def _work_state_gives_up_as_unknown() -> bool:
+    """A state that never resolves must stay unknown, not become unavailable."""
+    saved = bot._pixiv_work_state_once
+    calls = {"n": 0}
+
+    def always(_id, _timeout):
+        calls["n"] += 1
+        return "unknown"
+
+    try:
+        bot._pixiv_work_state_once = always
+        result = bot.pixiv_work_state("1")
+        return result == "unknown" and 1 < calls["n"] <= 4
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot._pixiv_work_state_once = saved
+
+
+def _string_lock_path_works() -> bool:
+    """A str INSTANCE_LOCK_FILE must resolve rather than raise AttributeError."""
+    saved = bot.INSTANCE_LOCK_FILE
+    try:
+        bot.INSTANCE_LOCK_FILE = "some/relative.lock"
+        resolved = bot._instance_lock_path()
+        return resolved.is_absolute() and str(resolved).endswith("some" + os.sep + "relative.lock")
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        bot.INSTANCE_LOCK_FILE = saved
+
+
 def _uses_base_interpreter() -> bool:
     """
     The interpreter chosen for children must be the base one, not the venv launcher.
@@ -317,15 +425,44 @@ def _child_imports_telegram() -> bool:
     return result.returncode == 0
 
 
+def _with_temporary_lock_file():
+    """
+    A context manager that points the instance lock at a file of our own.
+
+    **The lock tests must not depend on whether the bot happens to be running.** They used the
+    real lock, so a live bot holding it made "the lock is free" fail and "the second holder
+    waits" hang onto someone else's lock - two spurious failures that appeared only while the
+    bot was up, and which looked like regressions in the code under test.
+    """
+    import contextlib
+    import tempfile
+
+    @contextlib.contextmanager
+    def _manager():
+        saved = bot.INSTANCE_LOCK_FILE
+        work = tempfile.mkdtemp(prefix="dsh-lock-")
+        try:
+            bot.INSTANCE_LOCK_FILE = Path(work) / "test.lock"
+            yield
+        finally:
+            bot.release_instance_lock()
+            bot.INSTANCE_LOCK_FILE = saved
+            import shutil as _sh
+            _sh.rmtree(work, ignore_errors=True)
+
+    return _manager()
+
+
 def _lock_acquires_immediately() -> bool:
     """With nothing holding it, the lock must be taken at once."""
     import time as _tm
     try:
-        start = _tm.monotonic()
-        got = bot.acquire_instance_lock(2.0)
-        elapsed = _tm.monotonic() - start
-        bot.release_instance_lock()
-        return got is True and elapsed < 0.5
+        with _with_temporary_lock_file():
+            start = _tm.monotonic()
+            got = bot.acquire_instance_lock(2.0)
+            elapsed = _tm.monotonic() - start
+            bot.release_instance_lock()
+            return got is True and elapsed < 0.5
     except Exception:  # noqa: BLE001
         return False
 
@@ -335,31 +472,35 @@ def _lock_waits_for_the_holder() -> bool:
     A second holder must wait, and succeed once the first releases.
 
     Run in a child process, because the lock is per-process by design: an in-process test
-    would hold it with the same handle and prove nothing.
+    would hold it with the same handle and prove nothing. Both processes point at the same
+    temporary file, so a running bot cannot interfere.
     """
     import subprocess as _sp
     import sys as _sys
     import time as _tm
     try:
-        bot.acquire_instance_lock(2.0)
+        with _with_temporary_lock_file():
+            lock_path = str(bot.INSTANCE_LOCK_FILE)
+            if bot.acquire_instance_lock(2.0) is not True:
+                return False
+            child = (
+                "import sys, time; sys.path.append('vendor'); import bot;"
+                f"bot.INSTANCE_LOCK_FILE = r'{lock_path}';"
+                "t=time.monotonic(); got=bot.acquire_instance_lock(8.0);"
+                "print(got, round(time.monotonic()-t, 2))"
+            )
+            try:
+                proc = _sp.Popen([_sys.executable, "-c", child], stdout=_sp.PIPE,
+                                 stderr=_sp.DEVNULL, text=True, encoding="utf-8")
+                _tm.sleep(1.0)
+                bot.release_instance_lock()
+                out = (proc.communicate(timeout=30)[0] or "").strip()
+            except Exception:  # noqa: BLE001
+                return False
+            finally:
+                bot.release_instance_lock()
     except Exception:  # noqa: BLE001
         return False
-    child = (
-        "import sys, time; sys.path.append('vendor'); import bot;"
-        "t=time.monotonic(); got=bot.acquire_instance_lock(8.0);"
-        "print(got, round(time.monotonic()-t, 2))"
-    )
-    try:
-        proc = _sp.Popen([_sys.executable, "-c", child], stdout=_sp.PIPE,
-                         stderr=_sp.DEVNULL, text=True, encoding="utf-8")
-        _tm.sleep(1.0)
-        bot.release_instance_lock()
-        out = (proc.communicate(timeout=30)[0] or "").strip()
-    except Exception:  # noqa: BLE001
-        bot.release_instance_lock()
-        return False
-    finally:
-        bot.release_instance_lock()
     if not out:
         return False
     try:
@@ -2256,6 +2397,79 @@ check("every bulk-deletion path is batched",
       all("delete_files_quietly" in inspect.getsource(fn) for fn in (
           bot.cache_command, bot.ParseCache.clear, bot.prune_orphaned_cache_files)),
       "one unbatched path is enough to trigger it again")
+
+# --- A legacy pixiv link served another artwork's files from cache ---
+
+# normalize_cache_key dropped the whole query string, but pixiv's legacy form carries the
+# artwork id ONLY there:
+#
+#   https://www.pixiv.net/member_illust.php?mode=medium&illust_id=122010932
+#
+# So every such link normalised to "https://www.pixiv.net/member_illust.php" - one cache
+# entry shared by every artwork using that path. Reproduced: a second illust_id on the same
+# path was served the first one's files and never downloaded at all.
+check("a query parameter that names the resource survives canonicalisation",
+      _identity_query_survives(),
+      "dropping illust_id made every legacy pixiv link one cache entry")
+check("two legacy pixiv links are two different cache keys",
+      bot.normalize_cache_key(
+          "https://www.pixiv.net/member_illust.php?mode=medium&illust_id=122010932")
+      != bot.normalize_cache_key(
+          "https://www.pixiv.net/member_illust.php?mode=medium&illust_id=150824857"),
+      "sharing a key means serving the wrong artwork")
+check("tracking parameters are still dropped",
+      # The canonicalisation that stops one post being cached twice must keep working.
+      bot.normalize_cache_key("https://x.com/u/status/123?s=20&t=abc")
+      == bot.normalize_cache_key("https://x.com/u/status/123"),
+      "tracking parameters must not multiply cache entries")
+check("host aliases are still one key",
+      bot.normalize_cache_key("https://twitter.com/u/status/123")
+      == bot.normalize_cache_key("https://x.com/u/status/123"),
+      "the same post via two hosts is one resource")
+check("a parameter order difference is still one key",
+      bot.normalize_cache_key("https://www.pixiv.net/member_illust.php?a=1&illust_id=5")
+      == bot.normalize_cache_key("https://www.pixiv.net/member_illust.php?illust_id=5&a=2"),
+      "identity parameters are sorted, so order cannot split an entry")
+
+# --- The operator hint blamed credentials for a deletion ---
+
+# download_with_gallery_dl raised on a non-zero exit BEFORE recording gallery-dl's output, so
+# LAST_DOWNLOAD_REASON stayed empty for exactly the runs worth explaining - a deleted work
+# exits 4 with "NotFoundError". The hint then fell through to its per-platform guess:
+#
+#   classify_download_output(real output) -> 'missing'     (recognised)
+#   admin_hint('pixiv')                   -> credentials   (nothing recorded it)
+check("gallery-dl output is recorded before the exit code is checked",
+      _reason_recorded_on_failure(),
+      "recording only on success is what produced the credentials guess")
+check("the hint names a deletion instead of credentials",
+      _hint_does_not_blame_credentials(),
+      "an operator was being sent to redo an OAuth flow that was never the problem")
+check("the hint resets between runs",
+      # Otherwise one deleted work leaves "deleted" set and the next unrelated failure is
+      # reported as a deletion.
+      _hint_is_not_sticky(),
+      "a stale reason would mis-describe the next run")
+
+# --- A transient failure turned a deletion into silence ---
+
+check("the work-state check retries before giving up",
+      _work_state_retries(),
+      "one dropped request must not hide a dead link")
+check("a persistent failure still reports unknown",
+      _work_state_gives_up_as_unknown(),
+      "retrying must not turn an unverifiable state into an accusation")
+check("a verification run is not refused by the instance guard",
+      # verify_boot.py never reaches polling, so it cannot be a second poller - but it used to
+      # be refused whenever the bot was running, which read as a boot-path regression.
+      "BOT_SKIP_INSTANCE_LOCK" in inspect.getsource(bot.main)
+      and "BOT_SKIP_INSTANCE_LOCK" in (HERE / "verify_boot.py").read_text(encoding="utf-8"),
+      "the verification script must be exempt, and say so itself")
+check("a string lock path does not crash",
+      # Found by the lock-wait test's child: INSTANCE_LOCK_FILE as a str raised
+      # AttributeError inside _instance_lock_path.
+      _string_lock_path_works(),
+      "an override passing a string would break the lock")
 
 check("the work id is read from every pixiv url shape",
       # An earlier version required five or more digits, so a short id silently yielded ""
