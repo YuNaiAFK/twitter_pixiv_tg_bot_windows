@@ -24,3 +24,8 @@ telegram-bot-api
 telegram-bot-api.exe
 # Desktop-entry shortcut created per machine
 啟動機器人.lnk
+
+# Scratch files passed to git commit -F. They are written and deleted around the commit, but
+# git add -A between those two steps stages them - which happened once and put commit message
+# text into the repository.
+_*.txt
