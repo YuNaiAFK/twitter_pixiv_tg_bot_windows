@@ -1969,6 +1969,312 @@ def _regenerate_edits_the_stored_page() -> bool:
     return True
 
 
+class _GalleryImagesHarness:
+    """
+    Drives run_gallery_images with everything outside it stubbed.
+
+    Records which path was taken - sweep, create, edit - because the three are indistinguishable
+    from the message alone and telling them apart is the point of every check below.
+    """
+
+    def __init__(self, *, alive: bool):
+        self.alive = alive
+        self.swept = 0
+        self.created = 0
+        self.edited = []
+        self.texts = []
+        self.saved = []
+        self._undo = []
+
+    # -- setup ---------------------------------------------------------------
+
+    def patch(self, name, value):
+        """Replace a module attribute and remember how to put it back."""
+        original = getattr(bot, name, None)
+        self._undo.append((name, original))
+        setattr(bot, name, value)
+
+    def patch_ehentai(self, name, value):
+        original = getattr(bot.ehentai, name, None)
+        self._undo.append((None, name, original))
+        setattr(bot.ehentai, name, value)
+
+    def restore(self):
+        for item in reversed(self._undo):
+            if item[0] is None:
+                _, name, original = item
+                setattr(bot.ehentai, name, original)
+            else:
+                name, original = item
+                setattr(bot, name, original)
+        self._undo = []
+
+    # -- the run -------------------------------------------------------------
+
+    def run(self, gallery, mode, cache_entry=None):
+        import asyncio
+
+        harness = self
+
+        def fake_sweep(*a, **k):
+            harness.swept += 1
+            return (["https://hath.network/d1.jpg", "https://hath.network/d2.jpg"],
+                    ["https://hath.network/o1.jpg"])
+
+        async def fake_gallery_page_urls(*a, **k):
+            display, original = fake_sweep()
+            return display, original
+
+        def fake_alive(urls, **k):
+            return harness.alive
+
+        def fake_create(gallery, urls, **k):
+            harness.created += 1
+            return bot.ehentai.TelegraphPage(
+                url=f"https://telegra.ph/NEW-{harness.created}",
+                path=f"NEW-{harness.created}",
+                access_token="tok-new",
+            )
+
+        def fake_edit(page, gallery, urls, **k):
+            harness.edited.append(page.url)
+            # The same page back, which is what editPage does.
+            return page
+
+        async def fake_embed(urls, gallery, status, report=None):
+            return urls
+
+        async def fake_edit_text(text, **k):
+            harness.texts.append(text)
+            return True
+
+        async def fake_edit_cover(status, gallery, summary, keyboard=None):
+            harness.texts.append(summary)
+            return True
+
+        def fake_remember_page(url, gal, mode_, page, embedded=None):
+            harness.saved.append((mode_, page.url, page.path, list(embedded or [])))
+
+        harness.patch("gallery_page_urls", fake_gallery_page_urls)
+        harness.patch("public_embed_urls", fake_embed)
+        harness.patch("edit_message_to_cover", fake_edit_cover)
+        harness.patch("remember_telegraph_page", fake_remember_page)
+        harness.patch_ehentai("images_are_still_available", fake_alive)
+        harness.patch_ehentai("create_telegraph_page", fake_create)
+        harness.patch_ehentai("edit_telegraph_page", fake_edit)
+
+        # The gallery cache, isolated to a temp file.
+        import tempfile
+        real_cache = bot.PARSE_CACHE
+        real_dir = bot.CACHE_DIR
+        work = Path(tempfile.mkdtemp(prefix="telreuse-"))
+        bot.PARSE_CACHE = bot.ParseCache(work / "cache.json")
+        bot.CACHE_DIR = work
+        if cache_entry is not None:
+            bot.PARSE_CACHE.store(bot.gallery_cache_key(gallery.page_url, gallery), "gallery",
+                                  cache_entry)
+
+        status = type("S", (), {"edit_text": staticmethod(fake_edit_text),
+                                "message_id": 1})()
+
+        async def scenario():
+            try:
+                await bot.run_gallery_images(
+                    type("M", (), {"chat_id": -100, "message_id": 5})(),
+                    status, gallery, mode, work, "", type("U", (), {"id": 7})())
+            finally:
+                pass
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            bot.PARSE_CACHE = real_cache
+            bot.CACHE_DIR = real_dir
+            harness.restore()
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
+
+        return harness
+
+
+def _cached_page_entry(url, path, token, images):
+    """A gallery-cache payload carrying a previously published page for the 'view' mode."""
+    import dataclasses
+    return {
+        "gallery": dataclasses.asdict(_fake_gallery("111", "aaaa")),
+        "display_urls": ["https://hath.network/cached.jpg"],
+        "telegraph": {
+            "view": {"url": url, "path": path, "access_token": token,
+                     "images": images, "count": 205, "at": 1.0},
+        },
+    }
+
+
+def _a_known_link_reuses_its_page() -> bool:
+    """
+    A cached page whose images load is used directly: no sweep, no Telegraph call.
+
+    This is the request: parsing the same link again and pressing the Telegraph button should not
+    build anything. The sweep is about a minute on a real gallery, so skipping it is the point.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    entry = _cached_page_entry("https://telegra.ph/OLD-1", "OLD-1", "tok-old",
+                               ["https://hath.network/old1.jpg", "https://hath.network/old2.jpg"])
+    h = _GalleryImagesHarness(alive=True).run(gallery, "view", entry)
+
+    if h.swept:
+        note(f"the gallery was swept {h.swept} time(s) even though the cached page still works")
+        return False
+    if h.created:
+        note(f"a new Telegraph page was created ({h.created}) instead of reusing the cached one")
+        return False
+    if h.edited:
+        note(f"the page was edited ({h.edited}) although its images load")
+        return False
+    joined = "\n".join(h.texts)
+    if "https://telegra.ph/OLD-1" not in joined:
+        note(f"the reused URL is missing from the message: {joined!r}")
+        return False
+    if "先前已建立" not in joined:
+        note(f"the message does not say the page was reused: {joined!r}")
+        return False
+    return True
+
+
+def _a_stale_page_is_repaired_at_the_same_url() -> bool:
+    """
+    A cached page whose images no longer load is edited in place, and the URL is unchanged.
+
+    This is the repair half. Publishing a second page would fix the images and break every link
+    already shared, which is what the editPage work removed.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    entry = _cached_page_entry("https://telegra.ph/OLD-1", "OLD-1", "tok-old",
+                               ["https://hath.network/dead.jpg"])
+    h = _GalleryImagesHarness(alive=False).run(gallery, "view", entry)
+
+    if not h.edited:
+        note("the page was not edited, so the images would still be broken")
+        return False
+    if h.edited != ["https://telegra.ph/OLD-1"]:
+        note(f"the wrong page was edited: {h.edited}")
+        return False
+    if h.created:
+        note(f"a NEW page was created ({h.created}) instead of repairing the existing one, so "
+             f"the URL changed")
+        return False
+    joined = "\n".join(h.texts)
+    if "https://telegra.ph/OLD-1" not in joined:
+        note("the repaired message does not carry the original URL")
+        return False
+    if "網址不變" not in joined:
+        note(f"the message does not say the URL is unchanged: {joined!r}")
+        return False
+    # And the repaired page is recorded, so the next press reuses it.
+    if not h.saved or h.saved[0][1] != "https://telegra.ph/OLD-1":
+        note(f"the repaired page was not recorded: {h.saved}")
+        return False
+    return True
+
+
+def _an_unknown_link_still_publishes() -> bool:
+    """
+    With nothing cached, a page is created and recorded - the behaviour that existed before.
+
+    The reuse path must not have made the ordinary first-time case worse.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    h = _GalleryImagesHarness(alive=True).run(gallery, "view", None)
+
+    if not h.created:
+        note("nothing was created for a gallery with no cached page")
+        return False
+    if h.edited:
+        note(f"a page was edited before any existed: {h.edited}")
+        return False
+    if not h.swept:
+        note("the sweep was skipped, but without a cached page there is nothing to embed")
+        return False
+    if not h.saved:
+        note("the new page was not recorded, so the next parse cannot reuse it")
+        return False
+    return True
+
+
+def _a_page_for_one_mode_is_not_reused_for_the_other() -> bool:
+    """
+    "顯示圖" and "原圖" are different pages and must not be handed to each other.
+
+    They embed different images - the web-sized one and the full-resolution file - so reusing a
+    view page for an orig request would silently serve the smaller images.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    entry = _cached_page_entry("https://telegra.ph/VIEW-1", "VIEW-1", "tok-view",
+                               ["https://hath.network/v.jpg"])
+    # The entry only has "view"; asking for "orig" must not find it.
+    h = _GalleryImagesHarness(alive=True).run(gallery, "orig", entry)
+
+    if not h.created:
+        note("the view page was reused for an original request; the two embed different images")
+        return False
+    joined = "\n".join(h.texts)
+    if "https://telegra.ph/VIEW-1" in joined:
+        note("the message carries the view page's URL for an original request")
+        return False
+    return True
+
+
+def _the_cached_page_survives_a_gallery_rewrite() -> bool:
+    """
+    Recording a page must not discard the gallery facts or the cached sweep.
+
+    remember_telegraph_page merges into the existing payload. Replacing it would throw away the
+    expensive sweep every time a page was published, which is the cost the cache exists to avoid.
+    """
+    import dataclasses
+    import tempfile
+
+    gallery = _fake_gallery("111", "aaaa")
+    work = Path(tempfile.mkdtemp(prefix="telmerge-"))
+    real_cache = bot.PARSE_CACHE
+    real_dir = bot.CACHE_DIR
+    try:
+        bot.PARSE_CACHE = bot.ParseCache(work / "cache.json")
+        bot.CACHE_DIR = work
+        key = bot.gallery_cache_key(gallery.page_url, gallery)
+        bot.PARSE_CACHE.store(key, "gallery", {
+            "gallery": dataclasses.asdict(gallery),
+            "display_urls": ["https://hath.network/keep-me.jpg"],
+            "original_urls": ["https://hath.network/keep-me-orig.jpg"],
+        })
+        page = bot.ehentai.TelegraphPage(url="https://telegra.ph/X-1", path="X-1",
+                                         access_token="tok")
+        bot.remember_telegraph_page(gallery.page_url, gallery, "view", page,
+                                    ["https://hath.network/a.jpg"])
+        after = bot.gallery_cache_lookup(gallery.page_url, gallery)
+        if after.get("display_urls") != ["https://hath.network/keep-me.jpg"]:
+            note("recording a page discarded the cached image sweep")
+            return False
+        if (after.get("telegraph") or {}).get("view", {}).get("url") != "https://telegra.ph/X-1":
+            note("the page was not recorded")
+            return False
+        # And reading it back gives something an edit can use.
+        entry = bot.cached_telegraph_entry(gallery.page_url, gallery, "view")
+        rebuilt = bot.telegraph_page_from_entry(entry)
+        if rebuilt is None or rebuilt.access_token != "tok" or rebuilt.path != "X-1":
+            note("the recorded entry cannot be rebuilt into a page an edit could use")
+            return False
+        if bot.cached_telegraph_entry(gallery.page_url, gallery, "orig") is not None:
+            note("a page was found for a mode that was never published")
+            return False
+        return True
+    finally:
+        bot.PARSE_CACHE = real_cache
+        bot.CACHE_DIR = real_dir
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -3953,6 +4259,23 @@ check("a TelegraphPage stringifies to its URL",
 check("run_regenerate edits the stored page and says the URL is unchanged",
       _regenerate_edits_the_stored_page(),
       "the button's own path, where an undefined name or a wrong argument would surface")
+
+check("a link parsed before reuses its Telegraph page instead of building a new one",
+      _a_known_link_reuses_its_page(),
+      "pressing the Telegraph button for a gallery already looked at should cost two HEAD "
+      "requests, not a minute of sweeps and a Telegraph round trip")
+check("a cached page whose images no longer load is repaired at the same URL",
+      _a_stale_page_is_repaired_at_the_same_url(),
+      "publishing a second page would fix the images and break every link already shared")
+check("a link with no cached page still publishes one",
+      _an_unknown_link_still_publishes(),
+      "the reuse path must not make the first-time case worse")
+check("a page built for 顯示圖 is not reused for 原圖",
+      _a_page_for_one_mode_is_not_reused_for_the_other(),
+      "the two embed different images, so reusing one for the other serves the wrong set")
+check("recording a page keeps the gallery facts and the cached sweep",
+      _the_cached_page_survives_a_gallery_rewrite(),
+      "the sweep is the expensive part of the cache and must survive a publish")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),

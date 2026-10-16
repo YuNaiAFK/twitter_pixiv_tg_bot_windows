@@ -1705,7 +1705,7 @@ def gallery_cache_age(url: str, gallery=None) -> float | None:
     return PARSE_CACHE.age(gallery_cache_key(url, gallery))
 
 
-def gallery_cache_payload(gallery, image_urls=None) -> dict:
+def gallery_cache_payload(gallery, image_urls=None, telegraph=None) -> dict:
     """
     Serialise a gallery for the cache.
 
@@ -1726,6 +1726,8 @@ def gallery_cache_payload(gallery, image_urls=None) -> dict:
     if image_urls:
         payload["display_urls"] = list(image_urls[0] or [])
         payload["original_urls"] = list(image_urls[1] or [])
+    if telegraph:
+        payload["telegraph"] = telegraph
     return payload
 
 
@@ -1739,6 +1741,82 @@ def gallery_from_payload(payload: dict):
     except Exception as exc:  # noqa: BLE001
         logger.warning("快取的畫廊資料無法還原，將重新讀取：%s", exc)
         return None
+
+
+# How many embedded image URLs to keep for the liveness check. They are signed together and
+# expire together, so a handful answers the question; storing two hundred would bloat the cache
+# for no more certainty.
+TELEGRAPH_IMAGE_SAMPLES = 6
+
+
+def cached_telegraph_entry(url: str, gallery, mode: str) -> dict | None:
+    """
+    The Telegraph page recorded for this gallery and mode, or None.
+
+    Keyed by mode because the two are different pages with different content: "顯示圖" embeds the
+    web-sized image and "原圖" the full-resolution file, so a page built for one must not be handed
+    back for the other.
+
+    Returns the stored dict - url, path, access_token, and the sampled image URLs - not a
+    TelegraphPage, because the caller also needs the samples to decide whether it still works.
+    """
+    payload = gallery_cache_lookup(url, gallery)
+    pages = payload.get("telegraph") or {}
+    entry = pages.get(mode)
+    if not isinstance(entry, dict) or not entry.get("url"):
+        return None
+    return entry
+
+
+def telegraph_page_from_entry(entry: dict):
+    """Rebuild a TelegraphPage from a cached entry, or None if it lacks what an edit needs."""
+    if not entry:
+        return None
+    path = entry.get("path") or ""
+    token = entry.get("access_token") or ""
+    url = entry.get("url") or ""
+    if not (path and token and url):
+        return None
+    return ehentai.TelegraphPage(url=url, path=path, access_token=token)
+
+
+def remember_telegraph_page(url: str, gallery, mode: str, page, embedded=None) -> None:
+    """
+    Record a published page against its gallery, so a later parse reuses it.
+
+    Merged into the existing payload rather than replacing it: the gallery's facts and its image
+    sweep are still wanted, and rewriting the payload without them would throw away the expensive
+    part of the cache on every publish.
+    """
+    import dataclasses
+
+    payload = gallery_cache_lookup(url, gallery)
+    if not payload.get("gallery"):
+        # Nothing cached to merge into. Storing a page without its gallery would produce an entry
+        # gallery_from_payload cannot read, which is worse than not storing one.
+        payload = {"gallery": dataclasses.asdict(gallery)}
+
+    pages = dict(payload.get("telegraph") or {})
+    samples = []
+    if embedded:
+        # Spread across the list, not the first few: the liveness check wants URLs that represent
+        # the whole page.
+        step = max(1, len(embedded) // TELEGRAPH_IMAGE_SAMPLES)
+        samples = [embedded[i] for i in range(0, len(embedded), step)][:TELEGRAPH_IMAGE_SAMPLES]
+    pages[mode] = {
+        "url": page.url,
+        "path": page.path,
+        "access_token": page.access_token,
+        "images": samples,
+        "count": len(embedded or []),
+        "at": time.time(),
+    }
+    payload["telegraph"] = pages
+
+    PARSE_CACHE.store(gallery_cache_key(url, gallery), "gallery", payload)
+    if PARSE_CACHE.needs_pruning():
+        PARSE_CACHE.prune()
+    PARSE_CACHE.save()
 
 
 def remember_gallery(url: str, gallery, image_urls=None) -> None:
@@ -5859,39 +5937,104 @@ async def run_gallery_images(message, status, gallery, mode: str,
     each embedded image itself - which is why the reply appears without waiting for
     the gallery's bytes.
     """
-    # The sweep alone. The "歸檔" modes download through the same helper afterwards,
-    # so a gallery already looked at costs no sweep there either.
-    display_urls, original_urls = await gallery_page_urls(gallery, status, False)
-
-    await status.edit_text(
-        f"已取得 {len(display_urls)} 頁，正在建立 Telegraph 頁面……",
-        link_preview_options=source_link_options(),
-    )
-
-    embed = display_urls if mode == "view" else (original_urls or display_urls)
-    embed = await public_embed_urls(embed, gallery, status, report=True)
-
-    telegraph_page = None
-    telegraph_url = ""
-    try:
-        telegraph_page = await asyncio.to_thread(
-            ehentai.create_telegraph_page,
-            gallery,
-            embed,
-            author_name=TELEGRAPH_AUTHOR,
+    # **A page published for this gallery before is reused when it still works.**
+    #
+    # The gallery cache is on disk, so this finds a page built days ago, not only one from this
+    # session. The test is a couple of HEAD requests against the page's own embedded images - far
+    # cheaper than the per-page sweep, which is the expensive part of everything below.
+    cached_entry = cached_telegraph_entry(gallery.page_url, gallery, mode)
+    reuse_page = None
+    repaired = False
+    embed = []
+    if cached_entry is not None:
+        alive = await asyncio.to_thread(
+            ehentai.images_are_still_available,
+            cached_entry.get("images") or [],
+            timeout=float(EHENTAI_TIMEOUT_SECONDS),
         )
-        telegraph_url = telegraph_page.url
-    except ehentai.TelegraphError as exc:
-        logger.warning("Telegraph 建立失敗：%s", exc)
-        telegraph_url = ""
-        telegraph_note = f"（Telegraph 頁面建立失敗：{exc}）"
-    else:
-        telegraph_note = ""
+        if alive:
+            reuse_page = telegraph_page_from_entry(cached_entry)
+            if reuse_page is not None:
+                embed = list(cached_entry.get("images") or [])
+                logger.info("沿用先前建立的 Telegraph 頁面（圖片仍可載入）：%s",
+                            reuse_page.url)
+
+    telegraph_page = reuse_page
+    telegraph_note = ""
+    if reuse_page is None:
+        # The sweep alone. The "歸檔" modes download through the same helper afterwards,
+        # so a gallery already looked at costs no sweep there either.
+        display_urls, original_urls = await gallery_page_urls(gallery, status, False)
+
+        await status.edit_text(
+            f"已取得 {len(display_urls)} 頁，正在建立 Telegraph 頁面……",
+            link_preview_options=source_link_options(),
+        )
+
+        embed = display_urls if mode == "view" else (original_urls or display_urls)
+        embed = await public_embed_urls(embed, gallery, status, report=True)
+
+        try:
+            if cached_entry is not None:
+                # **The page exists but its images do not load: repair it in place.** Publishing a
+                # second page would fix the images and break every link already shared with the
+                # first, which is the opposite of what the button is for.
+                existing = telegraph_page_from_entry(cached_entry)
+                if existing is not None:
+                    telegraph_page = await asyncio.to_thread(
+                        ehentai.edit_telegraph_page,
+                        existing,
+                        gallery,
+                        embed,
+                    )
+                    repaired = True
+                    logger.info("已修復 Telegraph 頁面（網址不變）：%s", telegraph_page.url)
+                else:
+                    # Recorded without the token an edit needs. Only possible for an entry written
+                    # before pages carried one.
+                    telegraph_page = await asyncio.to_thread(
+                        ehentai.create_telegraph_page,
+                        gallery,
+                        embed,
+                        author_name=TELEGRAPH_AUTHOR,
+                    )
+            else:
+                telegraph_page = await asyncio.to_thread(
+                    ehentai.create_telegraph_page,
+                    gallery,
+                    embed,
+                    author_name=TELEGRAPH_AUTHOR,
+                )
+        except ehentai.TelegraphError as exc:
+            logger.warning("Telegraph 建立失敗：%s", exc)
+            telegraph_page = None
+            telegraph_note = f"（Telegraph 頁面建立失敗：{exc}）"
+
+        if telegraph_page is not None:
+            # **Recorded after a repair as well, which the first version of this got wrong.**
+            #
+            # The entry holds the sampled image URLs the liveness check uses, and a repair happens
+            # precisely because those URLs are dead. Skipping the write left the dead samples in
+            # the cache, so every later press would sweep again and repair again - the cost this
+            # whole path exists to avoid.
+            await asyncio.to_thread(
+                remember_telegraph_page, gallery.page_url, gallery, mode, telegraph_page, embed)
+
+    telegraph_url = telegraph_page.url if telegraph_page is not None else ""
 
     summary_lines = [build_gallery_info(gallery)]
     if telegraph_url:
-        summary_lines.append(
-            f"\n📄 Telegraph（內嵌 {len(embed)} 頁圖片）：{telegraph_url}")
+        if reuse_page is not None:
+            summary_lines.append(
+                f"\n📄 Telegraph（先前已建立，圖片仍可載入，內嵌 "
+                f"{cached_entry.get('count') or len(embed)} 頁圖片）：{telegraph_url}")
+        elif repaired:
+            summary_lines.append(
+                f"\n📄 Telegraph（已修復圖片，網址不變，內嵌 {len(embed)} 頁圖片）："
+                f"{telegraph_url}")
+        else:
+            summary_lines.append(
+                f"\n📄 Telegraph（內嵌 {len(embed)} 頁圖片）：{telegraph_url}")
     if telegraph_note:
         summary_lines.append(f"\n{telegraph_note}")
     if gallery.is_adult:

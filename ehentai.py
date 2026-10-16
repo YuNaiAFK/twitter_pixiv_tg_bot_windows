@@ -1168,6 +1168,65 @@ def create_telegraph_page(
     )
 
 
+def images_are_still_available(
+    urls: Sequence[str],
+    *,
+    sample: int = 3,
+    timeout: float = 15.0,
+    http_client=None,
+) -> bool:
+    """
+    Whether a Telegraph page's embedded images can still be loaded.
+
+    **This is the question 重新生成 exists to answer.** The embedded URLs are signed
+    ``hath.network`` links, and the signature expires; when it does, every image on the page stops
+    loading at once. Testing them directly says whether the page still works, which is what decides
+    between reusing it and repairing it - and it is far cheaper than re-running the per-page viewer
+    sweep to find out.
+
+    **One working URL is enough to call the page healthy.** The signature is a property of the
+    sweep that produced the URLs, not of an individual one, so they expire together: if any of them
+    still loads, the signature is valid and so are the rest. Requiring all of them would make a
+    single permanently-removed image cause a full re-sweep - about a minute of requests - on every
+    press, forever, and the re-sweep would not bring the missing image back.
+
+    Sampled URLs are spread across the list rather than taken from the front, so a page whose later
+    images broke is not called healthy on the strength of its first three.
+
+    Returns False when there is nothing to check, which is the safe answer: an unknown page is
+    treated as one that needs rebuilding rather than one that is fine.
+    """
+    import httpx
+
+    candidates = [u for u in urls if u]
+    if not candidates:
+        return False
+
+    if len(candidates) <= sample:
+        chosen = candidates
+    else:
+        # Spread across the list: first, last, and the ones between.
+        step = max(1, len(candidates) // sample)
+        chosen = [candidates[i] for i in range(0, len(candidates), step)][:sample]
+
+    client = http_client or httpx.Client(**http_client_kwargs(timeout))
+    try:
+        for url in chosen:
+            try:
+                # HEAD, not GET: this asks whether the link resolves without pulling an image.
+                # A ranged GET was tried for the same purpose elsewhere and downloaded the whole
+                # file, because these hosts ignore Range.
+                response = client.head(url)
+                if response.status_code < 400:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+    finally:
+        if http_client is None:
+            client.close()
+
+
 def edit_telegraph_page(
     page: TelegraphPage,
     gallery: EhentaiGallery,
