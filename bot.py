@@ -260,6 +260,10 @@ EHENTAI_DOWNLOAD_WORKERS = env_number("EHENTAI_DOWNLOAD_WORKERS", 6)
 # Viewer pages are plain page views rather than metered image downloads, so a
 # handful of workers is fine; measured 1.91s sequential vs 0.44s at 8.
 EHENTAI_VIEWER_WORKERS = env_number("EHENTAI_VIEWER_WORKERS", 6)
+# How many image URLs to check at once when verifying a Telegraph page, and how long to allow each.
+# Higher than the viewer sweep because these are HEAD requests to a CDN rather than page fetches.
+TELEGRAPH_VERIFY_WORKERS = env_number("TELEGRAPH_VERIFY_WORKERS", 16)
+TELEGRAPH_VERIFY_TIMEOUT = env_number("TELEGRAPH_VERIFY_TIMEOUT", 15)
 
 # Connections used to fetch one official archive. e-hentai's CDN throttles each
 # connection hard, so one stream leaves the link idle. Measured on a 16 MiB prefix of
@@ -5946,18 +5950,44 @@ async def run_gallery_images(message, status, gallery, mode: str,
     reuse_page = None
     repaired = False
     embed = []
+    damage = None
     if cached_entry is not None:
-        alive = await asyncio.to_thread(
-            ehentai.images_are_still_available,
-            cached_entry.get("images") or [],
-            timeout=float(EHENTAI_TIMEOUT_SECONDS),
-        )
-        if alive:
-            reuse_page = telegraph_page_from_entry(cached_entry)
-            if reuse_page is not None:
-                embed = list(cached_entry.get("images") or [])
-                logger.info("沿用先前建立的 Telegraph 頁面（圖片仍可載入）：%s",
-                            reuse_page.url)
+        candidate = telegraph_page_from_entry(cached_entry)
+        if candidate is not None:
+            # **Read the page and check every image it embeds.**
+            #
+            # Not the cached sample: that holds six URLs out of two hundred, and a sample cannot
+            # answer "are this page's images broken". The page's own <img> tags are what a
+            # reader's browser will try to load, so those are what is examined - and one broken
+            # image is enough to justify the repair, which is why the check stops at the first.
+            page_images = await asyncio.to_thread(
+                ehentai.telegraph_page_images,
+                candidate.path,
+                timeout=float(TELEGRAPH_VERIFY_TIMEOUT),
+            )
+            if not page_images:
+                # The page could not be read. That is a problem at Telegraph, not with the
+                # gallery, and punishing a transient outage with a full re-sweep would be worse
+                # than reusing a page that is probably fine.
+                logger.warning("讀不到 Telegraph 頁面的圖片清單，仍沿用原頁面：%s", candidate.url)
+                reuse_page = candidate
+            else:
+                report = await asyncio.to_thread(
+                    ehentai.check_image_urls,
+                    page_images,
+                    workers=int(TELEGRAPH_VERIFY_WORKERS),
+                    timeout=float(TELEGRAPH_VERIFY_TIMEOUT),
+                    stop_after=1,
+                )
+                if report.ok:
+                    reuse_page = candidate
+                    embed = page_images
+                    logger.info("沿用先前建立的 Telegraph 頁面（%s）：%s",
+                                report.summary(), candidate.url)
+                else:
+                    damage = report
+                    logger.info("Telegraph 頁面有圖片載入失敗，將修復（%s）：%s",
+                                report.summary(), candidate.url)
 
     telegraph_page = reuse_page
     telegraph_note = ""
@@ -6029,9 +6059,13 @@ async def run_gallery_images(message, status, gallery, mode: str,
                 f"\n📄 Telegraph（先前已建立，圖片仍可載入，內嵌 "
                 f"{cached_entry.get('count') or len(embed)} 頁圖片）：{telegraph_url}")
         elif repaired:
+            reason = ""
+            if damage is not None and damage.broken:
+                first = damage.broken[0]
+                reason = f"，偵測到 {len(damage.broken)} 張載入失敗（{first.reason}）"
             summary_lines.append(
-                f"\n📄 Telegraph（已修復圖片，網址不變，內嵌 {len(embed)} 頁圖片）："
-                f"{telegraph_url}")
+                f"\n📄 Telegraph（已修復圖片{reason}，網址不變，內嵌 "
+                f"{len(embed)} 頁圖片）：{telegraph_url}")
         else:
             summary_lines.append(
                 f"\n📄 Telegraph（內嵌 {len(embed)} 頁圖片）：{telegraph_url}")

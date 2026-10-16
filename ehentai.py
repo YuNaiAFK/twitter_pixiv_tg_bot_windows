@@ -30,7 +30,7 @@ import re
 import threading
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -1168,6 +1168,258 @@ def create_telegraph_page(
     )
 
 
+@dataclass
+class ImageCheck:
+    """The outcome of checking one image URL."""
+
+    url: str
+    ok: bool
+    reason: str = ""
+
+    @property
+    def host(self) -> str:
+        try:
+            return urllib.parse.urlsplit(self.url).netloc
+        except ValueError:
+            return ""
+
+
+@dataclass
+class ImageCheckReport:
+    """
+    What a check of a page's embedded images found.
+
+    `broken` is the useful part: it names each URL that did not come back as a usable image, with
+    the reason, so the chat can say how many and the log can say which.
+    """
+
+    total: int = 0
+    checked: int = 0
+    healthy: int = 0
+    broken: list = field(default_factory=list)
+    stopped_early: bool = False
+
+    @property
+    def ok(self) -> bool:
+        """True when every URL that was checked came back as a usable image."""
+        return not self.broken
+
+    def summary(self) -> str:
+        if not self.total:
+            return "沒有可檢查的圖片網址"
+        if not self.broken:
+            if self.stopped_early:
+                return f"已檢查 {self.checked} 張，全部正常"
+            return f"檢查 {self.checked} 張圖片，全部正常"
+        if self.stopped_early:
+            # Saying "N of M" would be wrong - the rest were never looked at. What matters to the
+            # reader is that the page is damaged and how much was confirmed before stopping.
+            return (f"檢查 {self.checked} 張圖片，已發現 {len(self.broken)} 張有問題"
+                    f"（尚有 {self.total - self.checked} 張未檢查）")
+        return f"檢查 {self.checked} 張圖片，{len(self.broken)} 張有問題"
+
+
+def _check_one_image(client, url: str, deep: bool) -> ImageCheck:
+    """
+    Request one image URL and decide whether it is usable.
+
+    **What "usable" means, and why the status alone is not it.** A signed hath.network URL that has
+    expired answers 403 or 404, which the status catches. But a node that is up and misconfigured
+    can answer 200 with an HTML error page, or with an empty body - both of which draw a broken
+    image in a browser and neither of which the status alone reveals. So the content type and the
+    length are checked too.
+
+    HEAD is used by default because these are images the bot does not otherwise need, and a ranged
+    GET was measured downloading the whole file - these hosts ignore Range, so asking for the first
+    kilobyte costs the whole image. ``deep`` fetches a bounded prefix instead, which catches a
+    truncated or mislabelled body at the cost of one download per URL.
+    """
+    try:
+        if deep:
+            # Streamed so the connection can be abandoned after the first chunk rather than
+            # reading an image the bot has no use for.
+            with client.stream("GET", url) as response:
+                status = response.status_code
+                content_type = (response.headers.get("content-type") or "").lower()
+                if status >= 400:
+                    return ImageCheck(url, False, f"HTTP {status}")
+                if content_type and not content_type.startswith("image/"):
+                    return ImageCheck(url, False, f"不是圖片（{content_type.split(';')[0]}）")
+                for chunk in response.iter_bytes(1024):
+                    if not chunk:
+                        return ImageCheck(url, False, "內容是空的")
+                    if not _looks_like_an_image(chunk):
+                        return ImageCheck(url, False, "內容不是圖片格式")
+                    return ImageCheck(url, True)
+                return ImageCheck(url, False, "內容是空的")
+        else:
+            response = client.head(url)
+            status = response.status_code
+            if status >= 400:
+                return ImageCheck(url, False, f"HTTP {status}")
+            content_type = (response.headers.get("content-type") or "").lower()
+            if content_type and not content_type.startswith("image/"):
+                # **Strict, and measured before being made strict.** Every working image from this
+                # CDN answered with an image content type; an earlier version excused text/html on
+                # the theory that some hosts only report the real type on GET - which was invented
+                # rather than observed, and it meant a 200 carrying an HTML error page counted as
+                # a working image. That is precisely the "damaged" case this is meant to catch.
+                return ImageCheck(url, False, f"不是圖片（{content_type.split(';')[0]}）")
+            length = response.headers.get("content-length")
+            if length is not None:
+                try:
+                    if int(length) <= 0:
+                        return ImageCheck(url, False, "長度為 0")
+                except ValueError:
+                    pass
+            return ImageCheck(url, True)
+    except Exception as exc:  # noqa: BLE001
+        # A timeout, a refused connection, a DNS failure: all mean the image does not load.
+        return ImageCheck(url, False, f"{type(exc).__name__}")
+
+
+def _looks_like_an_image(chunk: bytes) -> bool:
+    """
+    Whether these leading bytes are a known image format.
+
+    Checked by magic number rather than by the content type, because the content type is what the
+    server claims and the magic number is what the bytes are. JPEG, PNG, GIF, WebP and AVIF are
+    what e-hentai's CDN serves.
+    """
+    if len(chunk) < 12:
+        return False
+    if chunk.startswith(b"\xff\xd8\xff"):                      # JPEG
+        return True
+    if chunk.startswith(b"\x89PNG\r\n\x1a\n"):               # PNG
+        return True
+    if chunk.startswith(b"GIF87a") or chunk.startswith(b"GIF89a"):
+        return True
+    if chunk[:4] == b"RIFF" and chunk[8:12] == b"WEBP":           # WebP
+        return True
+    if chunk[4:12] in (b"ftypavif", b"ftypavis"):                 # AVIF
+        return True
+    return False
+
+
+def check_image_urls(
+    urls: Sequence[str],
+    *,
+    workers: int = 24,
+    timeout: float = 12.0,
+    deep: bool = False,
+    limit: int = 0,
+    stop_after: int = 0,
+    progress=None,
+) -> ImageCheckReport:
+    """
+    Check whether every embedded image URL still loads, and returns an image when it does.
+
+    **Every URL, not a sample.** This is what "detect images that fail to load or are damaged"
+    means, and a sample cannot answer it: the previous version called a page healthy as soon as one
+    of three URLs loaded, so a page with almost everything broken was reported as fine.
+
+    Concurrent because two hundred sequential requests would take minutes, and HEAD requests to a
+    CDN are cheap. ``progress`` is called with (done, total) if given.
+
+    ``limit`` caps how many are checked, for a caller that wants a quick opinion rather than a
+    guarantee. Zero means all of them.
+
+    ``stop_after`` halts once that many broken URLs have been found. The caller that only needs to
+    decide "is this page damaged" gets its answer in the time it takes to find the first one -
+    measured at a few seconds on a page whose signatures had all expired. The report records that
+    it stopped early, so its counts are not read as the whole picture.
+    """
+    import httpx
+
+    candidates = [u for u in urls if u]
+    if limit and limit > 0:
+        candidates = candidates[:limit]
+    report = ImageCheckReport(total=len(candidates))
+    if not candidates:
+        return report
+
+    client = httpx.Client(**http_client_kwargs(timeout))
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(_check_one_image, client, url, deep): url
+                       for url in candidates}
+            seen = 0
+            for future in as_completed(futures):
+                seen += 1
+                report.checked = seen
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    result = ImageCheck(futures[future], False, f"{type(exc).__name__}")
+                if result.ok:
+                    report.healthy += 1
+                else:
+                    report.broken.append(result)
+                if progress is not None:
+                    try:
+                        progress(seen, len(candidates))
+                    except Exception:  # noqa: BLE001
+                        pass
+                if stop_after and len(report.broken) >= stop_after:
+                    # **The answer is already known.** One broken image is enough to justify a
+                    # repair, so the rest would be requests made for a number nobody acts on. The
+                    # futures are cancelled by leaving the with-block, which shuts the pool down.
+                    report.stopped_early = seen < len(candidates)
+                    break
+    finally:
+        client.close()
+    return report
+
+
+def telegraph_page_images(path: str, *, timeout: float = 20.0, http_client=None) -> list[str]:
+    """
+    The image URLs a published Telegraph page embeds, in page order.
+
+    **Read from the page, not from anything the bot stored.** The cache keeps a handful of sampled
+    URLs per page, which cannot answer "are this page's images broken" - and a stored list can
+    drift from what was actually published. The page's own <img> tags are what a reader's browser
+    will try to load, so those are what to check.
+
+    Returns an empty list when the page cannot be read, which the caller must treat as "cannot
+    confirm" rather than "healthy" - see check_image_urls.
+
+    Only absolute http(s) sources are returned: the page also references scripts and an image
+    proxy, and those are not the gallery's images.
+    """
+    import httpx
+
+    if not path:
+        return []
+
+    client = http_client or httpx.Client(**http_client_kwargs(timeout))
+    owns_client = http_client is None
+    try:
+        response = client.get(f"https://telegra.ph/{path.lstrip('/')}")
+        if response.status_code >= 400:
+            return []
+        page_html = response.text
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("讀取 Telegraph 頁面失敗（%s）：%s", path, exc)
+        return []
+    finally:
+        if owns_client:
+            client.close()
+
+    found: list[str] = []
+    seen = set()
+    for match in re.finditer(r'<img\b[^>]*?\bsrc=["\']([^"\']+)["\']', page_html, re.I):
+        src = html.unescape(match.group(1)).strip()
+        if not src.lower().startswith(("http://", "https://")):
+            continue
+        # The page includes Telegram's own image proxy in some renderings; it is not the gallery.
+        if "t.me/" in src:
+            continue
+        if src not in seen:
+            seen.add(src)
+            found.append(src)
+    return found
+
+
 def images_are_still_available(
     urls: Sequence[str],
     *,
@@ -1176,25 +1428,13 @@ def images_are_still_available(
     http_client=None,
 ) -> bool:
     """
-    Whether a Telegraph page's embedded images can still be loaded.
+    A quick opinion: whether at least one of a few URLs still loads.
 
-    **This is the question 重新生成 exists to answer.** The embedded URLs are signed
-    ``hath.network`` links, and the signature expires; when it does, every image on the page stops
-    loading at once. Testing them directly says whether the page still works, which is what decides
-    between reusing it and repairing it - and it is far cheaper than re-running the per-page viewer
-    sweep to find out.
+    Kept for the cheap path, where the question is only "is this page obviously dead". It is **not**
+    the check behind "detect images that fail to load or are damaged" - use check_image_urls for
+    that, which examines every URL and what came back.
 
-    **One working URL is enough to call the page healthy.** The signature is a property of the
-    sweep that produced the URLs, not of an individual one, so they expire together: if any of them
-    still loads, the signature is valid and so are the rest. Requiring all of them would make a
-    single permanently-removed image cause a full re-sweep - about a minute of requests - on every
-    press, forever, and the re-sweep would not bring the missing image back.
-
-    Sampled URLs are spread across the list rather than taken from the front, so a page whose later
-    images broke is not called healthy on the strength of its first three.
-
-    Returns False when there is nothing to check, which is the safe answer: an unknown page is
-    treated as one that needs rebuilding rather than one that is fine.
+    Returns False when there is nothing to check, which is the safe answer.
     """
     import httpx
 
@@ -1205,17 +1445,14 @@ def images_are_still_available(
     if len(candidates) <= sample:
         chosen = candidates
     else:
-        # Spread across the list: first, last, and the ones between.
         step = max(1, len(candidates) // sample)
         chosen = [candidates[i] for i in range(0, len(candidates), step)][:sample]
 
     client = http_client or httpx.Client(**http_client_kwargs(timeout))
+    owns_client = http_client is None
     try:
         for url in chosen:
             try:
-                # HEAD, not GET: this asks whether the link resolves without pulling an image.
-                # A ranged GET was tried for the same purpose elsewhere and downloaded the whole
-                # file, because these hosts ignore Range.
                 response = client.head(url)
                 if response.status_code < 400:
                     return True
@@ -1223,7 +1460,7 @@ def images_are_still_available(
                 continue
         return False
     finally:
-        if http_client is None:
+        if owns_client:
             client.close()
 
 

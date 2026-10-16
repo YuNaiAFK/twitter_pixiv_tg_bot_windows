@@ -1984,6 +1984,11 @@ class _GalleryImagesHarness:
         self.edited = []
         self.texts = []
         self.saved = []
+        # What the page reports as its embedded images, and what the check was asked about.
+        self.embedded = ["https://hath.network/embedded-1.jpg",
+                         "https://hath.network/embedded-2.jpg"]
+        self.pages_read = []
+        self.checked = []
         self._undo = []
 
     # -- setup ---------------------------------------------------------------
@@ -2025,8 +2030,22 @@ class _GalleryImagesHarness:
             display, original = fake_sweep()
             return display, original
 
-        def fake_alive(urls, **k):
-            return harness.alive
+        # The reuse decision now reads the page's own images and checks every one of them, so
+        # these two are what the harness has to control - not images_are_still_available, which
+        # that path no longer calls.
+        def fake_page_images(path, **k):
+            harness.pages_read.append(path)
+            return list(harness.embedded)
+
+        def fake_check(urls, **k):
+            harness.checked.extend(urls)
+            if harness.alive:
+                return bot.ehentai.ImageCheckReport(
+                    total=len(urls), checked=len(urls), healthy=len(urls))
+            return bot.ehentai.ImageCheckReport(
+                total=len(urls), checked=1, healthy=max(0, len(urls) - 1),
+                broken=[bot.ehentai.ImageCheck(urls[0], False, "HTTP 403")],
+                stopped_early=len(urls) > 1)
 
         def fake_create(gallery, urls, **k):
             harness.created += 1
@@ -2059,7 +2078,8 @@ class _GalleryImagesHarness:
         harness.patch("public_embed_urls", fake_embed)
         harness.patch("edit_message_to_cover", fake_edit_cover)
         harness.patch("remember_telegraph_page", fake_remember_page)
-        harness.patch_ehentai("images_are_still_available", fake_alive)
+        harness.patch_ehentai("telegraph_page_images", fake_page_images)
+        harness.patch_ehentai("check_image_urls", fake_check)
         harness.patch_ehentai("create_telegraph_page", fake_create)
         harness.patch_ehentai("edit_telegraph_page", fake_edit)
 
@@ -2273,6 +2293,111 @@ def _the_cached_page_survives_a_gallery_rewrite() -> bool:
         bot.CACHE_DIR = real_dir
         import shutil
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _image_format_sniffing() -> bool:
+    """
+    The magic-number check must accept the formats this CDN serves and reject anything else.
+
+    It is what catches a body that is not an image even though the request succeeded - an HTML
+    error page served with 200, which the status alone cannot distinguish from a working image.
+    Content type is checked too, but the content type is what the server claims and the magic
+    number is what the bytes are.
+    """
+    cases = [
+        (b"\xff\xd8\xff\xe0" + b"0" * 12, True, "JPEG"),
+        (b"\x89PNG\r\n\x1a\n" + b"0" * 8, True, "PNG"),
+        (b"GIF87a" + b"0" * 12, True, "GIF87a"),
+        (b"GIF89a" + b"0" * 12, True, "GIF89a"),
+        (b"RIFF\x00\x00\x00\x00WEBP", True, "WebP"),
+        (b"\x00\x00\x00 ftypavif" + b"0" * 4, True, "AVIF"),
+        (b"<!DOCTYPE html><html><body>error", False, "an HTML error page"),
+        (b"{\"error\": \"not found\"}", False, "a JSON error"),
+        (b"short", False, "a body too short to identify"),
+        (b"", False, "an empty body"),
+    ]
+    for data, want, label in cases:
+        got = bot.ehentai._looks_like_an_image(data)
+        if got != want:
+            note(f"{label}: expected {want}, got {got}")
+            return False
+    return True
+
+
+def _image_check_reports_are_honest() -> bool:
+    """
+    A report must not read as complete when the check stopped early.
+
+    It stops at the first broken image, because one is enough to justify a repair. Saying "4 of 225
+    have a problem" would then be wrong - the other 221 were never looked at - and that is a number
+    someone would act on.
+    """
+    ehentai = bot.ehentai
+
+    empty = ehentai.ImageCheckReport()
+    if "沒有可檢查" not in empty.summary():
+        note(f"an empty report says {empty.summary()!r}")
+        return False
+
+    full_ok = ehentai.ImageCheckReport(total=10, checked=10, healthy=10)
+    if full_ok.summary() != "檢查 10 張圖片，全部正常":
+        note(f"a complete healthy report says {full_ok.summary()!r}")
+        return False
+    if not full_ok.ok:
+        note("a healthy report is not ok")
+        return False
+
+    full_bad = ehentai.ImageCheckReport(
+        total=10, checked=10, healthy=8,
+        broken=[ehentai.ImageCheck("u", False, "HTTP 403")] * 2)
+    if full_bad.summary() != "檢查 10 張圖片，2 張有問題":
+        note(f"a complete damaged report says {full_bad.summary()!r}")
+        return False
+    if full_bad.ok:
+        note("a damaged report is ok")
+        return False
+
+    early = ehentai.ImageCheckReport(
+        total=225, checked=4, healthy=3,
+        broken=[ehentai.ImageCheck("u", False, "HTTP 403")], stopped_early=True)
+    text = early.summary()
+    if "尚有 221 張未檢查" not in text:
+        note(f"an early-stopped report does not say what was left: {text!r}")
+        return False
+    if "1 張有問題" not in text:
+        note(f"an early-stopped report does not name the finding: {text!r}")
+        return False
+    return True
+
+
+def _the_decision_reads_the_page_not_the_cache() -> bool:
+    """
+    The reuse decision must read the published page's own images.
+
+    The cache holds six sampled URLs out of two hundred, and a sample cannot answer "are this
+    page's images broken" - the previous version called a page healthy as soon as one of its three
+    samples loaded. Reading the page also checks what a reader's browser will actually try to load,
+    rather than a list that can drift from what was published.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    entry = _cached_page_entry("https://telegra.ph/OLD-1", "OLD-1", "tok-old",
+                               ["https://hath.network/sample.jpg"])
+    h = _GalleryImagesHarness(alive=True).run(gallery, "view", entry)
+
+    if not h.pages_read:
+        note("the decision never read the published page, so it decided on the cached sample")
+        return False
+    if "OLD-1" not in h.pages_read[0]:
+        note(f"the wrong page was read: {h.pages_read}")
+        return False
+    if not h.checked:
+        note("nothing was checked even though the page was read")
+        return False
+    # The cached sample must not be what was examined.
+    if h.checked == ["https://hath.network/sample.jpg"]:
+        note("the cached sample was checked instead of the page's own images")
+        return False
+    return True
 
 
 def _result_message_helper_works() -> bool:
@@ -4276,6 +4401,16 @@ check("a page built for 顯示圖 is not reused for 原圖",
 check("recording a page keeps the gallery facts and the cached sweep",
       _the_cached_page_survives_a_gallery_rewrite(),
       "the sweep is the expensive part of the cache and must survive a publish")
+
+check("the image check recognises real image formats and rejects everything else",
+      _image_format_sniffing(),
+      "this is what catches a 200 carrying an HTML error page, which the status alone cannot")
+check("an image check report does not claim to be complete when it stopped early",
+      _image_check_reports_are_honest(),
+      "one broken image stops the check, so the rest were never examined and must not be counted")
+check("the reuse decision reads the published page, not the cached sample",
+      _the_decision_reads_the_page_not_the_cache(),
+      "six sampled URLs cannot answer whether a two-hundred-image page is broken")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),
