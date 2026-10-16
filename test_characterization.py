@@ -1196,6 +1196,360 @@ class StrictMessage:
         return self
 
 
+def _gate_entities(text: str):
+    """The entity list Telegram would attach to a command message."""
+    token = (text.split() or [text])[0]
+    return [type("E", (), {"type": "bot_command", "offset": 0, "length": len(token)})()]
+
+
+def _gate_update(text: str, chat_type: str, *, entities=True, username=True):
+    """
+    A minimal update for the gate: the chat type, the command entity, and this bot's username.
+
+    `entities=False` stands in for a message Telegram did not mark as a command, which is how a
+    link or ordinary prose arrives.
+
+    **The name is copied to a local first, and must stay that way.** ``class Bot: username =
+    "TestBot" if username else ""`` raises NameError: a name assigned anywhere in a class body is
+    local to that body, so the read on the right resolves to the class's own not-yet-assigned
+    ``username`` rather than to this function's parameter. Reading an enclosing function's local
+    is fine; it is the same-name assignment that shadows it.
+    """
+    bot_username = "TestBot" if username else ""
+
+    class Chat:
+        def __init__(self):
+            self.type = chat_type
+            self.id = 4242 if chat_type == "private" else -1001234
+
+    class Msg:
+        def __init__(self):
+            self.text = text
+            self.caption = None
+            self.chat_id = Chat().id
+            self.message_id = 1
+            self.entities = _gate_entities(text) if entities else []
+            self.caption_entities = None
+
+    class Bot:
+        username = bot_username
+
+    class Context:
+        bot = Bot()
+
+    class Update:
+        def __init__(self):
+            self.effective_message = Msg()
+            self.effective_chat = Chat()
+
+    return Update(), Context()
+
+
+def _group_gate_requires_the_bot_name() -> bool:
+    """
+    A bare command in a group is dropped; one naming this bot is answered.
+
+    The point of the change: Telegram delivers /cmd and /cmd@thisbot alike, so without this test a
+    bare /cmd in a group is answered although nobody directed it at the bot.
+    """
+    cases = [
+        # (text, chat type, expected to be gated)
+        ("/start", "group", True),
+        ("/start", "supergroup", True),
+        ("/help", "group", True),
+        ("/status", "supergroup", True),
+        ("/id", "group", True),
+        # Naming this bot is what makes it directed. Case is not part of a username.
+        ("/start@TestBot", "group", False),
+        ("/start@testbot", "group", False),
+        ("/start@TESTBOT", "supergroup", False),
+        # Somebody else's command. The library's CommandHandler would not route this here at all,
+        # so the gate must not be the only thing standing between it and a reply.
+        ("/start@OtherBot", "group", True),
+        # A command with trailing text is still the same command.
+        ("/start@TestBot hello", "group", False),
+        ("/start hello", "group", True),
+    ]
+    for text, chat_type, expect in cases:
+        update, context = _gate_update(text, chat_type)
+        got = bot.group_command_is_undirected(update, context)
+        if got != expect:
+            note(f"{text!r} in {chat_type}: expected gated={expect}, got {got}")
+            return False
+    return True
+
+
+def _group_gate_leaves_private_alone() -> bool:
+    """A DM has one bot in it, so a command there is not ambiguous and is never gated."""
+    for text in ("/start", "/help", "/status", "/start@TestBot"):
+        update, context = _gate_update(text, "private")
+        if bot.group_command_is_undirected(update, context):
+            note(f"{text!r} in a private chat was gated; with one bot present there is nobody "
+                 f"else the command could be for")
+            return False
+    return True
+
+
+def _group_gate_ignores_non_commands() -> bool:
+    """
+    Links, prose and button presses in a group must not be gated.
+
+    The change is about commands. A link posted in a group has to keep working exactly as before,
+    or the bot stops doing the one thing it exists for.
+    """
+    # A link: no command entity, so not a command.
+    update, context = _gate_update("https://x.com/u/status/123", "group", entities=False)
+    if bot.group_command_is_undirected(update, context):
+        note("a link in a group was gated; only commands are meant to require the bot's name")
+        return False
+    # Prose that happens to contain a slash.
+    update, context = _gate_update("and/or see https://x.com/u/status/123", "group",
+                                   entities=False)
+    if bot.group_command_is_undirected(update, context):
+        note("ordinary text containing a slash was treated as a command")
+        return False
+    # Button presses carry no message at all.
+    class Callback:
+        effective_message = None
+        effective_chat = type("C", (), {"type": "supergroup", "id": -1001234})()
+
+    class Context:
+        bot = type("B", (), {"username": "TestBot"})()
+
+    if bot.group_command_is_undirected(Callback(), Context()):
+        note("a button press was gated; it addresses this bot by construction, since the bot "
+             "drew the keyboard")
+        return False
+    # A channel is not a group and is not gated.
+    update, context = _gate_update("/start", "channel")
+    if bot.group_command_is_undirected(update, context):
+        note("a channel command was gated")
+        return False
+    return True
+
+
+def _group_gate_fails_open_without_a_username() -> bool:
+    """
+    Without knowing our own username the gate must let commands through.
+
+    "Did they name me" cannot be answered, and of the two possible failures - answering a bare
+    command, or ignoring every command in every group - the second makes the bot look broken and is
+    not recoverable by the user.
+    """
+    update, context = _gate_update("/start", "group", username=False)
+    if bot.group_command_is_undirected(update, context):
+        note("with an unknown username the gate dropped the command; it must fail open")
+        return False
+    return True
+
+
+def _group_gate_is_registered_first() -> bool:
+    """
+    The gate must be registered in a group below the command handlers, or it never runs in time.
+
+    Read from the source rather than from a live Application: building one needs a token and a
+    network, and the thing worth pinning is that the registration is in group -1 and uses a
+    TypeHandler, not that add_handler was called at all.
+    """
+    import inspect as _i
+
+    source = _i.getsource(bot.main)
+    if "gate_undirected_group_commands" not in source:
+        note("main() never registers the gate, so no group command is ever dropped")
+        return False
+    if "group=-1" not in source:
+        note("the gate is not in group -1; the command handlers would run first and reply")
+        return False
+    return True
+
+
+def _group_gate_stops_the_update() -> bool:
+    """
+    The gate must end the update, not merely decline to act.
+
+    ApplicationHandlerStop with no group argument stops processing entirely. Without it the
+    CommandHandler in group 0 still runs and the command is answered, which is the behaviour the
+    change exists to remove.
+    """
+    import asyncio as _a
+    import inspect as _i
+
+    source = _i.getsource(bot.gate_undirected_group_commands)
+    if "raise ApplicationHandlerStop" not in source:
+        note("the gate returns instead of raising ApplicationHandlerStop, so later handlers still "
+             "run and the command is answered anyway")
+        return False
+
+    # And it really raises, for a case that should be dropped.
+    update, context = _gate_update("/start", "group")
+    try:
+        _a.run(bot.gate_undirected_group_commands(update, context))
+    except bot.ApplicationHandlerStop:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        note(f"the gate raised {type(exc).__name__} instead of ApplicationHandlerStop: {exc}")
+        return False
+    else:
+        note("the gate returned normally for a bare /start in a group")
+        return False
+
+    # And it does nothing at all for a case that should be answered.
+    update, context = _gate_update("/start@TestBot", "group")
+    try:
+        _a.run(bot.gate_undirected_group_commands(update, context))
+    except bot.ApplicationHandlerStop:
+        note("the gate dropped /start@TestBot, which names this bot")
+        return False
+    return True
+
+
+def _real_update(text: str, chat_type: str, app, update_id: int = 1, command: bool = True):
+    """
+    A genuine Update carrying a genuine message, associated with `app`'s bot.
+
+    Built from the library's own classes rather than stand-ins: the gate is registered as
+    TypeHandler(Update, ...), which filters on isinstance, so a fake update is not routed at all
+    and a check using one would pass whether or not the gate works.
+
+    **Both set_bot calls are required.** `Update.set_bot()` associates the bot with the Update
+    alone; the Message keeps its own reference, and without it every shortcut on the message -
+    including the `effective_message` the gate itself reads - raises "This object has no bot
+    associated with it". That failure happens *inside* the gate, so a gate that works perfectly
+    reports as broken.
+    """
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from telegram import Chat as _Chat
+    from telegram import Message as _Message
+    from telegram import MessageEntity as _Entity
+    from telegram import Update as _Update
+    from telegram import User as _User
+
+    chat = _Chat(id=4242 if chat_type == "private" else -1001234, type=chat_type)
+    user = _User(id=7, first_name="someone", is_bot=False)
+    token = (text.split() or [text])[0]
+    message = _Message(
+        message_id=update_id,
+        date=_dt.now(_tz.utc),
+        chat=chat,
+        from_user=user,
+        text=text,
+        entities=[_Entity(type="bot_command", offset=0, length=len(token))] if command else [],
+    )
+    update = _Update(update_id=update_id, message=message)
+    update.set_bot(app.bot)
+    message.set_bot(app.bot)
+    return update
+
+
+def _application_with_the_gate():
+    """
+    A real Application carrying only the gate, initialized without a network call.
+
+    **initialize() is not called**, because it goes through getMe() and a placeholder token is
+    rejected with InvalidToken - a network dependency that has nothing to do with the dispatch
+    being tested. The two things process_update and Bot.username actually need are set directly:
+    `_initialized`, which _check_initialized reads, and `_bot_user`, which Bot.username reads.
+    """
+    from telegram import Update as _Update
+    from telegram import User as _User
+    from telegram.ext import Application as _Application
+    from telegram.ext import TypeHandler as _TypeHandler
+
+    app = (
+        _Application.builder()
+        .token("123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw")
+        .build()
+    )
+    app.bot._bot_user = _User(id=999, first_name="bot", is_bot=True, username="TestBot")
+    app._initialized = True
+    app.add_handler(_TypeHandler(_Update, bot.gate_undirected_group_commands), group=-1)
+    return app
+
+
+def _group_gate_against_real_dispatch() -> bool:
+    """
+    Through a real Application: a bare group command must not reach the handler, a named one must.
+
+    This is the check that catches registering the gate in the wrong group, or raising the wrong
+    exception - mistakes the direct-call checks pass straight over.
+    """
+    import asyncio as _a
+
+    from telegram.ext import CommandHandler as _CommandHandler
+
+    reached = []
+
+    async def record(update, context):
+        reached.append((update.effective_message.text or "").split()[0])
+
+    async def scenario():
+        app = _application_with_the_gate()
+        app.add_handler(_CommandHandler("start", record))
+        await app.process_update(_real_update("/start", "supergroup", app, 1))
+        if reached:
+            note(f"a bare /start in a group reached the handler: {reached}")
+            return False
+        await app.process_update(_real_update("/start@TestBot", "supergroup", app, 2))
+        if reached != ["/start@TestBot"]:
+            note(f"/start@TestBot did not reach the handler; reached={reached}")
+            return False
+        await app.process_update(_real_update("/start", "private", app, 3))
+        if reached != ["/start@TestBot", "/start"]:
+            note(f"/start in a private chat did not reach the handler; reached={reached}")
+            return False
+        return True
+
+    try:
+        return _a.run(scenario())
+    except Exception as exc:  # noqa: BLE001
+        note(f"{type(exc).__name__}: {exc}")
+        return False
+
+
+def _group_gate_does_not_block_links() -> bool:
+    """
+    Through a real Application: a link in a group must still reach the message handler.
+
+    The gate runs for every update in group -1, so a mistake there would silence the bot's actual
+    purpose rather than only its commands.
+    """
+    import asyncio as _a
+
+    from telegram.ext import MessageHandler as _MessageHandler
+    from telegram.ext import filters as _filters
+
+    reached = []
+
+    async def record(update, context):
+        reached.append(update.effective_message.text)
+
+    async def scenario():
+        app = _application_with_the_gate()
+        app.add_handler(_MessageHandler(_filters.TEXT & ~_filters.COMMAND, record))
+        await app.process_update(
+            _real_update("https://x.com/u/status/123", "supergroup", app, 9, command=False)
+        )
+        if reached != ["https://x.com/u/status/123"]:
+            note(f"a link in a group did not reach the message handler; reached={reached}")
+            return False
+        return True
+
+    try:
+        return _a.run(scenario())
+    except Exception as exc:  # noqa: BLE001
+        note(f"{type(exc).__name__}: {exc}")
+        return False
+
+
+def _dt_now():
+    from datetime import datetime as _d
+    from datetime import timezone as _t
+
+    return _d.now(_t.utc)
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -3128,6 +3482,31 @@ check("a progress path without a status message does not crash",
 #
 # so the handler logged a failure and posted a second copy instead of updating in place -
 # only when the cover had loaded, which is why it looked intermittent.
+check("through a real Application, a bare group command does not reach the handler",
+      _group_gate_against_real_dispatch(),
+      "this is the mechanism: TypeHandler in group -1 plus ApplicationHandlerStop")
+check("through a real Application, a group link still reaches the message handler",
+      _group_gate_does_not_block_links(),
+      "the gate must silence commands, not the bot")
+check("in a group a bare command is dropped, and one naming the bot is not",
+      _group_gate_requires_the_bot_name(),
+      "this is the whole change: /start in a group must not be answered unless it names the bot")
+check("a private chat command is never gated",
+      _group_gate_leaves_private_alone(),
+      "one bot in a DM means a command is never ambiguous")
+check("the group gate leaves links and button presses alone",
+      _group_gate_ignores_non_commands(),
+      "only commands are gated; a link in a group must keep working")
+check("the group gate fails open when the bot does not know its own name",
+      _group_gate_fails_open_without_a_username(),
+      "ignoring every command in every group is worse than answering a bare one")
+check("the group gate is registered in group -1",
+      _group_gate_is_registered_first(),
+      "registered in group 0 it would run after the command handlers and never drop anything")
+check("the group gate stops the update rather than returning",
+      _group_gate_stops_the_update(),
+      "returning lets the CommandHandler run anyway, so the command is answered")
+
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),
       "edit_text on a photo message is the failure that was logged")

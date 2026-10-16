@@ -40,10 +40,12 @@ from telegram.error import BadRequest, TelegramError, TimedOut
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 import ehentai
@@ -7272,6 +7274,126 @@ def bot_was_mentioned(update, context) -> bool:
     return False
 
 
+def message_is_a_command(message) -> bool:
+    """
+    Whether this message is a bot command rather than prose.
+
+    Read from the entities, not from a leading "/": a message can *contain* a slash without being
+    a command, and Telegram marks the command part with a ``bot_command`` entity. Checking the
+    entity is the same test the library's own CommandHandler uses, so the gate and the handlers
+    cannot disagree about what a command is.
+    """
+    entities = (getattr(message, "entities", None)
+                or getattr(message, "caption_entities", None) or [])
+    return any(getattr(entity, "type", "") == "bot_command" for entity in entities)
+
+
+def command_names_this_bot(message, bot_username: str) -> bool:
+    """
+    Whether the command in this message named this bot, as ``/cmd@thisbot``.
+
+    **The ``@`` form is how a command is addressed to one bot in a group.** Telegram delivers
+    ``/cmd`` and ``/cmd@thisbot`` alike to whichever bot the command belongs to - the library's
+    CommandHandler already rejects ``/cmd@someotherbot`` - so without this test a bare ``/cmd``
+    in a group is answered by the bot even though nobody directed it there.
+
+    Only the command's own text is inspected. A ``@`` elsewhere in the message is an ordinary
+    mention, which is not the same thing and is handled by ``bot_was_mentioned``.
+    """
+    text = message.text or message.caption or ""
+    if not text:
+        return False
+    entities = (getattr(message, "entities", None)
+                or getattr(message, "caption_entities", None) or [])
+    for entity in entities:
+        if getattr(entity, "type", "") != "bot_command":
+            continue
+        start = getattr(entity, "offset", None)
+        length = getattr(entity, "length", None)
+        if start is None or length is None:
+            continue
+        command = text[start:start + length]
+        # The first command entity decides. A message carries at most one command, and if it has
+        # no "@" then it named nobody - returning False here rather than continuing is what keeps
+        # a later entity from being mistaken for one.
+        if "@" not in command:
+            return False
+        named = command.split("@", 1)[1].strip().lower()
+        return named == bot_username
+    return False
+
+
+def group_command_is_undirected(update, context) -> bool:
+    """
+    Whether this update is a group command that was not addressed to this bot.
+
+    True means: say nothing, do nothing. Everything else is left alone, which is why each of the
+    following returns False:
+
+      * **private chats.** With one bot in the conversation there is nobody else a command could
+        be meant for, and requiring ``/start@thisbot`` in a DM would be an obstacle for no reason.
+      * **non-command messages.** Links and ordinary text are not commands and are not gated. A
+        link posted in a group still works exactly as before.
+      * **callback queries.** Button presses carry no command entity; they address this bot by
+        construction, since it is the bot that drew the keyboard.
+      * **an unknown own username.** "Did they name me" cannot be answered without it, and
+        answering nothing would make the bot appear broken in every group. Answering too much is
+        the recoverable failure of the two.
+    """
+    message = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None)
+    if message is None or chat is None:
+        return False
+    if getattr(chat, "type", "") not in ("group", "supergroup"):
+        return False
+    if not message_is_a_command(message):
+        return False
+
+    bot = getattr(context, "bot", None)
+    bot_username = (getattr(bot, "username", "") or "").lstrip("@").lower()
+    if not bot_username:
+        return False
+    return not command_names_this_bot(message, bot_username)
+
+
+async def gate_undirected_group_commands(update: Update,
+                                         context: ContextTypes.DEFAULT_TYPE):
+    """
+    Silently drop a group command that did not name this bot.
+
+    Registered in group -1, so it runs before every command handler, and it ends the update by
+    raising ``ApplicationHandlerStop`` with no group argument - which stops processing entirely
+    rather than only in this group. The result is that nothing replies: no message, no reaction,
+    no error.
+
+    **Every failure inside the decision means "do not drop".** The call below is wrapped because
+    ``Update.effective_message`` raises RuntimeError when the update has no Bot attached - a
+    library shortcut that a malformed or hand-built update can trip. A gate that raises would take
+    the whole update down and, worse, would do it before the handlers it guards, so the bot would
+    go quiet for a reason nothing in the log explains.
+
+    **Why the drop is logged at DEBUG rather than INFO.** In a busy group a bare ``/start`` is
+    not unusual, and one log line per occurrence would bury the entries that matter. It is still
+    recorded, because "why did the bot ignore my command" is otherwise unanswerable from a log.
+    """
+    try:
+        drop = group_command_is_undirected(update, context)
+    except Exception:  # noqa: BLE001
+        logger.debug("群組指令閘門無法判斷，這次不攔截", exc_info=True)
+        return
+    if not drop:
+        return
+
+    message = getattr(update, "effective_message", None)
+    chat = getattr(update, "effective_chat", None)
+    logger.debug(
+        "群組指令未指定本 bot，已靜默忽略：chat=%s text=%r",
+        getattr(chat, "id", None),
+        (getattr(message, "text", "") or "")[:60],
+    )
+    raise ApplicationHandlerStop
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
@@ -8076,6 +8198,19 @@ def main():
 
     # Registered first, so no handler's failure can go unreported.
     application.add_error_handler(on_error)
+
+    # **Group -1, so it runs before any command handler.**
+    #
+    # In a group a command must name this bot - /cmd@thisbot - and a bare /cmd is dropped without
+    # a reply. One gate covers all fifteen commands, including the next one added; a rule applied
+    # per registration is a rule the sixteenth will not have.
+    #
+    # Raising ApplicationHandlerStop with no group argument ends the update, so the CommandHandler
+    # in group 0 never sees it. That is the whole mechanism: nothing is replied, so nothing needs
+    # suppressing afterwards.
+    application.add_handler(
+        TypeHandler(Update, gate_undirected_group_commands), group=-1
+    )
 
     # --- Visitor commands ---
     application.add_handler(CommandHandler("start", start))
