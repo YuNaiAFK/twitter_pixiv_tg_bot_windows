@@ -920,7 +920,31 @@ TELEGRAPH_API = "https://api.telegra.ph"
 
 
 class TelegraphError(RuntimeError):
-    """Raised when a Telegraph page cannot be created."""
+    """Raised when a Telegraph page cannot be created or edited."""
+
+
+@dataclass
+class TelegraphPage:
+    """
+    A published Telegraph page, and what a later edit of it needs.
+
+    `access_token` belongs to the anonymous account that created the page and is returned by
+    Telegraph exactly once, at creation - it cannot be fetched again, so it has to be carried
+    around. `path` is the part of the URL after the domain and is what `editPage/{path}` needs.
+
+    Returning the URL alone was the reason regenerating had to make a new page: without the token
+    there is no way to touch the existing one. See edit_telegraph_page.
+    """
+
+    url: str
+    path: str
+    access_token: str
+
+    def __str__(self) -> str:
+        # So a stray f-string that expects the old return type still produces the URL rather than
+        # a repr. The old signature returned a str and a caller that was missed would otherwise
+        # show "TelegraphPage(url=...)" in a chat.
+        return self.url
 
 
 def _node(tag: str, children, attrs: dict | None = None) -> dict:
@@ -1029,6 +1053,63 @@ def build_telegraph_content(
     return content
 
 
+def _telegraph_content(gallery: EhentaiGallery, image_urls, embed_limit_kb: int) -> str:
+    """The node tree for a gallery, serialised the way Telegraph wants it."""
+    return json.dumps(
+        build_telegraph_content(gallery, image_urls, embed_limit_kb=embed_limit_kb),
+        ensure_ascii=False,
+    )
+
+
+def _telegraph_post(
+    endpoint: str,
+    *,
+    access_token: str,
+    title: str,
+    author_name: str,
+    author_url: str,
+    content: str,
+    timeout: float,
+    http_client=None,
+) -> TelegraphPage:
+    """
+    POST to createPage or editPage and return the resulting page.
+
+    One helper for both because the request is identical apart from the endpoint, and a second
+    copy is a second place for the field list to drift.
+    """
+    import httpx
+
+    client = http_client or httpx.Client(**http_client_kwargs(timeout))
+    try:
+        data = {
+            "access_token": access_token,
+            "title": title[:256],
+            "author_name": author_name[:128],
+            "content": content,
+            "return_content": "false",
+        }
+        if author_url:
+            data["author_url"] = author_url[:512]
+
+        page = client.post(f"{TELEGRAPH_API}/{endpoint}", data=data).json()
+        if not page.get("ok"):
+            raise TelegraphError(page.get("error") or "Telegraph 回應沒有 ok")
+        result = page["result"]
+        return TelegraphPage(
+            url=result["url"],
+            path=result["path"],
+            access_token=access_token,
+        )
+    except TelegraphError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise TelegraphError(f"Telegraph 請求失敗：{exc}") from exc
+    finally:
+        if http_client is None:
+            client.close()
+
+
 def create_telegraph_page(
     gallery: EhentaiGallery,
     image_urls: Sequence[str] | None = None,
@@ -1038,21 +1119,25 @@ def create_telegraph_page(
     timeout: float = 60.0,
     embed_limit_kb: int = 62,
     http_client=None,
-) -> str:
+) -> TelegraphPage:
     """
-    Publish a gallery to Telegraph and return the page URL.
+    Publish a gallery to Telegraph and return the page.
 
-    ``image_urls`` embeds the gallery's pages directly; Telegraph fetches them
-    from e-hentai's own CDN, so the bot transfers no image bytes at all.
+    ``image_urls`` embeds the gallery's pages directly; Telegraph fetches them from e-hentai's own
+    CDN, so the bot transfers no image bytes at all.
 
-    An anonymous Telegraph account is created per call, which keeps the bot from
-    depending on a token that has to be provisioned, and keeps each page
-    independent: if one is removed, the others are unaffected.
+    An anonymous Telegraph account is created per page, which keeps the bot from depending on a
+    token that has to be provisioned, and keeps each page independent: if one is removed, the
+    others are unaffected.
+
+    **The account's access token is part of the return value**, because edit_telegraph_page needs
+    it and Telegraph never returns it again - which is why regenerating used to have to publish a
+    second page at a different URL.
     """
     import httpx
 
     # Telegraph requires both names to be non-empty.
-    resolved_author = (author_name or "e-hentai")[:128]
+    resolved_author = (author_name or "e-hentai")
 
     client = http_client or httpx.Client(**http_client_kwargs(timeout))
     try:
@@ -1063,24 +1148,6 @@ def create_telegraph_page(
         if not account.get("ok"):
             raise TelegraphError(f"建立 Telegraph 帳號失敗：{account.get('error')}")
         token = account["result"]["access_token"]
-
-        data = {
-            "access_token": token,
-            "title": (gallery.title or "Gallery")[:256],
-            "author_name": resolved_author,
-            "content": json.dumps(
-                build_telegraph_content(gallery, image_urls, embed_limit_kb=embed_limit_kb),
-                ensure_ascii=False,
-            ),
-            "return_content": "false",
-        }
-        if author_url:
-            data["author_url"] = author_url[:512]
-
-        page = client.post(f"{TELEGRAPH_API}/createPage", data=data).json()
-        if not page.get("ok"):
-            raise TelegraphError(f"建立 Telegraph 頁面失敗：{page.get('error')}")
-        return page["result"]["url"]
     except TelegraphError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -1088,3 +1155,49 @@ def create_telegraph_page(
     finally:
         if http_client is None:
             client.close()
+
+    return _telegraph_post(
+        "createPage",
+        access_token=token,
+        title=(gallery.title or "Gallery"),
+        author_name=resolved_author,
+        author_url=author_url,
+        content=_telegraph_content(gallery, image_urls, embed_limit_kb),
+        timeout=timeout,
+        http_client=http_client,
+    )
+
+
+def edit_telegraph_page(
+    page: TelegraphPage,
+    gallery: EhentaiGallery,
+    image_urls: Sequence[str] | None = None,
+    *,
+    author_url: str = "",
+    timeout: float = 60.0,
+    embed_limit_kb: int = 62,
+    http_client=None,
+) -> TelegraphPage:
+    """
+    Rewrite an existing Telegraph page in place, at the same URL.
+
+    This is what 重新生成 should always have done. The page keeps its address, so a link already
+    shared still works and now shows working images - which is the entire point of regenerating,
+    since e-hentai's image URLs are time-limited and that is what breaks.
+
+    ``author_name`` is not a parameter: the page already has one and Telegraph takes it from the
+    page when it is omitted, so it cannot be changed here by accident.
+    """
+    if not page.path or not page.access_token:
+        raise TelegraphError("這個頁面沒有可用的編輯憑證，無法保留原網址")
+
+    return _telegraph_post(
+        f"editPage/{page.path}",
+        access_token=page.access_token,
+        title=(gallery.title or "Gallery"),
+        author_name="",
+        author_url=author_url,
+        content=_telegraph_content(gallery, image_urls, embed_limit_kb),
+        timeout=timeout,
+        http_client=http_client,
+    )

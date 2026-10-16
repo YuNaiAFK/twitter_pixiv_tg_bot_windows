@@ -1583,8 +1583,8 @@ def _regenerate_cache_separates_galleries() -> bool:
     saved = dict(bot._regenerate_cache)
     try:
         bot._regenerate_cache.clear()
-        bot.remember_regenerate(-100, 7, a, "orig")
-        bot.remember_regenerate(-100, 7, b, "view")
+        bot.remember_regenerate(-100, 7, a, "orig", None)
+        bot.remember_regenerate(-100, 7, b, "view", None)
 
         ka = bot.regenerate_cache_key(-100, 7, "111", "aaaa")
         kb = bot.regenerate_cache_key(-100, 7, "222", "bbbb")
@@ -1674,8 +1674,8 @@ def _regenerate_looks_up_the_pressed_gallery() -> bool:
         bot.remember_gallery = lambda *a, **k: None
         try:
             bot._regenerate_cache.clear()
-            bot.remember_regenerate(-100, 7, a, "orig")
-            bot.remember_regenerate(-100, 7, b, "view")
+            bot.remember_regenerate(-100, 7, a, "orig", None)
+            bot.remember_regenerate(-100, 7, b, "view", None)
 
             # Press the button on A's message, after B was parsed.
             await bot.handle_regenerate(None, Query("111", "aaaa"),
@@ -1753,6 +1753,218 @@ def _regenerate_entry_has_no_dead_message_id() -> bool:
     source = _i.getsource(bot.remember_regenerate)
     if '"message_id"' in source or "'message_id'" in source:
         note("remember_regenerate still stores message_id, which nothing reads")
+        return False
+    return True
+
+
+class _FakeTelegraphClient:
+    """
+    Stands in for httpx.Client for the Telegraph calls.
+
+    Records every POST so the endpoint and the form fields can be asserted on: the whole question
+    is *which* endpoint was used and whether the access token went with it, and neither is visible
+    from the return value alone.
+    """
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def post(self, url, data=None, **kwargs):
+        self.calls.append((url, dict(data or {})))
+        payload = self._responses.pop(0) if self._responses else {"ok": False, "error": "no reply"}
+        return type("R", (), {"json": staticmethod(lambda p=payload: p)})()
+
+    def close(self):
+        pass
+
+
+def _telegraph_pages(token_suffix="a"):
+    """The three replies a create-then-edit sequence expects."""
+    return [
+        {"ok": True, "result": {"access_token": f"tok-{token_suffix}"}},
+        {"ok": True, "result": {"url": "https://telegra.ph/Work-10-16",
+                                "path": "Work-10-16"}},
+        {"ok": True, "result": {"url": "https://telegra.ph/Work-10-16",
+                                "path": "Work-10-16"}},
+    ]
+
+
+def _telegraph_edit_keeps_the_url() -> bool:
+    """
+    Editing must POST to editPage/<path> with the creation token, and return the same URL.
+
+    The URL is the thing that must not change, so it is asserted on directly rather than inferred
+    from the endpoint being right.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    client = _FakeTelegraphClient(_telegraph_pages())
+
+    created = bot.ehentai.create_telegraph_page(
+        gallery, ["https://hath.network/a.jpg"], author_name="test", http_client=client)
+    if created.url != "https://telegra.ph/Work-10-16":
+        note(f"create returned {created.url!r}")
+        return False
+    if created.access_token != "tok-a":
+        note("create did not carry the account token back; nothing could edit the page later")
+        return False
+    if created.path != "Work-10-16":
+        note(f"create returned path {created.path!r}, which editPage needs")
+        return False
+
+    edited = bot.ehentai.edit_telegraph_page(
+        created, gallery, ["https://hath.network/b.jpg"], http_client=client)
+    if edited.url != created.url:
+        note(f"the URL changed: {created.url!r} -> {edited.url!r}. That is the bug this fixes: "
+             f"every link already shared with the old URL goes stale")
+        return False
+
+    # Strip the API base, not the last path segment: editPage's endpoint carries the page path
+    # after it, so rsplit("/", 1) turns "editPage/Work-10-16" into "Work-10-16" and the check
+    # reports editPage as never called while it plainly was.
+    base = bot.ehentai.TELEGRAPH_API + "/"
+    endpoints = [url.replace(base, "") for url, _ in client.calls]
+    if "editPage/Work-10-16" not in endpoints:
+        note(f"editPage was never called; endpoints were {endpoints}")
+        return False
+    edit_data = next(d for u, d in client.calls if "editPage" in u)
+    if edit_data.get("access_token") != "tok-a":
+        note("the edit did not send the creation token, so Telegraph would refuse it")
+        return False
+    if "content" not in edit_data:
+        note("the edit sent no content, so the images would not be replaced")
+        return False
+    return True
+
+
+def _telegraph_edit_refuses_a_tokenless_page() -> bool:
+    """
+    Editing a page with no token must raise, not silently publish a new page at a new URL.
+
+    A silent new page is the exact failure this change removes, so the refusal has to be loud.
+    """
+    page = bot.ehentai.TelegraphPage(url="https://telegra.ph/x-1", path="x-1", access_token="")
+    try:
+        bot.ehentai.edit_telegraph_page(page, _fake_gallery("111", "aaaa"), ["u"])
+    except bot.ehentai.TelegraphError as exc:
+        if "原網址" not in str(exc):
+            note(f"refused, but the message does not say the URL is the issue: {exc}")
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        note(f"raised {type(exc).__name__} instead of TelegraphError: {exc}")
+        return False
+    note("editing a page with no token was allowed; it would have published a second page")
+    return False
+
+
+def _telegraph_page_str_is_the_url() -> bool:
+    """
+    str(page) must be the URL.
+
+    The function used to return a bare string and several places interpolate it. A caller that was
+    missed would otherwise put "TelegraphPage(url=...)" into a chat message.
+    """
+    page = bot.ehentai.TelegraphPage(url="https://telegra.ph/x-1", path="x-1", access_token="t")
+    if str(page) != "https://telegra.ph/x-1":
+        note(f"str() gave {str(page)!r}")
+        return False
+    if f"{page}" != "https://telegra.ph/x-1":
+        note("f-string interpolation does not give the URL")
+        return False
+    return True
+
+
+def _regenerate_edits_the_stored_page() -> bool:
+    """
+    Through run_regenerate: the stored page is edited, and the message says the URL is unchanged.
+
+    This is the path the button takes, and it is where an undefined name or a wrong argument would
+    surface - the earlier version of this change referenced TELEGRAPH_TIMEOUT_SECONDS, which does
+    not exist, and a check that only stubs create_telegraph_page never reached the line.
+    """
+    import asyncio
+
+    gallery = _fake_gallery("111", "aaaa")
+    edited = []
+    text_seen = []
+    page = bot.ehentai.TelegraphPage(
+        url="https://telegra.ph/Work-10-16", path="Work-10-16", access_token="tok")
+
+    real_fetch = bot.ehentai.fetch_gallery_images
+    real_edit = bot.ehentai.edit_telegraph_page
+    real_create = bot.ehentai.create_telegraph_page
+    real_embed = bot.public_embed_urls
+    real_update = bot.update_result_message
+    real_remember = bot.remember_gallery
+
+    def fake_fetch(page_url, **kwargs):
+        return (["https://hath.network/d.jpg"], ["https://hath.network/o.jpg"])
+
+    def fake_edit(stored, gal, urls, **kwargs):
+        edited.append((stored, gal, tuple(urls)))
+        return stored
+
+    def fake_create(*a, **k):
+        edited.append(("CREATE",))
+        return page
+
+    async def fake_embed(urls, gal, message):
+        return urls
+
+    async def fake_update(message, text, **kwargs):
+        text_seen.append(text)
+        return True
+
+    class Query:
+        def __init__(self):
+            self.message = type("M", (), {
+                "chat_id": -100, "message_id": 5, "photo": [object()], "caption": "x",
+                "chat": type("C", (), {"type": "supergroup"})()})()
+
+        async def answer(self, *a, **k):
+            return True
+
+    async def scenario():
+        bot.ehentai.fetch_gallery_images = fake_fetch
+        bot.ehentai.edit_telegraph_page = fake_edit
+        bot.ehentai.create_telegraph_page = fake_create
+        bot.public_embed_urls = fake_embed
+        bot.update_result_message = fake_update
+        bot.remember_gallery = lambda *a, **k: None
+        try:
+            entry = {"gallery": gallery, "mode": "orig", "page": page}
+            await bot.run_regenerate(Query(), type("U", (), {"id": 7})(), entry)
+        finally:
+            bot.ehentai.fetch_gallery_images = real_fetch
+            bot.ehentai.edit_telegraph_page = real_edit
+            bot.ehentai.create_telegraph_page = real_create
+            bot.public_embed_urls = real_embed
+            bot.update_result_message = real_update
+            bot.remember_gallery = real_remember
+            bot._regenerate_cache.clear()
+
+    try:
+        asyncio.run(scenario())
+    except Exception as exc:  # noqa: BLE001
+        note(f"{type(exc).__name__}: {exc}")
+        return False
+
+    if not edited:
+        note("neither edit nor create was called")
+        return False
+    if edited[0][0] == "CREATE":
+        note("run_regenerate published a NEW page instead of editing the stored one, so the URL "
+             "would change - the opposite of what regenerating is for")
+        return False
+    if not text_seen:
+        note("the message was never updated")
+        return False
+    if "網址不變" not in text_seen[0]:
+        note(f"the message does not say the URL is unchanged: {text_seen[0]!r}")
+        return False
+    if "https://telegra.ph/Work-10-16" not in text_seen[0]:
+        note("the message does not carry the page's URL")
         return False
     return True
 
@@ -3727,6 +3939,20 @@ check("the 重新生成 button carries the gallery it belongs to",
 check("the regenerate entry stores no message_id that nothing reads",
       _regenerate_entry_has_no_dead_message_id(),
       "a field nothing reads made it look as though the target message was tracked")
+
+check("regenerating edits the Telegraph page in place and keeps its URL",
+      _telegraph_edit_keeps_the_url(),
+      "a new page fixes the images and breaks every link already shared, which is the opposite "
+      "of what regenerating is for")
+check("a page with no access token is refused rather than replaced",
+      _telegraph_edit_refuses_a_tokenless_page(),
+      "publishing a new page silently is the exact failure this removes")
+check("a TelegraphPage stringifies to its URL",
+      _telegraph_page_str_is_the_url(),
+      "callers used to be handed a bare URL and interpolate it")
+check("run_regenerate edits the stored page and says the URL is unchanged",
+      _regenerate_edits_the_stored_page(),
+      "the button's own path, where an undefined name or a wrong argument would surface")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),

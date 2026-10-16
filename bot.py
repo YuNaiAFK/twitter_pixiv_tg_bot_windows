@@ -5434,6 +5434,9 @@ async def run_regenerate(query, user, entry: dict) -> None:
     await query.answer("正在重新生成頁面……")
     gallery = entry["gallery"]
     mode = entry["mode"]
+    # Set when the page could not be edited and a new one had to be published. Only possible for
+    # an entry remembered before pages carried their access token.
+    regenerated_link_changed = False
 
     try:
         # Deliberately fetches fresh URLs rather than reading the sweep from the
@@ -5452,12 +5455,35 @@ async def run_regenerate(query, user, entry: dict) -> None:
         # Same conversion as publishing: the button embeds the same list, so without this
         # a regenerated page would be broken again on every page.
         embed = await public_embed_urls(embed, gallery, query.message)
-        telegraph_url = await asyncio.to_thread(
-            ehentai.create_telegraph_page,
-            gallery,
-            embed,
-            author_name=TELEGRAPH_AUTHOR,
-        )
+
+        # **Edit the existing page, so the URL does not change.**
+        #
+        # Regenerating exists because e-hentai's image URLs expire and the embedded images stop
+        # loading. Publishing a second page fixed the images and broke every link already shared
+        # with it - the opposite of the point. editPage rewrites the page at the same address,
+        # which needs the access token kept when it was created.
+        stored_page = entry.get("page")
+        if stored_page is not None and getattr(stored_page, "access_token", ""):
+            # No timeout argument: edit_telegraph_page defaults to the same 60 s that
+            # create_telegraph_page has always used here.
+            page = await asyncio.to_thread(
+                ehentai.edit_telegraph_page,
+                stored_page,
+                gallery,
+                embed,
+            )
+        else:
+            # Only reachable for an entry remembered before this change, which cannot survive a
+            # restart - the cache is in memory. Kept because the alternative is a crash, and said
+            # out loud because the URL changing is exactly what should not happen quietly.
+            page = await asyncio.to_thread(
+                ehentai.create_telegraph_page,
+                gallery,
+                embed,
+                author_name=TELEGRAPH_AUTHOR,
+            )
+            regenerated_link_changed = True
+        telegraph_url = page.url
     except (ehentai.EhentaiError, ehentai.TelegraphError) as exc:
         logger.warning("重新生成失敗：%s（%s）", gallery.page_url, exc)
         await query.answer(f"重新生成失敗：{exc}", show_alert=True)
@@ -5474,9 +5500,16 @@ async def run_regenerate(query, user, entry: dict) -> None:
     # second copy instead of updating the picture in place.
     text_lines = [build_gallery_info(gallery)]
     text_lines.append(f"\n📄 Telegraph：{telegraph_url}")
-    text_lines.append(f"（已重新生成，內嵌 {len(embed)} 頁圖片）")
+    if regenerated_link_changed:
+        text_lines.append("（已重新生成，但這次建立了新頁面，網址與原本不同，內嵌 "
+                          f"{len(embed)} 頁圖片）")
+    else:
+        text_lines.append(f"（已重新生成，網址不變，內嵌 {len(embed)} 頁圖片）")
     if gallery.is_adult:
         text_lines.append("（成人內容，Telegraph 頁面可能被移除）")
+
+    # Keep the page the press produced: the next press edits this one, at this URL.
+    remember_regenerate(query.message.chat_id, user.id, gallery, mode, page)
 
     new_text = "\n".join(text_lines)
     if await update_result_message(
@@ -5529,13 +5562,17 @@ def regenerate_cache_key(chat_id: int, user_id: int, gid: str, token: str):
     return (chat_id, user_id, gid, token)
 
 
-def remember_regenerate(chat_id: int, user_id: int, gallery, mode: str) -> None:
+def remember_regenerate(chat_id: int, user_id: int, gallery, mode: str, page) -> None:
     """
     Store what a later '重新生成' press needs.
 
     `message_id` used to be a parameter and was stored on every entry; nothing ever read it. The
     message being edited comes from the button that was pressed, which is the only answer that
     makes sense when the same gallery has been posted twice.
+
+    **`page` is the TelegraphPage, not its URL.** Editing the page in place needs the access token
+    the account was created with, and Telegraph returns it exactly once - so if it is not kept
+    here it is gone, and 重新生成 has to publish a second page at a second URL.
     """
     if len(_regenerate_cache) >= _REGENERATE_LIMIT:
         # Drop the oldest entries; this is a convenience cache, not a store.
@@ -5544,6 +5581,7 @@ def remember_regenerate(chat_id: int, user_id: int, gallery, mode: str) -> None:
     _regenerate_cache[regenerate_cache_key(chat_id, user_id, gallery.gid, gallery.token)] = {
         "gallery": gallery,
         "mode": mode,
+        "page": page,
     }
 
 
@@ -5833,13 +5871,16 @@ async def run_gallery_images(message, status, gallery, mode: str,
     embed = display_urls if mode == "view" else (original_urls or display_urls)
     embed = await public_embed_urls(embed, gallery, status, report=True)
 
+    telegraph_page = None
+    telegraph_url = ""
     try:
-        telegraph_url = await asyncio.to_thread(
+        telegraph_page = await asyncio.to_thread(
             ehentai.create_telegraph_page,
             gallery,
             embed,
             author_name=TELEGRAPH_AUTHOR,
         )
+        telegraph_url = telegraph_page.url
     except ehentai.TelegraphError as exc:
         logger.warning("Telegraph 建立失敗：%s", exc)
         telegraph_url = ""
@@ -5859,8 +5900,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
 
     # Remember this so the page can be re-signed later: e-hentai's image links
     # expire, and this button refreshes them without starting over.
-    if telegraph_url:
-        remember_regenerate(message.chat_id, user.id, gallery, mode)
+    if telegraph_page is not None:
+        remember_regenerate(message.chat_id, user.id, gallery, mode, telegraph_page)
 
     # One message, not two. The cover is edited into the message the bot already
     # sent, so the reply does not look like it is repeating itself. If the cover
