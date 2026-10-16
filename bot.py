@@ -1421,7 +1421,7 @@ def remember_media_parse(url: str, files: list[Path]) -> None:
 
 
 async def update_result_message(message, text: str, *, reply_markup=None,
-                                link_preview: bool = True, preview_url: str = "") -> bool:
+                                link_preview: bool = True) -> bool:
     """
     Replace a result message's text, whether or not it currently holds a photo.
 
@@ -1454,10 +1454,7 @@ async def update_result_message(message, text: str, *, reply_markup=None,
         common["reply_markup"] = reply_markup
     text_kwargs = dict(common)
     if link_preview:
-        # `preview_url` is for a message carrying a Telegraph page. Anything else keeps the
-        # suppressed preview, so the source link cannot produce a card.
-        text_kwargs["link_preview_options"] = (
-            telegraph_link_options(preview_url) if preview_url else source_link_options())
+        text_kwargs["link_preview_options"] = source_link_options()
 
     # The message object carries its own media from the update, so this reflects what the
     # message is *now*, not what it was when the handler was written.
@@ -2627,26 +2624,6 @@ def source_link_options() -> LinkPreviewOptions:
     would otherwise repeat the image the bot just sent.
     """
     return LinkPreviewOptions(is_disabled=True)
-
-
-def telegraph_link_options(url: str) -> LinkPreviewOptions:
-    """
-    Show a link preview for the Telegraph page, and nothing else, so Telegram offers Instant View.
-
-    **This is what makes tapping the link open inside Telegram.** The Instant View button lives in
-    the link preview area, so with previews disabled there is nowhere for it to appear and the link
-    can only open a browser.
-
-    **`url` is set explicitly, and that matters.** Without it Telegram previews the first URL in the
-    message, which is the gallery's own source link - e-hentai, or exhentai, whose preview is adult
-    material in whatever chat this is. Disabling previews was the only previous answer to that, and
-    it is why the two are separate helpers rather than one: the source link stays unpreviewed, and
-    only the Telegraph page gets a card.
-
-    The media preference is left unset so Telegram chooses. Forcing `prefer_large_media` would make
-    a full-width card for what is meant to be a line of text with a button under it.
-    """
-    return LinkPreviewOptions(url=url)
 
 
 # -------------------- Login credentials --------------------
@@ -5615,8 +5592,7 @@ async def run_regenerate(query, user, entry: dict) -> None:
     new_text = "\n".join(text_lines)
     if await update_result_message(
             query.message, new_text,
-            reply_markup=regenerate_keyboard(gallery.gid, gallery.token),
-            preview_url=telegraph_url):
+            reply_markup=regenerate_keyboard(gallery.gid, gallery.token)):
         return
     # Nothing editable - a photo with no caption, or a refusal. A second message is worse
     # than an edit but better than silence, and the old text stays as the record.
@@ -6076,25 +6052,6 @@ async def run_gallery_images(message, status, gallery, mode: str,
     # source link either way.
     keyboard = (regenerate_keyboard(gallery.gid, gallery.token)
                 if telegraph_url else None)
-
-    if telegraph_url:
-        # **Text, not a cover photo, whenever there is a Telegraph page to read.**
-        #
-        # A media caption cannot carry link preview options - the Bot API accepts them on
-        # edit_message_text and on nothing that holds media - so while the reply is a photo the
-        # Telegraph link inside its caption has no preview card, and therefore no Instant View
-        # button: tapping it can only open a browser. Sending the same summary as text lets the
-        # page's own preview appear, which is where the button lives.
-        #
-        # The gallery's cover is what is given up, and the page's own preview thumbnail takes its
-        # place in the card.
-        await status.edit_text(
-            summary,
-            link_preview_options=telegraph_link_options(telegraph_url),
-            reply_markup=keyboard,
-        )
-        return
-
     if await edit_message_to_cover(status, gallery, summary, keyboard):
         return
 
