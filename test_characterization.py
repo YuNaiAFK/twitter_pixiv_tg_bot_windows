@@ -2400,6 +2400,276 @@ def _the_decision_reads_the_page_not_the_cache() -> bool:
     return True
 
 
+class _R2Harness:
+    """
+    Drives host_on_r2 with a stubbed uploader and an isolated cache.
+
+    Records what was uploaded and what the caller got back, which is the whole contract: the return
+    value is the list of URLs that will be embedded.
+    """
+
+    def __init__(self, *, configured=True, outcome="ok", cached=None):
+        self.configured = configured
+        self.outcome = outcome
+        self.cached = cached or []
+        self.uploaded = []
+        self.saved = []
+        self.texts = []
+
+    def run(self, gallery, mode="view", embed=None):
+        import asyncio
+        import shutil
+        import tempfile
+
+        harness = self
+        embed = list(embed if embed is not None else [
+            "https://hath.network/a.jpg", "https://hath.network/b.jpg"])
+
+        settings = None
+        if harness.configured:
+            settings = bot.r2.R2Settings(
+                account_id="a" * 32, access_key="b" * 32, secret_key="c" * 64,
+                bucket="picture", public_base="https://img.example")
+
+        def fake_settings():
+            return settings
+
+        def fake_upload_many(urls, *, settings, workers=6, timeout=60, referer="",
+                             cookies=None, key_prefix="galleries", progress=None,
+                             stop_event=None):
+            harness.uploaded.append(list(urls))
+            if progress is not None:
+                for i in range(1, len(urls) + 1):
+                    progress(i, len(urls))
+            results = []
+            for url in urls:
+                if harness.outcome == "all_fail":
+                    results.append(bot.r2.UploadResult(url, error="boom"))
+                elif harness.outcome == "partial" and url.endswith("b.jpg"):
+                    results.append(bot.r2.UploadResult(url, error="boom"))
+                else:
+                    key = bot.r2.content_key(b"x" + url.encode(), extension="jpg")
+                    results.append(bot.r2.UploadResult(
+                        url, key=key, public_url=settings.public_url(key),
+                        size=100, content_type="image/jpeg"))
+            report = bot.r2.UploadReport(total=len(urls))
+            for r in results:
+                if r.error:
+                    report.failed += 1
+                else:
+                    report.uploaded += 1
+            report.results = results
+            return report
+
+        async def fake_edit_text(text, **k):
+            harness.texts.append(text)
+            return True
+
+        real = {n: getattr(bot.r2, n) for n in ("r2_settings", "upload_many")}
+        real_cache, real_dir = bot.PARSE_CACHE, bot.CACHE_DIR
+        real_save = bot.remember_r2_urls
+        work = Path(tempfile.mkdtemp(prefix="r2h-"))
+        bot.PARSE_CACHE = bot.ParseCache(work / "cache.json")
+        bot.CACHE_DIR = work
+
+        bot.r2.r2_settings = fake_settings
+        bot.r2.upload_many = fake_upload_many
+
+        def fake_remember(url, gal, mode_, urls):
+            harness.saved.append((mode_, list(urls)))
+            real_save(url, gal, mode_, urls)
+
+        bot.remember_r2_urls = fake_remember
+
+        if harness.cached:
+            real_save(gallery.page_url, gallery, mode, harness.cached)
+
+        status = type("S", (), {"edit_text": staticmethod(fake_edit_text)})()
+
+        async def scenario():
+            return await bot.host_on_r2(embed, gallery, mode, status)
+
+        try:
+            result = asyncio.run(scenario())
+        finally:
+            for n, v in real.items():
+                setattr(bot.r2, n, v)
+            bot.PARSE_CACHE, bot.CACHE_DIR = real_cache, real_dir
+            bot.remember_r2_urls = real_save
+            shutil.rmtree(work, ignore_errors=True)
+
+        harness.result = result
+        return harness
+
+
+def _r2_absent_leaves_the_urls_alone() -> bool:
+    """
+    With no R2 configuration the images must be embedded exactly as before.
+
+    This is the case for anyone who has not set R2 up, and for a half-filled block: turning a missing
+    feature into a broken gallery would be the wrong trade.
+    """
+    import os
+
+    saved = {k: os.environ.get(k) for k in
+             ("R2_ACCOUNT_ID", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET", "R2_PUBLIC_BASE")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        if bot.r2.r2_settings() is not None:
+            note("r2_settings() returned a value with nothing set")
+            return False
+
+        gallery = _fake_gallery("111", "aaaa")
+        embed = ["https://hath.network/a.jpg", "https://hath.network/b.jpg"]
+        # Use the real function here, so this exercises the actual configuration path.
+        import asyncio
+        harness = _R2Harness(configured=False).run(gallery, embed=embed)
+        if harness.result != embed:
+            note(f"the urls changed with R2 unconfigured: {harness.result}")
+            return False
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+    return True
+
+
+def _r2_uploads_and_returns_the_public_urls() -> bool:
+    """
+    A configured R2 must replace the embed list with its own public URLs, and record them.
+
+    Those URLs are what the Telegraph page will contain, so if they are not the R2 ones the page
+    still carries expiring links and nothing has been gained.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    h = _R2Harness().run(gallery)
+
+    if not h.uploaded:
+        note("nothing was uploaded")
+        return False
+    if not h.result or any("img.example" not in url for url in h.result):
+        note(f"the returned urls are not the R2 ones: {h.result}")
+        return False
+    if len(h.result) != 2:
+        note(f"the url count changed: {h.result}")
+        return False
+    if not h.saved or h.saved[0][1] != h.result:
+        note(f"the urls were not recorded: {h.saved}")
+        return False
+    return True
+
+
+def _r2_reuses_a_recorded_upload() -> bool:
+    """
+    A gallery already uploaded must not upload again.
+
+    The whole reason the key is a content hash is that re-parsing a gallery should cost nothing for
+    the images that have not changed. Without this the second parse of a gallery re-uploads fifty
+    megabytes for no reason.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    cached = ["https://img.example/galleries/aa/bb/one.jpg",
+              "https://img.example/galleries/cc/dd/two.jpg"]
+    h = _R2Harness(cached=cached).run(gallery)
+
+    if h.uploaded:
+        note(f"it uploaded again despite {len(cached)} recorded urls: {h.uploaded}")
+        return False
+    if h.result != cached:
+        note(f"the recorded urls were not returned: {h.result}")
+        return False
+    return True
+
+
+def _r2_failure_still_delivers_the_gallery() -> bool:
+    """
+    A failed upload must return the original URLs, not a list of broken ones.
+
+    Embedding URLs that do not resolve would produce a page of broken images - worse than the page
+    the bot produced before R2 existed, which at least worked until the keystamp lapsed.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    embed = ["https://hath.network/a.jpg", "https://hath.network/b.jpg"]
+    h = _R2Harness(outcome="all_fail").run(gallery, embed=embed)
+
+    if h.result != embed:
+        note(f"a total failure did not fall back to the original urls: {h.result}")
+        return False
+    if h.saved:
+        note(f"a failed upload was recorded as successful: {h.saved}")
+        return False
+
+    # A partial failure keeps the successes and leaves the rest on their original URLs, so no page
+    # is lost - the list keeps its length and order either way.
+    partial = _R2Harness(outcome="partial").run(gallery, embed=embed)
+    if len(partial.result) != len(embed):
+        note(f"a partial failure changed the length: {partial.result}")
+        return False
+    if "img.example" not in partial.result[0]:
+        note(f"the successful one was not replaced: {partial.result}")
+        return False
+    if partial.result[1] != embed[1]:
+        note(f"the failed one did not keep its original url: {partial.result}")
+        return False
+    return True
+
+
+def _r2_recording_survives_a_telegraph_write() -> bool:
+    """
+    Recording R2 URLs must not discard the gallery facts, the sweep, or the Telegraph page.
+
+    All three are written into the same cache payload by different helpers, and each one has to merge.
+    A helper that replaced the payload would silently throw away the others' work - which is the same
+    bug the Telegraph recorder had.
+    """
+    import dataclasses
+    import tempfile
+
+    gallery = _fake_gallery("111", "aaaa")
+    work = Path(tempfile.mkdtemp(prefix="r2merge-"))
+    real_cache, real_dir = bot.PARSE_CACHE, bot.CACHE_DIR
+    try:
+        bot.PARSE_CACHE = bot.ParseCache(work / "cache.json")
+        bot.CACHE_DIR = work
+        key = bot.gallery_cache_key(gallery.page_url, gallery)
+        bot.PARSE_CACHE.store(key, "gallery", {
+            "gallery": dataclasses.asdict(gallery),
+            "display_urls": ["https://hath.network/keep.jpg"],
+            "telegraph": {"view": {"url": "https://telegra.ph/X", "path": "X",
+                                   "access_token": "t", "images": [], "count": 0}},
+        })
+
+        bot.remember_r2_urls(gallery.page_url, gallery, "view",
+                             ["https://img.example/one.jpg"])
+        after = bot.gallery_cache_lookup(gallery.page_url, gallery)
+
+        if after.get("display_urls") != ["https://hath.network/keep.jpg"]:
+            note("recording R2 urls discarded the cached sweep")
+            return False
+        if (after.get("telegraph") or {}).get("view", {}).get("url") != "https://telegra.ph/X":
+            note("recording R2 urls discarded the Telegraph page")
+            return False
+        if bot.cached_r2_urls(gallery.page_url, gallery, "view") != ["https://img.example/one.jpg"]:
+            note("the R2 urls did not come back")
+            return False
+        if bot.cached_r2_urls(gallery.page_url, gallery, "orig"):
+            note("a mode that was never uploaded reported urls")
+            return False
+
+        # And a second write for the other mode must keep the first.
+        bot.remember_r2_urls(gallery.page_url, gallery, "orig",
+                             ["https://img.example/orig.jpg"])
+        if bot.cached_r2_urls(gallery.page_url, gallery, "view") != ["https://img.example/one.jpg"]:
+            note("recording the other mode discarded the first")
+            return False
+        return True
+    finally:
+        bot.PARSE_CACHE, bot.CACHE_DIR = real_cache, real_dir
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -4411,6 +4681,22 @@ check("an image check report does not claim to be complete when it stopped early
 check("the reuse decision reads the published page, not the cached sample",
       _the_decision_reads_the_page_not_the_cache(),
       "six sampled URLs cannot answer whether a two-hundred-image page is broken")
+
+check("without R2 configured the page keeps the original urls",
+      _r2_absent_leaves_the_urls_alone(),
+      "a missing feature must not break a gallery")
+check("a configured R2 replaces the embedded urls with its own",
+      _r2_uploads_and_returns_the_public_urls(),
+      "otherwise the page still carries links that expire and nothing was gained")
+check("a gallery already uploaded to R2 is not uploaded again",
+      _r2_reuses_a_recorded_upload(),
+      "the content-hash key exists so a second parse costs nothing")
+check("a failed R2 upload still delivers the gallery",
+      _r2_failure_still_delivers_the_gallery(),
+      "embedding urls that do not resolve is worse than the behaviour R2 replaced")
+check("recording R2 urls keeps the sweep and the Telegraph page",
+      _r2_recording_survives_a_telegraph_write(),
+      "all three share one cache payload and each has to merge")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),

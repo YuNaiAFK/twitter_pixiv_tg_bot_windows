@@ -26,6 +26,7 @@ if _VENDOR_DIR.is_dir() and importlib.util.find_spec("PIL") is None:
     sys.path.append(str(_VENDOR_DIR))
 
 from dotenv import load_dotenv
+import r2
 from telegram import (
     BotCommand,
     BotCommandScopeChat,
@@ -264,6 +265,11 @@ EHENTAI_VIEWER_WORKERS = env_number("EHENTAI_VIEWER_WORKERS", 6)
 # Higher than the viewer sweep because these are HEAD requests to a CDN rather than page fetches.
 TELEGRAPH_VERIFY_WORKERS = env_number("TELEGRAPH_VERIFY_WORKERS", 16)
 TELEGRAPH_VERIFY_TIMEOUT = env_number("TELEGRAPH_VERIFY_TIMEOUT", 15)
+# How many images to upload to R2 at once, and how long each may take. The phone's uplink is the
+# bottleneck rather than R2, so this is lower than the verify pool: more connections would only make
+# every one of them slower.
+R2_UPLOAD_WORKERS = env_number("R2_UPLOAD_WORKERS", 6)
+R2_UPLOAD_TIMEOUT = env_number("R2_UPLOAD_TIMEOUT", 60)
 
 # Connections used to fetch one official archive. e-hentai's CDN throttles each
 # connection hard, so one stream leaves the link idle. Measured on a 16 MiB prefix of
@@ -1770,6 +1776,42 @@ def cached_telegraph_entry(url: str, gallery, mode: str) -> dict | None:
     if not isinstance(entry, dict) or not entry.get("url"):
         return None
     return entry
+
+
+def cached_r2_urls(url: str, gallery, mode: str) -> list:
+    """
+    The R2 URLs recorded for this gallery and mode, or an empty list.
+
+    Empty rather than None so the caller can treat "nothing recorded" and "recorded but empty" the
+    same way, which they are: both mean the upload still has to happen.
+    """
+    payload = gallery_cache_lookup(url, gallery)
+    stored = (payload.get("r2") or {}).get(mode) or []
+    return list(stored) if isinstance(stored, list) else []
+
+
+def remember_r2_urls(url: str, gallery, mode: str, urls) -> None:
+    """
+    Record the R2 URLs for this gallery and mode, merged into the existing payload.
+
+    Merged rather than replaced for the same reason remember_telegraph_page is: the gallery's facts,
+    its sweep and its Telegraph page are all still wanted, and rewriting the payload without them
+    would throw away the expensive part of the cache.
+    """
+    import dataclasses
+
+    payload = gallery_cache_lookup(url, gallery)
+    if not payload.get("gallery"):
+        payload = {"gallery": dataclasses.asdict(gallery)}
+
+    per_mode = dict(payload.get("r2") or {})
+    per_mode[mode] = list(urls)
+    payload["r2"] = per_mode
+
+    PARSE_CACHE.store(gallery_cache_key(url, gallery), "gallery", payload)
+    if PARSE_CACHE.needs_pruning():
+        PARSE_CACHE.prune()
+    PARSE_CACHE.save()
 
 
 def telegraph_page_from_entry(entry: dict):
@@ -5861,6 +5903,91 @@ async def run_gallery_action(query, message, user, mode: str,
         gallery_semaphore.release()
 
 
+async def host_on_r2(embed: list, gallery, mode: str, status) -> list:
+    """
+    Copy the page's images into R2 and return the URLs to embed instead.
+
+    **Returns the input unchanged whenever R2 cannot be used**, which covers three cases that all
+    have to degrade rather than fail: R2 is not configured, the upload produced nothing, or every
+    upload failed. A gallery that cannot reach R2 is still readable through e-hentai's own links,
+    with the expiry problem it always had - which is much better than not being delivered.
+
+    Progress is reported into the status message from the worker thread through
+    ``run_coroutine_threadsafe``, throttled to one edit every few seconds. A gallery is about two
+    hundred images and takes minutes; a status line that never changes for minutes looks stuck.
+    """
+    settings = r2.r2_settings()
+    if settings is None or not embed:
+        return embed
+
+    # Already done? The cache is on disk, so this survives a restart, and a gallery parsed twice
+    # uploads once. The length has to match: a gallery that gained pages since would otherwise be
+    # served a short list and lose them.
+    cached = cached_r2_urls(gallery.page_url, gallery, mode)
+    if cached and len(cached) == len(embed):
+        logger.info("沿用已上傳到 R2 的 %d 張圖片", len(cached))
+        return cached
+
+    await status.edit_text(
+        f"正在上傳 {len(embed)} 張圖片到 R2……",
+        link_preview_options=source_link_options(),
+    )
+
+    loop = asyncio.get_running_loop()
+    last = [0.0]
+
+    def progress(done_count, total):
+        now = time.monotonic()
+        if now - last[0] < 4:
+            return
+        last[0] = now
+        try:
+            asyncio.run_coroutine_threadsafe(
+                status.edit_text(
+                    f"正在上傳到 R2…… {done_count}/{total}",
+                    link_preview_options=source_link_options(),
+                ),
+                loop,
+            )
+        except Exception:  # noqa: BLE001
+            # A status edit that cannot be scheduled must not stop the upload.
+            pass
+
+    try:
+        report = await asyncio.to_thread(
+            r2.upload_many,
+            embed,
+            settings=settings,
+            workers=int(R2_UPLOAD_WORKERS),
+            timeout=float(R2_UPLOAD_TIMEOUT),
+            referer="https://e-hentai.org/",
+            progress=progress,
+        )
+    except r2.R2Error as exc:
+        logger.warning("R2 上傳無法進行：%s；改用原始網址", exc)
+        return embed
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("R2 上傳失敗：%s；改用原始網址", exc)
+        return embed
+
+    logger.info("R2：%s", report.summary())
+    if not report.uploaded and not report.reused:
+        # Nothing succeeded. Handing back the original URLs keeps the gallery readable; handing back
+        # a report full of failures would produce a page of broken images.
+        return embed
+
+    urls = report.urls()
+    try:
+        remember_r2_urls(gallery.page_url, gallery, mode, urls)
+    except Exception as exc:  # noqa: BLE001
+        # Losing the record costs a re-upload next time, not this delivery.
+        logger.warning("R2 網址寫入快取失敗：%s", exc)
+
+    if report.failed:
+        logger.warning("R2：%d 張上傳失敗，這些仍使用原始網址", report.failed)
+    return urls
+
+
 async def public_embed_urls(embed: list[str], gallery, status,
                             report=None) -> list[str]:
     """
@@ -6003,6 +6130,13 @@ async def run_gallery_images(message, status, gallery, mode: str,
 
         embed = display_urls if mode == "view" else (original_urls or display_urls)
         embed = await public_embed_urls(embed, gallery, status, report=True)
+
+        # **Copy them somewhere permanent before the page is built.**
+        #
+        # What goes into Telegraph is then an R2 object rather than a signed e-hentai link, so the
+        # page keeps working after the keystamp lapses - which is the failure the 重新生成 button
+        # exists to repair. Degrades to the original URLs whenever R2 is unavailable.
+        embed = await host_on_r2(embed, gallery, mode, status)
 
         try:
             if cached_entry is not None:
