@@ -1434,30 +1434,54 @@ async def update_result_message(message, text: str, *, reply_markup=None,
     survives the update. Editing rather than sending again also keeps the one-message-per-
     request rule the cover was introduced for.
 
+    **``link_preview_options`` belongs to the text call alone.** ``edit_message_text`` accepts it;
+    ``edit_message_caption`` does not - the Bot API offers no link-preview control for captions.
+    Both used to be handed the same ``**kwargs`` dict, so every 重新生成 on a gallery whose cover
+    had loaded died with
+
+        TypeError: Message.edit_caption() got an unexpected keyword argument 'link_preview_options'
+
+    and TypeError is not a TelegramError, so it went straight through the handler below and out as
+    處理更新時發生未預期錯誤. Eleven of those in one log.
+
     Returns whether the message was updated. Callers may send a new message on False.
     """
-    kwargs = {}
-    if link_preview:
-        kwargs["link_preview_options"] = source_link_options()
+    # reply_markup is valid on both; link_preview_options only on the text one.
+    common = {}
     if reply_markup is not None:
-        kwargs["reply_markup"] = reply_markup
+        common["reply_markup"] = reply_markup
+    text_kwargs = dict(common)
+    if link_preview:
+        text_kwargs["link_preview_options"] = source_link_options()
 
     # The message object carries its own media from the update, so this reflects what the
     # message is *now*, not what it was when the handler was written.
     is_photo = bool(getattr(message, "photo", None))
+    what = "照片" if is_photo else "文字"
     try:
         if is_photo:
             if not text:
                 # Telegram needs a non-empty caption on a media message; an empty one is
                 # refused. Nothing sensible to write, so let the caller send separately.
                 return False
-            await message.edit_caption(caption=text, **kwargs)
+            await message.edit_caption(caption=text, **common)
         else:
-            await message.edit_text(text, **kwargs)
+            await message.edit_text(text, **text_kwargs)
         return True
     except TelegramError as exc:
-        logger.warning("更新結果訊息失敗（%s）：%s",
-                       "照片" if is_photo else "文字", exc)
+        logger.warning("更新結果訊息失敗（%s）：%s", what, exc)
+        return False
+    except TypeError as exc:
+        # **Deliberately caught, and logged as a code fault rather than a Telegram one.**
+        #
+        # python-telegram-bot's signatures differ between versions - the bug above was exactly
+        # that, and it was invisible until someone pressed the button. Reaching here means an
+        # argument does not exist on this version, which is a mistake in this file and not
+        # something the user can act on. Swallowing it silently would hide the next one, and
+        # letting it escape crashes a button press that should be cosmetic; so it stops here and
+        # says plainly what it is.
+        logger.error("更新結果訊息（%s）時參數不被接受：%s"
+                     "（這是程式錯誤：此版本的 python-telegram-bot 沒有這個參數）", what, exc)
         return False
 
 

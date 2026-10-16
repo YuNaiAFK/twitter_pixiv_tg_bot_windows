@@ -51,11 +51,32 @@ PASSED: list[str] = []
 FAILED: list[str] = []
 
 
+# Why the next check is about to fail.
+#
+# check() is handed a bool, not the helper that produced it, so it has no way to ask what went
+# wrong. Helpers return False for several different reasons and a bare "FAIL  <name>" left the
+# cause to be guessed at - and the guess was usually wrong. A helper that wants to explain itself
+# calls note() first; check() prints it for a failure and clears it either way, so a reason cannot
+# leak onto an unrelated check.
+LAST_REASON = ""
+
+
+def note(reason: str) -> None:
+    """Record why the check that is about to run will fail. See LAST_REASON."""
+    global LAST_REASON
+    LAST_REASON = reason
+
+
 def check(name: str, condition, detail: str = "") -> bool:
+    global LAST_REASON
     ok = bool(condition)
     (PASSED if ok else FAILED).append(name)
+    # note() names the precise cause; `detail` is the generic fallback written next to the check,
+    # so the specific one wins.
+    reason = LAST_REASON or detail
+    LAST_REASON = ""
     print(f"{'PASS' if ok else 'FAIL'}  {name}"
-          f"{(' -> ' + str(detail)) if detail and not ok else ''}")
+          f"{(' -> ' + str(reason)) if reason and not ok else ''}")
     return ok
 
 
@@ -1087,6 +1108,94 @@ def _public_embed_urls_accepts_no_status() -> bool:
     return "report is not None and status is not None" in source
 
 
+def _ptb_keywords(func):
+    """
+    The keyword names ``func`` accepts, or None when it takes ``**kwargs`` and so accepts any.
+
+    Read from the installed library rather than written out by hand: the bug these doubles exist
+    to catch *was* a signature mismatch, and a hand-copied list would drift the same way.
+    """
+    import inspect as _i
+
+    params = _i.signature(func).parameters
+    if any(p.kind == _i.Parameter.VAR_KEYWORD for p in params.values()):
+        return None
+    return {
+        name
+        for name, p in params.items()
+        if p.kind in (_i.Parameter.POSITIONAL_OR_KEYWORD, _i.Parameter.KEYWORD_ONLY)
+    }
+
+
+def _ptb_edit_keywords():
+    """The real edit_caption / edit_text keyword sets, or an empty dict if unavailable."""
+    try:
+        from telegram import Message
+
+        return {
+            "edit_caption": _ptb_keywords(Message.edit_caption),
+            "edit_text": _ptb_keywords(Message.edit_text),
+        }
+    except Exception:  # noqa: BLE001 - a missing library is not this test's subject
+        return {}
+
+
+_PTB_EDIT_KEYWORDS = _ptb_edit_keywords()
+
+
+def _reject_unexpected(method: str, kwargs: dict):
+    """
+    Raise the same TypeError the real method would, for an argument it does not accept.
+
+    **This is the whole point of the doubles.** ``async def edit_caption(self, caption=None,
+    **kwargs)`` accepted link_preview_options, which ``Message.edit_caption`` does not - so
+    update_result_message looked correct here while every 重新生成 on a photo message died with
+
+        TypeError: Message.edit_caption() got an unexpected keyword argument 'link_preview_options'
+
+    and TypeError is not a TelegramError, so it escaped the handler entirely.
+    """
+    allowed = _PTB_EDIT_KEYWORDS.get(method)
+    if allowed is None:
+        return
+    unexpected = set(kwargs) - allowed
+    if unexpected:
+        raise TypeError(
+            f"Message.{method}() got an unexpected keyword argument "
+            f"'{sorted(unexpected)[0]}'"
+        )
+
+
+class StrictMessage:
+    """
+    A telegram.Message stand-in that refuses what the real one refuses.
+
+    Records which edit was attempted, so a wrong branch is visible, and passes unknown keywords to
+    _reject_unexpected so a wrong *argument* is too.
+    """
+
+    def __init__(self, has_photo=False):
+        self.photo = [object()] if has_photo else []
+        self.calls = []
+        self.message_id = 1
+        self.chat_id = 1
+        self.caption = None
+
+    async def edit_caption(self, caption=None, **kwargs):
+        # **Recorded before the signature is enforced.** If the argument is one the real method
+        # refuses this raises, and update_result_message catches it - so recording afterwards
+        # would leave `calls` empty and the test able to say only "it returned False", not what
+        # was attempted. That is exactly how the original bug stayed invisible.
+        self.calls.append(("edit_caption", caption, dict(kwargs)))
+        _reject_unexpected("edit_caption", kwargs)
+        return self
+
+    async def edit_text(self, text=None, **kwargs):
+        self.calls.append(("edit_text", text, dict(kwargs)))
+        _reject_unexpected("edit_text", kwargs)
+        return self
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -1096,39 +1205,62 @@ def _result_message_helper_works() -> bool:
     """
     import asyncio
 
-    class Msg:
-        def __init__(self, has_photo):
-            self.photo = [object()] if has_photo else []
-            self.calls = []
-            self.message_id = 1
-            self.chat_id = 1
-            self.caption = None
-
-        async def edit_caption(self, caption=None, **kwargs):
-            self.calls.append(("edit_caption", caption))
-            return self
-
-        async def edit_text(self, text=None, **kwargs):
-            self.calls.append(("edit_text", text))
-            return self
-
+    # StrictMessage, not a local class with **kwargs: see _reject_unexpected for why the
+    # permissive version let a real crash through.
     async def scenario():
-        text_msg = Msg(False)
-        photo_msg = Msg(True)
+        text_msg = StrictMessage(False)
+        photo_msg = StrictMessage(True)
         ok_text = await bot.update_result_message(text_msg, "summary")
         ok_photo = await bot.update_result_message(photo_msg, "summary")
-        if not (ok_text and ok_photo):
+
+        # **Inspect the attempts before the return values.**
+        #
+        # When the caption call is made with an argument the real method refuses, it raises
+        # TypeError, update_result_message catches it and returns False - so checking the return
+        # values first reports only "returned False" and leaves the actual mistake unnamed.
+        # StrictMessage records the attempt even when it rejects it, so the cause is visible here.
+        if photo_msg.calls:
+            method, _, kwargs = photo_msg.calls[0]
+            if method != "edit_caption":
+                note("a photo message was updated with "
+                     f"{method}(), which Telegram refuses with 'There is no text in the message "
+                     "to edit'")
+                return False
+            if "link_preview_options" in kwargs:
+                note("link_preview_options was passed to edit_caption; PTB's edit_caption has no "
+                     "such parameter and raises TypeError - which is not a TelegramError, so it "
+                     "escapes the handler entirely")
+                return False
+        if text_msg.calls:
+            method, _, kwargs = text_msg.calls[0]
+            if method != "edit_text":
+                note(f"a text message was updated with {method}() instead of edit_text()")
+                return False
+            # The text edit should still carry it, or the caption fix threw away the feature.
+            if "link_preview_options" not in kwargs:
+                note("link_preview_options is missing from edit_text; the link preview setting "
+                     "was lost while fixing the caption call")
+                return False
+
+        if not ok_text:
+            note("update_result_message returned False for a text message")
             return False
-        if text_msg.calls[0][0] != "edit_text":
+        if not ok_photo:
+            note("update_result_message returned False for a photo message")
             return False
-        if photo_msg.calls[0][0] != "edit_caption":
+        if not photo_msg.calls:
+            note("no edit was attempted on the photo message at all")
             return False
         # And the caption actually carries the new text, not an empty placeholder.
-        return photo_msg.calls[0][1] == "summary"
+        if photo_msg.calls[0][1] != "summary":
+            note(f"the caption was {photo_msg.calls[0][1]!r}, not the new text")
+            return False
+        return True
 
     try:
         return asyncio.run(scenario())
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        note(f"{type(exc).__name__}: {exc}")
         return False
 
 
@@ -1136,23 +1268,8 @@ def _empty_caption_is_refused() -> bool:
     """An empty caption on a photo must return False, not raise or send an empty edit."""
     import asyncio
 
-    class Msg:
-        photo = [object()]
-        message_id = 1
-
-        def __init__(self):
-            self.calls = []
-
-        async def edit_caption(self, caption=None, **kwargs):
-            self.calls.append(caption)
-            return self
-
-        async def edit_text(self, text=None, **kwargs):
-            self.calls.append(text)
-            return self
-
     async def scenario():
-        msg = Msg()
+        msg = StrictMessage(True)
         result = await bot.update_result_message(msg, "")
         return result is False and not msg.calls
 
@@ -2810,11 +2927,24 @@ check("a non-work url yields no id",
 check("a deleted or un-published pixiv work is reported, not silenced",
       _empty_download_reports_deleted(),
       "a work nobody can open is the one case worth telling the sender about")
+# **A live probe, so it also depends on Pixiv being reachable.** The assertion is the stated
+# intent - a readable work is never reported as deleted - and not `== "ok"`, which additionally
+# required the network and so turned an unreachable Pixiv into a failure of a check about
+# deletion. That is what it did for as long as this machine's proxy was down: the probe returned
+# "unknown", which is the correct answer for "could not find out", and this check reported it as
+# "a live work was called deleted".
+#
+# "unknown" means the check is inconclusive rather than wrong, so it says so rather than passing in
+# silence. The unknown path has its own check just below.
+_pixiv_state = bot.pixiv_work_state("150824857")
+if _pixiv_state == "unknown":
+    print("      note: Pixiv was unreachable, so this could not confirm the work is readable -"
+          " only that it was not reported as deleted")
 check("a work the bot CAN read is never called deleted",
       # The probe answers 200 for an age-restricted work when credentials work, so the
       # reply is silence and the download path is left to succeed.
-      bot.pixiv_work_state("150824857") == "ok",
-      "a live work must not be reported as deleted")
+      _pixiv_state != "deleted",
+      f"the probe returned {_pixiv_state!r}: a work that can be opened was called deleted")
 check("an unreadable work state is unknown, not a guess",
       _unknown_state_is_silent(),
       "claiming a deletion the bot cannot verify is worse than silence")
