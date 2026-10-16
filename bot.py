@@ -5399,7 +5399,16 @@ async def handle_regenerate(update: Update, query, user, gid: str, token: str) -
     and publishes a new page, replacing the old one in place and removing the
     button afterwards so it cannot be pressed twice by accident.
     """
-    entry = _regenerate_cache.get((query.message.chat_id, user.id))
+    # **Keyed by the gallery too.** With (chat_id, user_id) alone there is one entry per person,
+    # so parsing a second gallery overwrote the first and this press - on the first gallery's
+    # message - rebuilt the second gallery into it. The gid and token come from the callback data,
+    # which is what they are there for.
+    #
+    # Built through regenerate_cache_key rather than as a literal tuple: the store and the lookup
+    # have to agree, and if they stop agreeing the symptom is "this button has expired", which
+    # names nothing.
+    entry = _regenerate_cache.get(
+        regenerate_cache_key(query.message.chat_id, user.id, gid, token))
     if entry is None:
         await query.answer("這個按鈕已過期，請重新傳送畫廊連結。", show_alert=True)
         return
@@ -5496,24 +5505,45 @@ def stop_keyboard(gid: str, token: str) -> InlineKeyboardMarkup:
 # uguu.se and tmpfiles.org keep files for hours - so the honest fix is a button
 # that rebuilds the page with freshly signed URLs from the same gallery.
 #
-# The gallery object and the message to update are held here because Telegram caps
-# callback data at 64 bytes, which cannot carry them. Keyed by chat and user so one
-# person cannot regenerate another's page.
-_regenerate_cache: dict[tuple[int, int], dict] = {}
+# The gallery object is held here because Telegram caps callback data at 64 bytes, which cannot
+# carry it.
+#
+# **Keyed by the gallery as well as by chat and user.** It used to be keyed by (chat_id, user_id)
+# alone - one entry per person - so parsing a second gallery silently replaced the first, and
+# pressing 重新生成 on the first gallery's message rebuilt the *second* gallery into it. The chat
+# and user are still part of the key so one person cannot regenerate another's page; the gid and
+# token are what tell two of the same person's galleries apart, and the callback data has carried
+# them all along.
+_regenerate_cache: dict[tuple[int, int, str, str], dict] = {}
 _REGENERATE_LIMIT = 200
 
 
-def remember_regenerate(chat_id: int, user_id: int, gallery, mode: str,
-                        message_id: int) -> None:
-    """Store what a later '重新生成' press needs."""
+def regenerate_cache_key(chat_id: int, user_id: int, gid: str, token: str):
+    """
+    The key a gallery's regenerate entry is stored and looked up under.
+
+    One function rather than the tuple written out twice, because the two must agree: a mismatch
+    between the store and the lookup is exactly the bug this replaced, and it fails as "this button
+    has expired" rather than as anything that names the cause.
+    """
+    return (chat_id, user_id, gid, token)
+
+
+def remember_regenerate(chat_id: int, user_id: int, gallery, mode: str) -> None:
+    """
+    Store what a later '重新生成' press needs.
+
+    `message_id` used to be a parameter and was stored on every entry; nothing ever read it. The
+    message being edited comes from the button that was pressed, which is the only answer that
+    makes sense when the same gallery has been posted twice.
+    """
     if len(_regenerate_cache) >= _REGENERATE_LIMIT:
-        # Drop the oldest entry; this is a convenience cache, not a store.
+        # Drop the oldest entries; this is a convenience cache, not a store.
         for key in list(_regenerate_cache)[: _REGENERATE_LIMIT // 4]:
             _regenerate_cache.pop(key, None)
-    _regenerate_cache[(chat_id, user_id)] = {
+    _regenerate_cache[regenerate_cache_key(chat_id, user_id, gallery.gid, gallery.token)] = {
         "gallery": gallery,
         "mode": mode,
-        "message_id": message_id,
     }
 
 
@@ -5830,8 +5860,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
     # Remember this so the page can be re-signed later: e-hentai's image links
     # expire, and this button refreshes them without starting over.
     if telegraph_url:
-        remember_regenerate(message.chat_id, user.id, gallery, mode,
-                            status.message_id if hasattr(status, "message_id") else 0)
+        remember_regenerate(message.chat_id, user.id, gallery, mode)
 
     # One message, not two. The cover is edited into the message the bot already
     # sent, so the reply does not look like it is repeating itself. If the cover

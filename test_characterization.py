@@ -1550,6 +1550,213 @@ def _dt_now():
     return _d.now(_t.utc)
 
 
+def _fake_gallery(gid: str, token: str):
+    """
+    A gallery, built from the real class.
+
+    **Not a hand-rolled stand-in**, which is what the first version was and it broke twice: first
+    on `remember_gallery` needing a dozen fields, then on `build_gallery_info` reading `category`.
+    Each failure looked like the bug being tested for. The real dataclass cannot drift from what
+    the code reads.
+    """
+    return bot.ehentai.EhentaiGallery(
+        url=f"https://e-hentai.org/g/{gid}/{token}/",
+        gid=gid,
+        token=token,
+        title=f"work {gid}",
+        category="Manga",
+        language="Chinese",
+        filecount="10",
+        tags={},
+    )
+
+
+def _regenerate_cache_separates_galleries() -> bool:
+    """
+    Two galleries from the same person must be stored independently.
+
+    This is the shape of the bug: keyed by (chat, user) alone, the second `remember_regenerate`
+    replaced the first, and nothing said so.
+    """
+    a = _fake_gallery("111", "aaaa")
+    b = _fake_gallery("222", "bbbb")
+    saved = dict(bot._regenerate_cache)
+    try:
+        bot._regenerate_cache.clear()
+        bot.remember_regenerate(-100, 7, a, "orig")
+        bot.remember_regenerate(-100, 7, b, "view")
+
+        ka = bot.regenerate_cache_key(-100, 7, "111", "aaaa")
+        kb = bot.regenerate_cache_key(-100, 7, "222", "bbbb")
+
+        if bot._regenerate_cache.get(ka, {}).get("gallery") is not a:
+            note("gallery A was not retrievable after gallery B was remembered - the second "
+                 "entry overwrote the first, which is the reported bug")
+            return False
+        if bot._regenerate_cache.get(kb, {}).get("gallery") is not b:
+            note("gallery B was not stored under its own key")
+            return False
+        # The mode has to travel with the gallery too, or a regenerated original set is rebuilt
+        # from the display set.
+        if bot._regenerate_cache[ka]["mode"] != "orig":
+            note(f"A's mode is {bot._regenerate_cache[ka]['mode']!r}, not 'orig'")
+            return False
+        if bot._regenerate_cache[kb]["mode"] != "view":
+            note(f"B's mode is {bot._regenerate_cache[kb]['mode']!r}, not 'view'")
+            return False
+        # And a different user or chat must not see it.
+        if bot.regenerate_cache_key(-100, 8, "111", "aaaa") in bot._regenerate_cache:
+            note("another user's key resolves to this entry")
+            return False
+        return True
+    finally:
+        bot._regenerate_cache.clear()
+        bot._regenerate_cache.update(saved)
+
+
+def _regenerate_looks_up_the_pressed_gallery() -> bool:
+    """
+    Pressing 重新生成 on gallery A must rebuild A, not whichever was parsed last.
+
+    Driven through handle_regenerate rather than by inspecting the key, because the key being
+    right and the lookup using it are two different things - and it was the lookup's key that was
+    wrong. e-hentai is replaced by a recorder, so which gallery was fetched is observable.
+    """
+    import asyncio
+
+    a = _fake_gallery("111", "aaaa")
+    b = _fake_gallery("222", "bbbb")
+    fetched = []
+
+    real_fetch = bot.ehentai.fetch_gallery_images
+    real_create = bot.ehentai.create_telegraph_page
+    bot.ehentai.create_telegraph_page = lambda *a, **k: "https://telegra.ph/fake-1"
+
+    real_embed = bot.public_embed_urls
+    real_update = bot.update_result_message
+    real_allowed = bot.user_is_allowed
+    # remember_gallery writes the parse cache, which reads a dozen gallery fields this stub does
+    # not have. Stubbed because the question here is *which* gallery is regenerated, and a stub
+    # that raised would be indistinguishable from the bug being tested for.
+    real_remember = bot.remember_gallery
+
+    # **Synchronous, because run_regenerate calls it through asyncio.to_thread.** An `async def`
+    # here returns a coroutine to to_thread, to_thread hands the coroutine straight back, and the
+    # unpacking below fails - so the check reported "nothing was fetched" for a reason that had
+    # nothing to do with the cache.
+    def fake_fetch(page_url, **kwargs):
+        fetched.append(page_url)
+        return (["https://hath.network/d1.jpg"], ["https://hath.network/o1.jpg"])
+
+    async def fake_embed(urls, gallery, message):
+        return urls
+
+    async def fake_update(message, text, **kwargs):
+        fetched.append(f"edited:{text.splitlines()[0]}")
+        return True
+
+    class Query:
+        def __init__(self, gid, token):
+            self.data = f"eh|regen|{gid}|{token}"
+            self.message = type("M", (), {
+                "chat_id": -100, "message_id": 5, "photo": [object()], "caption": "x",
+                "chat": type("C", (), {"type": "supergroup"})(),
+            })()
+
+        async def answer(self, *a, **k):
+            return True
+
+    async def scenario():
+        bot.ehentai.fetch_gallery_images = fake_fetch
+        bot.public_embed_urls = fake_embed
+        bot.update_result_message = fake_update
+        bot.user_is_allowed = lambda *a, **k: True
+        bot.remember_gallery = lambda *a, **k: None
+        try:
+            bot._regenerate_cache.clear()
+            bot.remember_regenerate(-100, 7, a, "orig")
+            bot.remember_regenerate(-100, 7, b, "view")
+
+            # Press the button on A's message, after B was parsed.
+            await bot.handle_regenerate(None, Query("111", "aaaa"),
+                                        type("U", (), {"id": 7})(), "111", "aaaa")
+            if not fetched:
+                note("nothing was fetched at all")
+                return False
+            if a.page_url not in fetched[0]:
+                note(f"pressing A's button fetched {fetched[0]!r} instead of {a.page_url!r} - "
+                     f"the second gallery's content went into the first one's message")
+                return False
+
+            # And the other way round.
+            fetched.clear()
+            await bot.handle_regenerate(None, Query("222", "bbbb"),
+                                        type("U", (), {"id": 7})(), "222", "bbbb")
+            if not fetched or b.page_url not in fetched[0]:
+                note(f"pressing B's button fetched {fetched[:1]!r} instead of {b.page_url!r}")
+                return False
+
+            # A gallery that was never cached must be refused, not silently answered with
+            # somebody else's gallery.
+            fetched.clear()
+            await bot.handle_regenerate(None, Query("999", "zzzz"),
+                                        type("U", (), {"id": 7})(), "999", "zzzz")
+            if fetched:
+                note(f"an uncached gallery was acted on: {fetched!r}")
+                return False
+            return True
+        finally:
+            bot.ehentai.create_telegraph_page = real_create
+            bot.ehentai.fetch_gallery_images = real_fetch
+            bot.ehentai.create_telegraph_page = real_create
+            bot.public_embed_urls = real_embed
+            bot.update_result_message = real_update
+            bot.user_is_allowed = real_allowed
+            bot.remember_gallery = real_remember
+            bot._regenerate_cache.clear()
+
+    try:
+        return asyncio.run(scenario())
+    except Exception as exc:  # noqa: BLE001
+        note(f"{type(exc).__name__}: {exc}")
+        return False
+
+
+def _regenerate_button_carries_its_gallery() -> bool:
+    """
+    The button must carry the gid and token the lookup needs, and they must survive parsing.
+
+    The cache fix depends on these; if the callback data were ever trimmed, the lookup would start
+    missing and every press would report an expired button.
+    """
+    keyboard = bot.regenerate_keyboard("111", "aaaa")
+    data = keyboard.inline_keyboard[0][0].callback_data
+    if len(data.encode("utf-8")) > 64:
+        note(f"the callback data is {len(data.encode('utf-8'))} bytes, over Telegram's 64-byte cap")
+        return False
+    parsed = bot.parse_gallery_callback(data)
+    if parsed != ("regen", "111", "aaaa"):
+        note(f"round-tripped to {parsed!r}, expected ('regen', '111', 'aaaa')")
+        return False
+    return True
+
+
+def _regenerate_entry_has_no_dead_message_id() -> bool:
+    """
+    The entry must not carry a message_id nothing reads.
+
+    It was stored on every entry and read by nothing, which made it look as though the message
+    being edited was tracked - it never was, and that is part of why the collision was invisible.
+    """
+    import inspect as _i
+
+    source = _i.getsource(bot.remember_regenerate)
+    if '"message_id"' in source or "'message_id'" in source:
+        note("remember_regenerate still stores message_id, which nothing reads")
+        return False
+    return True
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -3506,6 +3713,20 @@ check("the group gate is registered in group -1",
 check("the group gate stops the update rather than returning",
       _group_gate_stops_the_update(),
       "returning lets the CommandHandler run anyway, so the command is answered")
+
+check("two galleries from one person do not overwrite each other in the regenerate cache",
+      _regenerate_cache_separates_galleries(),
+      "this is the reported bug: parsing a second link replaced the first, so 重新生成 on the "
+      "first message rebuilt the second gallery into it")
+check("pressing 重新生成 rebuilds the gallery whose button was pressed",
+      _regenerate_looks_up_the_pressed_gallery(),
+      "the lookup key must carry the gallery, not just the chat and user")
+check("the 重新生成 button carries the gallery it belongs to",
+      _regenerate_button_carries_its_gallery(),
+      "the cache fix depends on the gid and token surviving in the callback data")
+check("the regenerate entry stores no message_id that nothing reads",
+      _regenerate_entry_has_no_dead_message_id(),
+      "a field nothing reads made it look as though the target message was tracked")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),
