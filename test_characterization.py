@@ -1984,6 +1984,9 @@ class _GalleryImagesHarness:
         self.edited = []
         self.texts = []
         self.saved = []
+        self.options = []
+        self.reply_markup = []
+        self.cover_used = 0
         self._undo = []
 
     # -- setup ---------------------------------------------------------------
@@ -2046,10 +2049,14 @@ class _GalleryImagesHarness:
 
         async def fake_edit_text(text, **k):
             harness.texts.append(text)
+            # The link preview options, which decide whether Telegram offers Instant View.
+            harness.options.append(k.get("link_preview_options"))
+            harness.reply_markup.append(k.get("reply_markup"))
             return True
 
         async def fake_edit_cover(status, gallery, summary, keyboard=None):
             harness.texts.append(summary)
+            harness.cover_used += 1
             return True
 
         def fake_remember_page(url, gal, mode_, page, embedded=None):
@@ -2274,6 +2281,272 @@ def _the_cached_page_survives_a_gallery_rewrite() -> bool:
         import shutil
         shutil.rmtree(work, ignore_errors=True)
 
+
+def _telegraph_preview_points_at_the_page() -> bool:
+    """
+    The preview must name the Telegraph URL, not fall through to the source link.
+
+    LinkPreviewOptions.url is what Telegram previews; without it the first URL in the message is
+    used, which here is the gallery's own e-hentai or exhentai link. A preview card for exhentai is
+    adult material in whatever chat the bot was used, and it is the reason previews were disabled.
+    """
+    options = bot.telegraph_link_options("https://telegra.ph/Work-10-16")
+    if getattr(options, "url", None) != "https://telegra.ph/Work-10-16":
+        note(f"the preview url is {getattr(options, 'url', None)!r}")
+        return False
+    if getattr(options, "is_disabled", None):
+        note("the Telegraph preview is disabled, so Telegram shows no Instant View button")
+        return False
+    # And the source link stays unpreviewed, which is the other half.
+    source = bot.source_link_options()
+    if not getattr(source, "is_disabled", None):
+        note("source_link_options no longer disables the preview, so source links would show cards")
+        return False
+    if getattr(source, "url", None):
+        note("source_link_options sets a url, which would preview something")
+        return False
+    return True
+
+
+def _a_telegraph_result_is_text_not_a_cover() -> bool:
+    """
+    With a Telegraph page the result must be text, because a caption cannot carry preview options.
+
+    Checked against the installed library: edit_caption, edit_media and InputMediaPhoto all lack
+    link_preview_options, so while the reply is a photo the link inside its caption has no preview
+    and no Instant View button.
+    """
+    import inspect
+
+    from telegram import InputMediaPhoto, Message
+
+    for name, fn in (("Message.edit_caption", Message.edit_caption),
+                     ("Message.edit_media", Message.edit_media),
+                     ("InputMediaPhoto", InputMediaPhoto.__init__)):
+        if "link_preview_options" in inspect.signature(fn).parameters:
+            note(f"{name} now accepts link_preview_options, so the reply could stay a photo")
+            return False
+
+    gallery = _fake_gallery("111", "aaaa")
+    h = _GalleryImagesHarness(alive=True).run(gallery, "view", None)
+
+    if h.cover_used:
+        note("the cover was used for a result that has a Telegraph page, so the link sits in a "
+             "caption and cannot show Instant View")
+        return False
+    if not h.options:
+        note("the message was never sent")
+        return False
+    preview = h.options[-1]
+    url = getattr(preview, "url", None) if preview is not None else None
+    if not url or "telegra.ph" not in url:
+        note(f"the text message preview is {url!r}, so Telegram would preview the source link or "
+             f"nothing at all")
+        return False
+    if not h.reply_markup or h.reply_markup[-1] is None:
+        note("the 重新生成 button was dropped when the reply stopped being a photo")
+        return False
+    return True
+
+
+def _a_result_without_telegraph_still_uses_the_cover() -> bool:
+    """
+    With no Telegraph page the cover is still used and previews stay off.
+
+    The change is only about the Telegraph link; every other result should look as it did. Split
+    from _telegraph_without_page_uses_the_cover only because the setup is long.
+    """
+    return _telegraph_without_page_uses_the_cover()
+
+
+def _telegraph_without_page_uses_the_cover() -> bool:
+    """The body of _a_result_without_telegraph_still_uses_the_cover: publish fails, cover is used."""
+    import asyncio
+    import tempfile
+
+    gallery = _fake_gallery("111", "aaaa")
+    seen = {"cover": 0, "options": [], "texts": []}
+
+    def fail_create(gallery, urls, **k):
+        raise bot.ehentai.TelegraphError("telegraph is down")
+
+    async def fake_gallery_page_urls(*a, **k):
+        return (["https://hath.network/d.jpg"], ["https://hath.network/o.jpg"])
+
+    async def fake_embed(urls, gallery, status, report=None):
+        return urls
+
+    async def fake_edit_text(text, **k):
+        seen["texts"].append(text)
+        seen["options"].append(k.get("link_preview_options"))
+        return True
+
+    async def fake_cover(status, gallery, summary, keyboard=None):
+        seen["cover"] += 1
+        return True
+
+    import shutil
+    real = {n: getattr(bot, n) for n in
+            ("gallery_page_urls", "public_embed_urls", "edit_message_to_cover")}
+    real_create = bot.ehentai.create_telegraph_page
+    real_cache, real_dir = bot.PARSE_CACHE, bot.CACHE_DIR
+    work = Path(tempfile.mkdtemp(prefix="telnocover-"))
+    try:
+        bot.gallery_page_urls = fake_gallery_page_urls
+        bot.public_embed_urls = fake_embed
+        bot.edit_message_to_cover = fake_cover
+        bot.ehentai.create_telegraph_page = fail_create
+        bot.PARSE_CACHE = bot.ParseCache(work / "c.json")
+        bot.CACHE_DIR = work
+
+        status = type("S", (), {"edit_text": staticmethod(fake_edit_text), "message_id": 1})()
+
+        async def go():
+            await bot.run_gallery_images(
+                type("M", (), {"chat_id": -100, "message_id": 5})(),
+                status, gallery, "view", work, "", type("U", (), {"id": 7})())
+
+        asyncio.run(go())
+    finally:
+        for n, v in real.items():
+            setattr(bot, n, v)
+        bot.ehentai.create_telegraph_page = real_create
+        bot.PARSE_CACHE, bot.CACHE_DIR = real_cache, real_dir
+        shutil.rmtree(work, ignore_errors=True)
+
+    if not seen["cover"]:
+        note("without a Telegraph page the cover was not used, so the change affected results it "
+             "should not have")
+        return False
+    for option in seen["options"]:
+        if option is not None and not getattr(option, "is_disabled", None):
+            note(f"a result without a Telegraph page had previews enabled: {option!r}")
+            return False
+    return True
+
+
+def _regenerate_keeps_the_preview() -> bool:
+    """
+    The 重新生成 path must keep the Telegraph preview, or the Instant View button disappears the
+    first time the button is pressed.
+    """
+    import asyncio
+
+    gallery = _fake_gallery("111", "aaaa")
+    page = bot.ehentai.TelegraphPage(
+        url="https://telegra.ph/Work-10-16", path="Work-10-16", access_token="tok")
+    seen = {}
+
+    async def fake_update(message, text, **kwargs):
+        # **preview_url, not link_preview_options.** This stub replaces update_result_message, so
+        # the conversion from one to the other does not run here - asserting on the options would
+        # always see None and would be testing the stub rather than the caller. The conversion
+        # itself is covered by _update_result_message_builds_the_telegraph_preview.
+        seen["preview_url"] = kwargs.get("preview_url")
+        return True
+
+    real_update = bot.update_result_message
+    real_fetch = bot.ehentai.fetch_gallery_images
+    real_edit = bot.ehentai.edit_telegraph_page
+    real_embed = bot.public_embed_urls
+    real_remember = bot.remember_gallery
+
+    class Query:
+        def __init__(self):
+            self.message = type("M", (), {
+                "chat_id": -100, "message_id": 5, "photo": [], "caption": "x",
+                "chat": type("C", (), {"type": "supergroup"})()})()
+
+        async def answer(self, *a, **k):
+            return True
+
+    async def scenario():
+        bot.update_result_message = fake_update
+        bot.ehentai.fetch_gallery_images = lambda *a, **k: (["u"], ["u"])
+        bot.ehentai.edit_telegraph_page = lambda page, gal, urls, **k: page
+        bot.public_embed_urls = lambda urls, gal, msg: _await(urls)
+        bot.remember_gallery = lambda *a, **k: None
+        try:
+            entry = {"gallery": gallery, "mode": "view", "page": page}
+            await bot.run_regenerate(Query(), type("U", (), {"id": 7})(), entry)
+        finally:
+            bot.update_result_message = real_update
+            bot.ehentai.fetch_gallery_images = real_fetch
+            bot.ehentai.edit_telegraph_page = real_edit
+            bot.public_embed_urls = real_embed
+            bot.remember_gallery = real_remember
+
+    async def _await(v):
+        return v
+
+    try:
+        asyncio.run(scenario())
+    except Exception as exc:  # noqa: BLE001
+        note(f"{type(exc).__name__}: {exc}")
+        return False
+
+    url = seen.get("preview_url")
+    if not url or "telegra.ph" not in url:
+        note(f"run_regenerate passed preview_url={url!r}, so the regenerated message would not "
+             f"preview the Telegraph page and the Instant View button is lost after the first "
+             f"press")
+        return False
+    return True
+
+
+def _update_result_message_builds_the_telegraph_preview() -> bool:
+    """
+    preview_url must become a preview of that page, and its absence must keep previews off.
+
+    The callers pass a URL, not options, so this is where the translation happens - and it is the
+    half the regenerate check cannot see, because that check replaces update_result_message.
+    """
+    import asyncio
+
+    seen = []
+
+    class Msg:
+        photo = []          # a text message, so edit_text is the branch taken
+        caption = "x"
+
+        async def edit_text(self, text, **kwargs):
+            seen.append(kwargs.get("link_preview_options"))
+            return True
+
+        async def edit_caption(self, caption=None, **kwargs):
+            note("edit_caption was used, which cannot carry link preview options")
+            return True
+
+    async def go():
+        msg = Msg()
+        await bot.update_result_message(msg, "text", preview_url="https://telegra.ph/W-1")
+        await bot.update_result_message(msg, "text")
+        await bot.update_result_message(msg, "text", link_preview=False)
+
+    try:
+        asyncio.run(go())
+    except Exception as exc:  # noqa: BLE001
+        note(f"{type(exc).__name__}: {exc}")
+        return False
+
+    if len(seen) != 3:
+        note(f"expected three edits, saw {len(seen)}")
+        return False
+    with_url = seen[0]
+    if getattr(with_url, "url", None) != "https://telegra.ph/W-1":
+        note(f"preview_url produced {with_url!r}")
+        return False
+    if getattr(with_url, "is_disabled", None):
+        note("preview_url produced a DISABLED preview, so no Instant View button")
+        return False
+    plain = seen[1]
+    if not getattr(plain, "is_disabled", None):
+        note(f"a message without preview_url got {plain!r} instead of a disabled preview")
+        return False
+    if seen[2] is not None:
+        note(f"link_preview=False still passed {seen[2]!r}")
+        return False
+    return True
 
 def _result_message_helper_works() -> bool:
     """
@@ -4276,6 +4549,24 @@ check("a page built for 顯示圖 is not reused for 原圖",
 check("recording a page keeps the gallery facts and the cached sweep",
       _the_cached_page_survives_a_gallery_rewrite(),
       "the sweep is the expensive part of the cache and must survive a publish")
+
+check("the Telegraph link preview points at the page, and the source link stays unpreviewed",
+      _telegraph_preview_points_at_the_page(),
+      "Instant View lives in the preview area, and previewing the source link would put an "
+      "exhentai card in the chat")
+check("a result with a Telegraph page is text, so its link can show Instant View",
+      _a_telegraph_result_is_text_not_a_cover(),
+      "a media caption cannot carry link preview options, so a cover photo can never show the "
+      "Instant View button")
+check("a result without a Telegraph page still uses the cover with previews off",
+      _a_result_without_telegraph_still_uses_the_cover(),
+      "the change is only about the Telegraph link")
+check("update_result_message turns preview_url into a Telegraph preview",
+      _update_result_message_builds_the_telegraph_preview(),
+      "the callers pass a URL, so this is where the options are built")
+check("重新生成 keeps the Telegraph preview",
+      _regenerate_keeps_the_preview(),
+      "or the Instant View button disappears the first time the button is pressed")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),
