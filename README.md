@@ -1,140 +1,340 @@
-# X/Twitter + Pixiv Telegram Bot (Windows)
+# X/Twitter + Pixiv Telegram 機器人（Windows）
 
-## Who can do what
-The bot is meant to be public: anyone who can see it in a group can send a link
-and get the result. Managing the bot is separate from that.
+## 專案簡介
 
-| Command | Who | Notes |
-| --- | --- | --- |
-| `/start`, `/help` | Anyone | Usage text only, no deployment detail |
-| `/id` | Anyone | Shows the caller their own ID |
-| `/authorized` | Admin or authorized | The current lists, the mode, and the file in use |
-| `/grant <ID>` | Admin or authorized | Authorize a user. In a group with no ID: authorize **that group** |
-| `/revoke <ID>` | Admin or authorized | Remove a user. In a group with no ID: remove **that group** |
-| `/promote <ID>` | **Admin only** | Make a user an administrator |
-| `/demote <ID>` | **Admin only** | Remove administrator rights |
-| `/lock on\|off` | **Admin only** | Private-chat / user-list mode |
-| `/lockgroup on\|off` | **Admin only** | Group-chat mode |
-| `/cookies` | **Admin only** | Credential files, expiry dates, error strings |
-| `/status` | **Admin only** | Limits, authorization state, runtime settings |
-| `/cache` | **Admin only** | Parse-cache contents; `/cache clear` empties it |
-| `/restart` | **Admin only** | Replaces the running process with a fresh copy |
+在 Telegram 裡貼上一則 **X（Twitter）**、**Pixiv** 或 **e-hentai** 的連結，機器人就把媒體送回同一個聊天室：
 
-**Parsing is open to everyone.** The authorized list is a *restriction*: an empty
-list means anyone may parse, and adding someone to it does not grant them anything
-they did not already have. `/revoke` is how a specific user is cut off without
-locking the bot down for everybody.
+- **X/Twitter**：貼文中的圖片與影片，直接回傳到 Telegram。
+- **Pixiv**：作品的**原始檔案**，以相簿形式送出——不壓縮、不重新編碼、不縮圖、不打包成 ZIP；多頁作品分成多個相簿。
+- **e-hentai / exhentai**：畫廊的分類、語言、評分、頁數，以及依命名空間分組的完整標籤，再加上四個動作按鈕（Telegraph 頁面或 ZIP 歸檔）。
 
-### Authorizing a whole group
-Run `/grant` **in the group**, with no argument, and that group is authorized — so
-every member of it may parse, with no per-user grant. This is the practical way to
-use it, since a chat ID is awkward to obtain by hand.
+**只支援這三個站點。** 其他網站的連結永遠不會被下載或抓取，所以這個機器人不能被當成通用的連結抓取器。
 
-| Groups authorized | `/lockgroup off` (default) | `/lockgroup on` |
-| --- | --- | --- |
-| none | every group may parse | **no** group may parse |
-| one or more | only those groups | only those groups |
+機器人設計成**公開**的：任何在群組裡看得到它的人都能貼連結、拿到結果。管理機器人是另一回事——只有管理員能碰，而且管理權限刻意與「能不能貼連結」分開。
 
-**`/lockgroup` is separate from `/lock` on purpose.** `/lock` governs private chats
-and the user list; it says nothing about groups. With only `/lock on`, every group
-stayed wide open — the bot looked locked down in private chats while any group could
-still use it. That is why there are two switches answering two different questions:
+每個結果都會附上來源連結（`原始連結：<url>`），可用 `ATTACH_SOURCE_LINK=0` 關閉。解析成功時只送出結果，不附加任何說明；失敗時只回一行話，技術細節寫進日誌而不是聊天室。在 Windows 上以單一行程、polling 方式執行，需要 Python 3.11 以上。
 
-| Question | Switch |
+### 訊息如何被路由
+| 訊息內容 | 機器人做的事 |
 | --- | --- |
-| May people use it in private chats? | `/lock on\|off` |
-| May groups use it? | `/lockgroup on\|off` |
+| `x.com` / `twitter.com` 作品連結 | 下載媒體；圖片以相簿送出 |
+| `pixiv.net` 作品連結 | 下載作品，以**原始檔案**相簿送出 |
+| `e-hentai.org` / `exhentai.org` 畫廊連結 | 顯示畫廊資訊與標籤，附四個動作按鈕 |
+| 其他網站的連結 | 預設**沉默**；`REPLY_UNSUPPORTED_LINKS=1` 時回覆 `SUPPORTED_SITES_NOTICE` |
+| `t.me` 邀請／公開連結 | 說明它不會加入，也不會替這類連結分類 |
+| 一則訊息含多個連結 | X/Twitter 或 Pixiv 作品連結優先，其次是畫廊連結 |
 
-`/lockgroup on` is **allowed** with an empty group list — that blocks every group
-until one is authorized, and the reply says so. Gating first and then running
-`/grant` in the group is the natural order, and blocking it would block the very
-sequence that makes the feature usable:
+## 功能
 
-```
-1. /lockgroup on          → 守門模式; no group may parse yet
-2. /grant   (in a group)  → that group is now the only one that may parse
-3. any other group        → still refused
-```
+- **只認 X/Twitter、Pixiv 與 e-hentai 連結**，其他站點一律不下載、不抓取。
+- **Pixiv 以原始圖檔送出**，多頁作品變成相簿；X/Twitter 的圖片與影片原樣回傳。
+- **e-hentai 畫廊變成 Telegraph 文章**：畫廊資料與每個標籤（依命名空間分組），以單一訊息送出，封面就是訊息本體。
+- **Telegram 邀請連結**（`t.me/+...`、`t.me/joinchat/...`）會被單獨識別；公開的 `t.me` 連結會辨識但不會被誤標成群組——它可能指向群組、頻道、使用者或機器人。
+- 連結冷卻、下載逾時、同時下載數上限、單檔大小上限，以及**一位使用者同時只能有一個請求**（只在真的有請求在跑時才拒絕）。
+- 選用的使用者封鎖名單、各站登入 cookie、只有管理員能用的 `/cookies`、`/status`、`/restart`。
+- **解析快取**（同一個連結不重新下載）、**平行下載頁面**、百分比進度條、可中止的「停止」按鈕。
+- **歸檔改用 e-hentai 官方壓縮檔**、**標籤顯示繁體中文**、**Cloudflare R2 圖片代管**（選用）。
+- 成功後自動清掉「正在解析…」提示與帶連結的原始訊息。
 
-An administrator can always undo it with `/lockgroup off` in a private chat, so
-there is no state this can reach that cannot be undone.
+### Cloudflare R2 圖片代管與免費額度上限
+e-hentai 內嵌的圖片是帶簽章、會過期的連結（`*.hath.network`），一旦過期，Telegraph 頁面上的**每一張圖同時**壞掉。`重新生成` 就是為了繞過這件事而做的：重新掃描、重新簽章、原地改寫頁面。把圖片複製一份到 **Cloudflare R2** 則根本沒有這個問題：物件存在多久，URL 就穩定多久——一個月前解析過的畫廊，也能在完全不碰 e-hentai 的情況下送出。
 
-Three things worth knowing:
+- **物件鍵是內容雜湊**（`galleries/ab/cd/<sha256>.jpg`，兩層前綴把物件分散到 65536 個前綴）。同張圖上傳兩次就是同一個物件，所以重新解析只補缺的；也因為 URL 不能從畫廊 id 猜到，知道一個路徑無法列舉桶裡還有什麼。Telegraph 是匿名抓圖的，URL 必須公開，雜湊是讓它「公開但不可搜尋」的手段。
+- **`Cache-Control: public, max-age=31536000, immutable`**：物件不可變，沒有理由給更短的快取。
+- 單張圖片上限 **32 MiB**；平行上傳預設 **6** 個 worker（`R2_UPLOAD_WORKERS`）、單張逾時 **60 秒**（`R2_UPLOAD_TIMEOUT`）。
 
-- **Managing lists inside a group is administrators only.** Group authorization is
-  decided in a group, so if any authorized user could run it, any member of an
-  authorized group could change the lists — self-service for everyone the bot
-  already admits. In a private chat, authorized users keep the ability.
-- **Administrators pass everywhere**, including in a group that is not listed, so
-  an operator is never locked out of their own bot.
-- **Private chats are unaffected by the group list and the group mode**, and groups
-  are unaffected by the user list and `/lock`. A private chat has no group to speak
-  for it, so the user rules apply there.
+**免費額度與上限。** Cloudflare 文件上的免費額度是每月 **10 GB** 儲存空間（程式以十進位計算：`10 * 1000**3` 位元組，因為 Cloudflare 以 GB 計費）。實際上傳會停在額度的 **95%**（預設即 **9.50 GB**），可用 `R2_FREE_BYTES` 與 `R2_LIMIT_PERCENT` 調整。留 5% 是必要的，不是保守：儲存按月、依物件存在與否計費，剛好頂到額度、一週後才被清掉的畫廊，那個月仍然超額。
 
-`/revoke` in a group removes that group; the reply notes when the list becomes empty
-and every group is welcome again.
+- **上限在 `put` 之前檢查**（`已儲存 + 這張圖 <= 上限`），不是之後——物件一寫入就開始計費。**用量從桶子讀**（`ListObjectsV2`），不靠機器人自己記的數字：本機計數在有人從 Cloudflare 後台刪東西之後就失準，從此不是誤擋就是超額；而列出物件是 class B 操作，免費額度是每月一千萬次，問一下並不貴。
+- 額度用完時**停止上傳、通知管理員、其餘圖片沿用原始網址**，結果上會出現「⚠️ R2 免費額度已滿，這次不改用 R2（已通知管理員）。」。這與「上傳失敗」是不同狀態：沒有東西壞掉，只是被刻意擋下。
+- **R2 永遠不會讓機器人掛掉。** 沒設定、只設定一半、`boto3` 沒裝、上傳全失敗，任何一種都退回 e-hentai 自己的連結（`r2.py` 因此延後匯入 `boto3`）。已上傳的 R2 網址會依「畫廊 + 模式」記進解析快取，重按同一個按鈕不會再傳一次。
 
-### Two modes, and the one thing to get right
-These govern **private chats and the user list**:
+需要的五個設定值：`R2_ACCOUNT_ID`、`R2_ACCESS_KEY`、`R2_SECRET_KEY`、`R2_BUCKET`、`R2_PUBLIC_BASE`（匿名可讀的網域）。端點固定是 `https://<account_id>.r2.cloudflarestorage.com`；`R2_PUBLIC_BASE` 必須是 `http://` 或 `https://` 開頭，否則整組視為未設定。
 
-| Mode | Empty list means | Populated list means |
+### 解析快取：同一個連結不解析兩次
+解析過的連結由快取供應，重貼一次不花下載、也不花請求。在 5 頁畫廊上實測：**1.93 秒 → 0.02 秒**，因為逐頁掃 viewer 的動作整個被跳過。兩種東西被快取，因為昂貴的工作不一樣：
+
+| 種類 | 快取的內容 | 省下什麼 |
 | --- | --- | --- |
-| **Open** (default, `/lock off`) | anyone may parse | only listed users may parse |
-| **Locked** (`/lock on`) | **nobody** may parse | only listed users may parse |
+| e-hentai | 畫廊資料，以及 viewer 掃描得到的圖片網址 | 掃描是每頁一個請求——53 頁畫廊約需一分鐘 |
+| 媒體 | 下載下來的檔案本身（另存一份） | 完全不下載、也不跑 gallery-dl |
 
-An empty list meaning "nobody" is the dangerous reading, so it is never chosen for
-you: the default is open, and `/lock on` is refused while no administrator or
-authorized user exists. Administrators always pass in both modes, so a locked bot
-can still be unlocked from inside it.
+Pixiv 與 X 同理。實測：
 
-### Bootstrap, then manage in chat
-The first administrator has to come from `.env`, because there is nobody to grant
-it:
+```
+第一次請求    2.09s   Pixiv 解析完成，已傳送原圖 2/2 個檔案。
+第二次請求    0.01s   已從快取傳送 2/2 個檔案。
+```
+
+- **快取命中不受連結冷卻限制**：冷卻擋的是重複的*下載*工作，而快取命中沒有下載；套用冷卻只會讓一個已經在磁碟上的答案白等十秒。沒有任何快取時，冷卻照舊。
+- **快取命中也會清理聊天室**，跟真的下載一樣：進度提示與連結訊息都被刪掉。少了這段清理，快取反而留下更多雜訊。
+- 送出時使用**暫存目錄**，絕不直接用快取目錄：超大圖片會先寫一份縮圖，指向快取目錄就會覆蓋正在被快取的檔案。
+- **失敗的結果刻意不快取**：失敗通常是暫時的，或是一組管理員後來修好的憑證；快取它會讓一次壞運氣變成永久。
+- **刻意不使用 `gallery-dl --download-archive`**：它與「每次請求用全新的暫存目錄」衝突——archive 說「下載過了」，gallery-dl 於是跳過，而每個請求都要新目錄，結果是重貼時什麼都沒寫，機器人卻回報「沒有找到可傳送的圖片或影片」。重複使用上一次的解析結果是快取的工作；快取沒中時，重新下載才是正確行為。
+- **快取的圖片網址還是會過期**：e-hentai 的圖片連結有時效，所以快取的掃描結果只能撐一陣子，過期就自己失效；`重新生成 Telegraph 頁面` 是重新整理這種頁面的正式做法，它會刻意忽略快取，並把新的網址寫回去。
+
+```ini
+CACHE_FILE=parse_cache.json
+CACHE_DIR=.cache
+CACHE_STALE_SECONDS=1209600   # 14 天
+CACHE_MAX_ENTRIES=300
+GALLERY_URL_TTL_SECONDS=7200  # 2 小時：快取的網址清單可信多久
+```
+
+快取在兩個維度都有上限，並優先清掉最舊的項目（連同它的檔案一起刪——只丟索引會漏出無人引用的磁碟空間）。損壞的快取檔會被丟棄而不是致命錯誤，因為快取只是最佳化，失去它只損失時間。**只存在一部分**的檔案集會被視為沒有快取，因為送出半個作品比重新下載更糟。`/cache` 顯示內容、命中／未命中次數與磁碟用量，`/cache clear` 清空，兩者都只有管理員能用。
+
+### 為什麼 Pixiv 是以「檔案」而不是「照片」送出
+Telegram 的照片路徑沒有辦法原樣送出一張圖：`sendPhoto` 會在伺服器端重新編碼並改名成 `.jpg`，所以「照片」永遠不是原檔。Pixiv 作品因此以**文件**送出，Telegram 會逐位元組原樣傳遞，原始檔名（`150653396_p0.jpg`）也保留下來。
+
+- 圖片會以檔案而不是內嵌照片出現。點開來看，手機上可用「儲存到相簿」，桌機則直接下載。
+- 多頁作品以最多 10 個為一組，所以 30 頁的作品會是三個相簿，而不是三十則訊息。
+- 超過 `MAX_UPLOAD_MB` 的檔案會被回報並跳過，而不是悄悄縮小——重點是送出原檔，不是替代品。
+- **X/Twitter 仍走一般照片路徑**，因為貼文本來就預期是壓縮過的預覽。
+
+### 清理聊天室
+請求成功後，機器人會刪掉它自己製造的雜訊：「正在解析…」提示，以及帶著連結的**原始訊息**。兩者都由 `.env` 控制，設成 `0` 就保留：
+
+```ini
+DELETE_STATUS_MESSAGE=1
+DELETE_SOURCE_MESSAGE=1
+```
+
+**在群組裡刪掉別人的訊息，需要機器人是管理員並擁有「刪除訊息」權限。** 沒有這個權限時 Telegram 會拒絕刪除，機器人只記一筆警告，然後只刪掉自己的提示——請求本身仍然成功，解析結果不受影響。私人聊天不需要任何特殊權限。請求**失敗**時什麼都不刪：那時狀態訊息是使用者唯一的解釋，來源連結是他唯一的線索。
+
+## 安裝 / 設定
+
+1. 從 <https://www.python.org/downloads/> 安裝 **Python 3.11+**（安裝時勾選加入 PATH）。
+2. 把 `.env.example` 複製成 `.env`，並把 `BOT_TOKEN` 設成新產生的 token。
+3. 在這個資料夾開啟 CMD，執行：
+
+   ```bat
+   py -m venv .venv
+   .venv\Scripts\activate
+   py -m pip install --upgrade pip
+   py -m pip install -r requirements.txt
+   py -m pip install -U gallery-dl
+   ```
+
+4. 需要成人限定或需登入的 Pixiv/X 內容時，設定登入 cookie（見下方 `cookies/*.txt`）。
+5. 執行 `run.bat`，然後傳 `/start` 給機器人，確認它活著。
+
+**如果 pip 寫不進 venv。** 有些主機會拒絕寫入 `.venv\Lib\site-packages`，pip 在寫 wheel metadata 時就以 `PermissionError` 中斷。機器人還是能跑，只有 Pillow 受影響。改成「解包安裝」：
+
+```bat
+.venv\Scripts\python.exe install_pillow_offline.py
+```
+
+它會把對應的 wheel 解到 `vendor\`。`bot.py` 只在 Pillow 無法正常匯入時才把 `vendor\` 加進 `sys.path`，`pixiv_login.py` 對 `websockets` 也做一樣的事，所以真的用 pip 裝好時，永遠是 pip 的版本優先。
+
+### 重要 `.env` 設定
+```ini
+# 必要
+BOT_TOKEN=123456:ABC...
+ADMIN_USER_IDS=123456789
+# 授權
+AUTH_FILE=authorized.json
+AUTH_GROUP_LOCKED=0        # 1 = 啟動時就鎖住群組
+BLOCKED_USER_IDS=          # 空白 = 所有人都能解析
+# 上限
+MAX_FILES=20
+MAX_UPLOAD_MB=45
+MAX_DOWNLOAD_SECONDS=180
+MAX_CONCURRENT_DOWNLOADS=2
+USER_COOLDOWN_SECONDS=10   # 只針對連結
+REQUEST_STALE_SECONDS=1800 # 請求卡死時回收名額
+# 顯示與連結
+ATTACH_SOURCE_LINK=1
+SOURCE_LABEL=原始連結
+DELETE_STATUS_MESSAGE=1
+DELETE_SOURCE_MESSAGE=1
+SUPPORTED_SITES_NOTICE=目前只支援 X/Twitter、Pixiv 與 e-hentai 連結。
+REPLY_UNSUPPORTED_LINKS=0  # 0 = 沉默
+# 憑證
+TWITTER_COOKIES=cookies/twitter.txt
+PIXIV_REFRESH_TOKEN=
+EHENTAI_COOKIES=cookies/ehentai.txt
+EXPIRY_WARN_DAYS=14
+# 快取與工作目錄
+CACHE_FILE=parse_cache.json
+CACHE_DIR=.cache
+CACHE_STALE_SECONDS=1209600
+CACHE_MAX_ENTRIES=300
+WORK_DIR=D:/bot_tmp         # 空白則依序退回 .downloads\ 與系統暫存
+# e-hentai
+EHENTAI_TIMEOUT=60
+EHENTAI_DOWNLOAD_TIMEOUT=900
+EHENTAI_DOWNLOAD_WORKERS=6
+EHENTAI_VIEWER_WORKERS=6
+GALLERY_URL_TTL_SECONDS=7200
+# Telegraph
+TELEGRAPH_ALLOW_ADULT=1
+TELEGRAPH_AUTHOR=e-hentai 解析
+# 歸檔
+ARCHIVE_CACHE=1
+ARCHIVE_CACHE_MAX_BYTES=8589934592   # 8 GiB
+ARCHIVE_DEADLINE_SECONDS=300
+# /restart
+RESTART_STARTUP_DELAY=6    # 替代行程等鎖的上限（秒）
+RESTART_LOG_MAX_MB=2       # restart.log 超過就輪替
+# 自架 Bot API（選用）
+TELEGRAM_API_ID=
+TELEGRAM_API_HASH=
+TELEGRAM_API_BASE=
+TELEGRAM_LOCAL=
+```
+
+### 登入憑證：`cookies/*.txt`
+**cookie 檔要放在 `cookies/` 底下，並以 Netscape 格式存成 `.txt`。** 這個資料夾已被 gitignore，憑證不會被提交；同一個檔案可以包含多個站點，e-hentai 的請求會依網域過濾後才送出。
+
+這兩個站需要**不同種類**的憑證，這是整個設定過程中最常見的混淆來源：
+
+| 站點 | 需要什麼 | 為什麼 |
+| --- | --- | --- |
+| X/Twitter | cookie：`auth_token` + `ct0` | 這類客戶端沒有可用的密碼登入 |
+| Pixiv | OAuth **refresh token** | 作品頁走 Pixiv 的 App API，cookie 授權不了 |
+
+**X/Twitter cookie。** 用平常的瀏覽器登入 X，以 *Get cookies.txt LOCALLY* 或 *cookies.txt* 這類擴充套件匯出 **Netscape 格式**（`.txt`，不要 JSON），而且要分別在登入 `x.com` **和** `twitter.com` 的狀態下匯出。存成 `cookies/twitter.txt`，並讓 `.env` 指向它：
+
+```ini
+TWITTER_COOKIES=cookies/twitter.txt
+```
+
+**Pixiv refresh token。** `PHPSESSID` cookie 對 pixiv.net 自己的網頁端點有效，但對 gallery-dl 使用的 App API **無效**，所以需要 refresh token。授權碼綁在「發出請求的那個行程」的 PKCE `code_verifier` 上，而那個 verifier 從不離開行程；把 code 複製到另一個行程**永遠**換不到 token，Pixiv 還會用與「過期 code」相同的 `invalid_request` 回報。請用內建的輔助工具，它讓兩半在同一次執行裡完成：
+
+```bat
+.venv\Scripts\python.exe pixiv_login.py --auto
+```
+
+`--auto` 會啟動一個用完就丟的 Chrome（獨立設定檔，不會動到你自己的瀏覽器），自動從傳輸中讀到 code，token 直接寫進 `.env`。偏好 gallery-dl 自己的流程，或 `--auto` 跑不起來時：
+
+```bat
+.venv\Scripts\python.exe pixiv_login.py          # 手動貼上
+.venv\Scripts\gallery-dl.exe oauth:pixiv         # gallery-dl 的等價流程
+```
+
+兩條手動路徑都一樣：**登入前**先按 F12 → Network，登入後複製最後一個 `callback?state=...` 請求的 `code` 參數。code 在登入後 **30 秒**就過期。`accounts.pixiv.net/post-redirect?...code_challenge=...` 這種 URL 是流程的*起點*、不含 code，輔助工具會直接拒絕它並說明原因。`cookies/pixiv.txt` 對 pixiv.net 的網頁請求仍然有用，`/cookies` 也會檢查它。
+
+**e-hentai cookie。** 成人畫廊需要 session：檔案需要 `ipb_member_id` 與 `ipb_pass_hash`（exhentai 另外需要 `sk` 與 `igneous`）。`/cookies` 與 `bot.py --check` 都會說缺哪一個。
+
+```ini
+EHENTAI_COOKIES=cookies/ehentai.txt
+```
+
+**憑證會過期，但三者行為差很多**：X 的 `auth_token` + `ct0` 約一年，過期後所有 X 存取停止；Pixiv 的 `PIXIV_REFRESH_TOKEN` **不會過期**（除非被撤銷或改密碼）；`PHPSESSID` 約一個月，只影響 pixiv.net 的 AJAX 端點。機器人會在距到期日少於 `EXPIRY_WARN_DAYS`（預設 14）天時於啟動時警告，管理員的 `/cookies` 隨時顯示剩餘天數，所以故障不會毫無預警地出現。實測數據與「為什麼沒有自動抓 cookie 的工具」見 [docs/NOTES.md](docs/NOTES.md)。
+
+### 驗證設定
+```bat
+.venv\Scripts\python.exe bot.py --check
+```
+
+這會回報每個站點的真實狀態——包括只有 cookie 時會說的「Pixiv: 缺少 refresh-token」。管理員也可以在 Telegram 傳 `/cookies`。加上 `--live` 會對每個站點發出一次真實請求，證明憑證真的能用，而不只是「還沒過期」：
+
+```bat
+.venv\Scripts\python.exe bot.py --check --live
+```
+
+```
+線上驗證（會向站點發出一次真實請求）：
+  [OK] X/Twitter：登入有效（注意：X 可能仍不返回推文內容）
+  [OK] Pixiv：PHPSESSID 有效（關注 567，粉絲 2）
+  [OK] Pixiv refresh-token：已設定（不過期）
+```
+
+> **Windows 上的代理是這裡的常見陷阱。** 這台機器走系統代理，而 `gallery-dl`、`httpx` 與 `urllib` 都不讀 Windows 登錄檔裡的代理設定。修法與量測見 [docs/NOTES.md](docs/NOTES.md)；簡單說：`HTTPS_PROXY` 設了就贏過登錄檔。
+
+### 工作目錄與 gallery-dl 設定
+下載會先暫存在「每次請求一個」的暫存目錄，結束後刪除。挑選順序是：有設 `WORK_DIR` 就用它，否則用 `bot.py` 旁邊的 `.downloads\`，再否則用系統暫存資料夾。第一個能寫入的勝出，所以唯讀或空間不足的位置只會降級，而不是讓每個請求都失敗。大型 Pixiv 作品請把 `WORK_DIR` 指到空間充足的磁碟。
+
+`gallery-dl.conf` 會在啟動時產生在 `bot.py` 旁邊。它存在的理由是讓 gallery-dl 的 SQLite 快取落在 `.gallery-dl-cache\` 而不是 `%APPDATA%`：那個設定檔所在的位置若唯讀，gallery-dl 會以 *attempt to write a readonly database* 失敗，兩個站點就一起停擺。這個檔案也會帶上 `PIXIV_REFRESH_TOKEN`。兩個位置都可用 `GALLERY_DL_CACHE` 覆蓋，或用 `GALLERY_DL_CONFIG` 換成整份自訂設定。
+
+## 使用方式
+
+### 指令與權限
+| 指令 | 誰能用 | 說明 |
+| --- | --- | --- |
+| `/start`、`/help` | 任何人 | 只有用法說明，不含部署細節 |
+| `/id` | 任何人 | 顯示自己的 ID |
+| `/authorized` | 管理員或授權使用者 | 目前的名單、模式，以及正在使用的檔案 |
+| `/grant <ID>` | 管理員或授權使用者 | 私人聊天：解除封鎖某人。群組中不帶 ID：授權**該群組** |
+| `/revoke <ID>` | 管理員或授權使用者 | 私人聊天：封鎖某人。群組中不帶 ID：移除**該群組**的授權 |
+| `/blocked` | 管理員或授權使用者 | 列出被封鎖的使用者 |
+| `/promote <ID>` | **僅管理員** | 把某人升為管理員 |
+| `/demote <ID>` | **僅管理員** | 移除管理員權限 |
+| `/lockgroup on\|off` | **僅管理員** | 群組模式的開關 |
+| `/cookies` | **僅管理員** | 憑證檔、到期日、錯誤字串 |
+| `/status` | **僅管理員** | 各項上限、授權狀態、執行期設定 |
+| `/cache` | **僅管理員** | 解析快取內容；`/cache clear` 清空 |
+| `/restart` | **僅管理員** | 用一份全新的行程取代正在跑的這一份 |
+
+**解析對所有人開放。** 私人聊天用的是**封鎖名單**：名單為空代表任何人都能解析，把某人加進去只是擋掉他，不會給他原本沒有的東西。群組則刻意維持**允許名單**：公開群組裡的機器人應該只服務「被刻意加進去」的群組，而不是每一個剛好把它拉進去的群組。
+
+| 名單 | 空白 | 有名單 |
+| --- | --- | --- |
+| **私人聊天**（封鎖名單） | 所有人都能解析 | 名單上的人被拒絕，其他人歡迎 |
+| **群組**（允許名單） | 由 `AUTH_GROUP_LOCKED` 決定：全開或全關 | 只有名單上的群組 |
+
+**管理員在兩種模式下都能通行**，所以名單寫錯也不會把操作者鎖在自己的機器人外面。私人聊天不受群組名單與群組模式影響，群組也不受封鎖名單影響——私人聊天沒有群組能替它發言，所以套用使用者規則。`/lock` 已經退役（封鎖名單不是一道閘門，沒有「模式」可選），但仍註冊著並會回答「它被什麼取代」，因為筆記裡還留著 `/lock` 的人一定會輸入它。
+
+**授權整個群組：** 在群組裡打 `/grant`、不帶參數，那個群組就被授權了：其中每個成員都能解析，不必逐一授權。這是實務上的用法，因為聊天 ID 用手找很麻煩。
+
+```
+1. /lockgroup on          → 守門模式；目前沒有任何群組能解析
+2. /grant   （在群組裡）  → 該群組成為唯一能解析的群組
+3. 其他任何群組           → 仍然被拒絕
+```
+
+`/lockgroup on` 在群組名單為空時是**允許**的：它會先擋住所有群組，直到有人被授權為止，回覆也會這樣說。先守門、再到群組裡 `/grant`，是自然的順序；擋掉它反而會擋掉讓這個功能可用的那套流程。管理員隨時可以在私人聊天裡用 `/lockgroup off` 復原，所以沒有任何回不去的狀態。在群組裡 `/revoke` 會移除該群組，名單變空時回覆會提醒「所有群組又都歡迎了」。
+
+三件值得知道的事：**在群組裡管理名單只有管理員能做**（群組授權是在群組裡決定的，如果任何授權使用者都能改，被授權群組裡的任何成員都能改名單）；**管理員到處通行**，包括不在名單上的群組；**私人聊天與群組的規則互不影響**。
+
+**第一個管理員只能來自 `.env`**，因為那時沒有人能授權它：
 
 ```ini
 ADMIN_USER_IDS=123456789
 ```
 
-After that, one restart and the rest is done from Telegram with `/promote`. That is
-the point of the interface: applying an authorization change should not require
-reaching the host.
+之後重啟一次，其餘都在 Telegram 裡用 `/promote` 完成——這就是這個介面的意義：改授權不該需要碰主機。傳 `/id` 可得知自己的數字 ID；**只接受數字 ID，永不接受 `@username`**，因為使用者名稱可以被改掉、被別人重新註冊，記在使用者名稱上的授權遲早會指向另一個人。**`ADMIN_USER_IDS` 空白不代表「所有人都是管理員」**，而是管理指令對所有人關閉並告訴擁有者怎麼開啟；在公開機器人上，相反的預設會把 `/cookies` 交給任何陌生人。
 
-Send `/id` to the bot to learn your own numeric ID. **Only numeric IDs are
-accepted**, never `@username`: a username can be changed and re-registered by
-someone else, so an authorization recorded against one would eventually point at a
-different person.
+名單的變更寫進 `bot.py` 旁邊的 `authorized.json`，重啟後仍然有效，也包含群組聊天 ID（負數，超級群組是 `-100…` 的形式）。`.env` 提供起始值，檔案保存指令改過的部分。檔案損壞或讀不到時會退回 `.env` 的值並在日誌說明，而不是崩潰或默默放寬權限；改動名單的指令也會在聊天裡回報寫入失敗，所以「重啟後會消失的變更」不會看起來像有效的變更。這個檔案已被 gitignore（裡面是真實的使用者 ID）。管理指令不會出現在公開的 Telegram 指令選單裡，管理員與授權使用者則會拿到依自己聊天室範圍的選單。
 
-**An empty `ADMIN_USER_IDS` does not mean "everyone is an admin".** It means the
-admin commands are closed to all, and the owner is told how to enable them. On a
-public bot the opposite default would hand `/cookies` to any stranger, which would
-expose local file paths and credential state.
+### 按鈕
+畫廊結果上的行內按鈕才是實際操作的地方：
 
-### Where the lists live
-Changes are written to `authorized.json` next to `bot.py` and survive restarts,
-including group chat IDs — which are negative, and of the `-100…` form for
-supergroups. `.env` supplies the starting values; the file holds what the commands
-changed.
+| 按鈕 | 做什麼 |
+| --- | --- |
+| `Telegraph · 顯示圖` | 發佈一個嵌入站方 1280px 圖片的 Telegraph 頁面，什麼都不送進聊天室 |
+| `Telegraph · 原圖` | 發佈嵌入全解析度圖片的 Telegraph 頁面 |
+| `歸檔 · 1280` | 下載 1280px 版本，打包成一個 ZIP 送出 |
+| `歸檔 · 原圖` | 下載全解析度版本，打包成一個 ZIP 送出 |
+| `重新生成 Telegraph 頁面` | 重新取得簽章網址並原地更新頁面 |
+| `停止` | 中止進行中的下載 |
+
+按下按鈕之前什麼都不會下載，所以「只是好奇」的連結只花一次 metadata 請求。
+
+### 在 Telegram 群組裡使用
+- 把機器人加進群組。
+- 如果機器人需要看到一般的群組訊息，用 `@BotFather` → `/setprivacy` → 選擇機器人 → `Disable`，然後把機器人移除再重新加入群組。
+- 或者在隱私模式允許的範圍內，由使用者提及／回覆機器人。
+- 除非真的需要管理權限，不要把它設成群組管理員。
+
+**在隱私模式關閉的部署上（`can_read_all_group_messages: True`），Telegram 會送來每一則群組訊息**，包含完全沒有東西可解析的那些。兩條規則讓這件事不至於變成噪音：
+
+- **沒有連結的訊息永不回覆**，無條件。它以前會在「看起來」被叫到時回覆說明文字——例如被 `@` 提及，或有人回覆它自己的訊息——結果被回報成「機器人被別人觸發」：有人回覆機器人先前貼的照片、寫了一句「如此巨乳！」，機器人就用使用說明回答。任何這類猜測都是對意圖的賭注，而猜錯比沉默更糟；`/help` 明確涵蓋了合法情境，而且不會誤觸。
+- **授權檢查在找到連結之後才做。** 以前是先檢查，於是未授權使用者的每一句話都會收到「此機器人目前不允許你的帳號使用」，連「i send no link」這種話也一樣。這就是調整順序要修的誤判。
+
+被拒絕的使用者永遠到不了快取、下載器或 Telegraph：閘門在它們全部之前，回歸測試也會斷言被拒絕的使用者根本不會觸發查詢。**被拒絕的群組則是完全沉默，而不是回一句拒絕**：拒絕訊息在私人聊天裡是有用的答案，在群組裡恰恰相反——它會在別人的對話裡對每一則連結出聲，還向沒在問它的人宣傳自己的存在。這個守衛是 `handle_message` 的第一件事，所以被拒絕的群組連冷卻提示、不支援連結提示、失敗訊息都到不了。
+
+### 請求、冷卻與失敗回覆
+一位使用者同時只能有**一個**請求在跑。第二個會被拒絕並說明現在的情況，第一個一結束就立刻接受。這取代了過去對所有東西（包含按鈕）一律套用的 10 秒冷卻：那個版本會在有人剛完成一個動作、馬上按下第二個時跳出「操作太快了」——明明沒有東西在跑，剩餘冷卻還在倒數——於是它拖慢了真正的工作，卻沒有增加任何保護。「距離上次請求多久」不是重點，「現在有沒有工作在跑」才是。連結保留自己的冷卻，因為貼連結會啟動真正的下載工作，重複張貼才是濫用情境；按鈕不受此限制。
 
 ```ini
-AUTH_FILE=authorized.json
-AUTH_LOCKED=0            # 1 to start with private chats gated
-AUTH_GROUP_LOCKED=0      # 1 to start with groups gated
+USER_COOLDOWN_SECONDS=10   # 只針對連結
+REQUEST_STALE_SECONDS=1800 # 請求沒釋放名額就卡死時，回收它
 ```
 
-A corrupt or unreadable file falls back to the `.env` values and says so in the
-log, rather than crashing or silently widening access. Every command that changes a
-list reports a failed write in chat, so a change that will not survive a restart
-does not look like one that will.
+名額一定會被釋放（包含工作拋出例外），而卡死上限意味著任何當機都不會永久鎖住一位使用者。
 
-The file is gitignored: it holds real user IDs.
-
-Administrator commands are left out of the published Telegram command menu, so the
-menu does not advertise what a visitor cannot use. Administrators and authorized
-users get a menu scoped to their own chat, which is how they discover the
-management commands.
-
-### Failure replies are one short line
-A failure says what happened in a single sentence and nothing more:
+**失敗回覆只有一行**，技術診斷——憑證狀態、`bot.py --check --live` 指令列、例外類型——**寫進日誌而不是聊天室**：
 
 ```
 取不到連結內容，可能是平台限制，請稍後再試。
@@ -142,468 +342,64 @@ A failure says what happened in a single sentence and nothing more:
 原始連結：https://x.com/...
 ```
 
-The technical diagnosis — credential state, the `bot.py --check --live` command
-line, the exception type — is **written to the log instead of the chat**. It used
-to be appended to the reply when an administrator asked, which meant an operator
-saw a paragraph of shell commands in the middle of a conversation. The information
-is not lost: it is in the console log and in `restart.log`, and `/cookies` reports
-the credential state on demand.
+以前這些會在使用者要求時附加在回覆裡，結果操作者在對話中間看到一整段 shell 指令。資訊沒有消失：它在主控台日誌與 `restart.log` 裡，`/cookies` 也能隨時回報憑證狀態。`@BotFather` 的隱私模式步驟刻意**不出現在任何聊天回覆裡**，因為那是部署細節。
 
-A successful parse posts only its result, with no accompanying explanation.
-
-The `@BotFather` privacy-mode step is deliberately **not** in any chat reply —
-it is deployment detail. See *Using it in Telegram groups* below.
-
-### /restart
-Restarts the bot without host access, which is the point: applying a change to
-`.env` or to a credential file otherwise means reaching the machine. It is
-administrator only, because it briefly takes the bot offline.
-
-What it does:
-
-1. Starts a second copy of `bot.py`, **detached** so it does not belong to the
-   console that started the current one. The copy waits a few seconds before it
-   starts polling, so it does not race the process it is replacing for Telegram's
-   `getUpdates` lock.
-2. Replies with the new process's PID and the log path.
-3. Stops polling after a short delay, letting that reply reach Telegram first and
-   allowing the in-flight update to finish.
-
-The new copy writes to `restart.log` next to `bot.py`, so read that if the bot does
-not come back. A failed spawn is reported in the chat and **the current process
-keeps running** — a restart that cannot happen must not look like one that did.
-
-```ini
-RESTART_STARTUP_DELAY=6      # seconds a replacement waits before polling
-RESTART_LOG_MAX_MB=2         # restart.log is rotated past this size
-```
-
-Two failure modes were hit while building this, both fixed and both worth
-remembering:
-
-- **`stop_running()` was called from the wrong thread, so it did nothing.** The
-  first version ran the shutdown on a worker thread, but
-  `Application.stop_running()` is implemented as
-  `asyncio.get_running_loop().stop()` — and a worker thread has no running loop, so
-  it raised `RuntimeError` and the old process kept polling. The replacement then
-  died with *Conflict: terminated by other getUpdates request*, and the bot was left
-  **offline**. The request is now handed to the loop with `call_soon_threadsafe`.
-  The exception is also no longer swallowed silently, since a bare `except` was the
-  only reason this was hard to see.
-- **Two pollers on one token are fatal to the new one.** Telegram answers the second
-  `getUpdates` with *Conflict: terminated by other getUpdates request*. Even with the
-  shutdown fixed, the replacement can reach polling in the moment before the old
-  process releases the lock, so the replacement now **waits before it starts
-  polling** (`RESTART_STARTUP_DELAY`). That removes the race rather than relying on
-  the new process surviving it.
-- **The replacement inherited the parent's stdout pipe.** On Windows the default is
-  `close_fds=False`, so the new process held every inheritable handle — including
-  the stdout pipe of whatever started the bot. Any launcher capturing that pipe
-  (`subprocess.run(..., capture_output=True)`, a service wrapper, a CI step) then
-  blocked forever waiting for an EOF that could not arrive while the bot lived.
-  The spawn now passes `close_fds=True`.
-- **`restart.log` was written in the machine's code page**, so the file the reply
-  tells the operator to read was mojibake. The spawn now forces
-  `PYTHONIOENCODING=utf-8`, and the file is rotated past `RESTART_LOG_MAX_MB` so a
-  bot that restarts occasionally does not grow it without limit.
-
-There is a real process test for this in `test_bot_features.py` (section 1ab): it
-starts a child process using the same `schedule_restart`, and requires that the
-child **exits on its own**, that a replacement is spawned, and that the replacement
-reaches polling without a `Conflict`. A restart that leaves no bot running is the
-failure that matters, and only a real process can catch it.
-
-`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` is used rather
-than `DETACHED_PROCESS` alone: with no console at all, any accidental `print` in the
-new process would fail on a binary file handle, whereas `CREATE_NO_WINDOW` gives it
-a console that simply is not shown.
-
-## Cleaning up the chat
-Once a request succeeds the bot removes the clutter it created:
-
-- the **"正在解析…" notice**, and
-- the **original message that carried the link**.
-
-Both are controlled in `.env`:
-
-```ini
-DELETE_STATUS_MESSAGE=1
-DELETE_SOURCE_MESSAGE=1
-```
-
-Set either to `0` to keep that message.
-
-**In a group, deleting someone else's message requires the bot to be an
-administrator with the _Delete messages_ right.** Without it Telegram refuses the
-delete, the bot logs a single warning, and only its own notice is removed — the
-request still succeeds, and the parsed result is unaffected. In a private chat no
-special right is needed.
-
-Nothing is deleted when a request **fails**: the status message is then the only
-explanation the user has, and the source link is their only reference.
-
-## Features
-- **X/Twitter, Pixiv and e-hentai links only.** Links on any other site are never
-  downloaded or fetched, so the bot cannot be used as a general-purpose link
-  fetcher.
-- **Pixiv artwork is sent as the original image files** — no ZIP, no recompression,
-  no downscaling. Multi-page works arrive as albums.
-- **e-hentai galleries become Telegraph articles** with the gallery's facts and
-  every tag grouped by namespace, delivered as a single chat message with the cover
-  as the message body.
-- X/Twitter images and videos sent back to Telegram.
-- Telegram invite links (`t.me/+...`, `t.me/joinchat/...`) identified separately.
-- Public Telegram links are recognized but not falsely labeled as groups because they can point to a group, channel, user or bot.
-- Cooldown on links, download timeout, concurrent download limit, per-file size limit.
-- One request per user at a time, refused only while one is actually running.
-- Optional user allowlist and per-site login cookies.
-- Administrator-only `/cookies`, `/status` and `/restart`; the bot is safe to run in
-  a public group.
-
-## How a message is routed
-| Message contains | What the bot does |
-| --- | --- |
-| An `x.com` / `twitter.com` artwork link | Downloads the media; images go back as an album of photos |
-| A `pixiv.net` artwork link | Downloads the artwork and sends the **original files** as albums |
-| An `e-hentai.org` / `exhentai.org` gallery link | Shows the gallery's facts and tags, plus four action buttons |
-| A link on any other site | Replies with `SUPPORTED_SITES_NOTICE`; nothing is fetched |
-| A `t.me` invite/public link | Explains that it does not join or classify it |
-| Several links in one message | An X/Twitter or Pixiv artwork link wins; then a gallery link |
-
-The source link (`原始連結：<url>`) is attached to every result. Disable it with
-`ATTACH_SOURCE_LINK=0`.
-
-To answer unsupported links with a different message, or to stay silent instead
-(which suits a busy public group):
+**不支援的連結預設沉默**（`REPLY_UNSUPPORTED_LINKS=0`）：公開群組裡對每一則無法解析的連結都回話，只是在沒被邀請的對話裡製造噪音。想換成別的訊息，或想在看連結是真的不支援、還是被誤判時打開它：
 
 ```ini
 SUPPORTED_SITES_NOTICE=目前只支援 X/Twitter、Pixiv 與 e-hentai 連結。
 REPLY_UNSUPPORTED_LINKS=1
 ```
 
-## e-hentai galleries → Telegraph
-Send a gallery link such as `https://e-hentai.org/g/3672745/82d9d6d00e/` and the
-bot replies with the gallery's facts and every tag grouped by its namespace —
-Language, Artist, Group, Parody, Character, Female, Male and so on — plus four
-buttons:
+沉默之所以安全，是因為**分類照樣會跑**：不是貼文的 X 連結仍會在啟動下載器之前被辨識並丟掉，否則「沉默」會變成等三分鐘然後什麼都沒聽到。
 
-| Button | What it does |
-| --- | --- |
-| Telegraph · 顯示圖 | Publishes a Telegraph page embedding the site's 1280px images. Nothing is sent to the chat |
-| Telegraph · 原圖 | Publishes a Telegraph page embedding the full-resolution images |
-| 歸檔 · 1280 | Downloads the 1280px set and sends it as one ZIP |
-| 歸檔 · 原圖 | Downloads the full-resolution set and sends it as one ZIP |
+### /restart
+不需要碰主機就能重啟，這正是重點：否則改 `.env` 或換憑證檔都得去碰機器。它只給管理員用，因為它會讓機器人短暫離線。
 
-Nothing is downloaded until a button is pressed, so a link you are only curious
-about costs one metadata request.
+1. 啟動 `bot.py` 的第二份副本，**分離**執行，不屬於啟動目前這份的控制台。副本會先等幾秒才開始 polling，免得跟它要取代的行程搶 Telegram 的 `getUpdates` 鎖。
+2. 回覆新行程的 PID 與日誌路徑。
+3. 短暫延遲後停止 polling，讓那則回覆先送達 Telegram，也讓進行中的更新跑完。
 
-### Layout: the source link is the first item's caption
-**Only X/Twitter carries the source link. Pixiv sends the images alone.** Requested
-explicitly, and it is a per-call option (`attach_link`) rather than a global, because
-the two platforms are configured differently.
-
-X/Twitter — the link is the **first item's caption**, so it reads above the images:
-
-```
-[ 原始連結：https://x.com/pohitashi/status/... ]   ← caption on item 0
-[ 相簿：page0 · page1 · page2 ]
-```
-
-Pixiv — no caption at all:
-
-```
-[ 相簿：page0 · page1 · page2 ]
-```
-
-The layouts that were tried, and why this one:
-
-| Approach | Where the link lands | Cost |
-| --- | --- | --- |
-| Caption on the first item | **above** the images | one message |
-| A separate message | above the album | **two** messages |
-| A url button alone | below the images | one message |
-| Caption **and** button | above, then again below | one message, **link shown twice** |
-
-**The url button is no longer attached.** It was introduced when the link could only be
-a caption drawn against the media, so it acted as the guaranteed-reachable copy. With
-the link in the caption on a message that itself survives cleanup, a button pointing at
-the same address printed the link a second time — reported as redundant.
-`build_source_keyboard` is kept and documented as intentionally unused, because it is
-the only place that keyboard exists and reattaching it should be a one-line change if a
-client is ever found to render the caption somewhere unreachable. Reattaching it
-**without** removing the caption link would restore the duplication.
-
-**Only the first item is captioned.** Telegram rejects a media group in which every
-item has one, and one link is what is wanted anyway.
-
-**The position is Telegram's to decide, not ours.** An album caption is drawn by the
-client *against the media*, which is why an earlier attempt landed the link in the
-middle of the set when it was attached to a later item. Anchoring it to the first item
-is the best that can be done from here.
-
-The caption goes on the **first album only**, so a 30-page work does not carry the same
-link on all three of its messages. A separate text message is now only a fallback for
-the case where nothing was sent at all.
-
-**The cached replay follows the same split.** `send_cached_media` passes
-`attach_link=(platform != "pixiv")`, so a repeat of a cached Pixiv link does not grow a
-link that the original send did not have.
-
-### One message per request, with the cover in it
-The gallery's cover becomes the body of the reply, so the result is **one message**:
-the cover photo with the gallery's facts, tags and page link as its caption.
-
-It is done by *editing the message the bot already sent*, not by posting a second
-one. Posting the cover separately made every reply arrive as two messages, which
-read as the bot repeating itself for no reason.
-
-The image is referenced **by URL**, so Telegram fetches it and the bot downloads no
-bytes for it. It uses e-hentai's static thumbnail host (`ehgt.org`) rather than the
-time-limited `hath.network` links the page images use, so a cover posted in the chat
-keeps working.
-
-A missing thumbnail is not an error: the same message falls back to text and the
-request carries on, because refusing to deliver a gallery over a missing cover would
-be the wrong trade. The 重新生成 button is attached in both cases — `edit_media`
-replacing the message body would otherwise drop it.
-
-### The Telegraph page does not repeat the cover
-The page is the title, the facts, the tags grouped by namespace, then the page
-images. The cover is left out: it is already in the chat message, and putting it at
-the top of the page spent content budget the actual pages need.
-
-### Tag values are stripped of wiki notes
-e-hentai attaches a wiki annotation to some tags, which used to render as
-`japanese | definition revised please read the wiki`. That is site boilerplate
-rather than part of the tag, so it is removed before display and translation.
-
-### Nothing is parsed twice
-A link that has already been parsed is served from a cache, so a repeat costs no
-download and no requests. Measured on a 5-page gallery: **1.93s → 0.02s**, because
-the per-page viewer sweep is skipped entirely.
-
-Two things are cached, because the expensive work differs:
-
-| Kind | Cached | The saving |
-| --- | --- | --- |
-| e-hentai | the gallery's facts and the image URLs from the viewer sweep | the sweep is one request per page — about a minute on a 53-page gallery |
-| media | the downloaded files themselves, copied aside | no download and no gallery-dl run at all |
-
-Verified on a repeat request through the real handler:
-
-```
-first request    viewer sweep 1.93s
-second request   cache hit    0.02s
-```
-
-For Pixiv and X the same applies to the files themselves:
-
-```
-first request    2.09s   Pixiv 解析完成，已傳送原圖 2/2 個檔案。
-second request   0.01s   已從快取傳送 2/2 個檔案。
-```
-
-**A cached result is not subject to the link cooldown.** That cooldown exists to stop
-repeated *download* work, which a cache hit does none of; applying it would make a
-repeat wait ten seconds for an answer already on disk — the one case where waiting
-is pure loss. The cooldown still applies when nothing is cached.
-
-**A cached result cleans up the chat exactly as a download does.** Both the progress
-notice and the link message are removed, and the delivered files stay. Serving from
-the cache without that cleanup left two extra messages behind, so a cache hit
-produced *more* clutter than a fresh download — the opposite of the point.
-
-The send uses a **scratch** directory, never the cache: the sender writes downscaled
-copies for oversized images, and pointing that at the cache directory would let it
-overwrite the files being cached.
-
-What is deliberately **not** cached is a failure. A link that failed is retried,
-because the usual cause is transient or a credential the operator has since fixed;
-caching it would make one bad moment permanent.
-
-**There is deliberately no `gallery-dl --download-archive`.** It looks like a
-natural backstop for the cache, but it conflicts with the per-request output
-directory: the archive records that a file has been downloaded and gallery-dl then
-skips it, while each request asks for a *fresh* temp directory. On a repeat it
-therefore wrote nothing at all, and the bot reported "沒有找到可傳送的圖片或影片"
-for a link it had just delivered. Reusing a previous parse is the result cache's
-job, and when the cache misses a re-download is the correct behaviour.
-
-**Cached image URLs still expire.** e-hentai's image links are time-limited, so the
-cached sweep is only good for a while; the entry expires on its own, and
-重新生成 Telegraph 頁面 is the supported way to refresh a page whose images have
-stopped loading. A regenerate deliberately ignores the cache and writes the fresh
-URLs back.
+新副本會寫入 `bot.py` 旁邊的 `restart.log`，機器人沒回來就讀那個檔。啟動失敗會在聊天裡回報，而且**目前這個行程會繼續跑**——一場沒發生的重啟，不能看起來像發生過。
 
 ```ini
-CACHE_FILE=parse_cache.json
-CACHE_DIR=.cache
-CACHE_STALE_SECONDS=1209600   # 14 days
-CACHE_MAX_ENTRIES=300
+RESTART_STARTUP_DELAY=6      # 替代行程開始 polling 前等待的秒數（上限）
+RESTART_LOG_MAX_MB=2         # restart.log 超過這個大小就輪替
 ```
 
-The cache is bounded on both axes and prunes the oldest entries first, removing
-their files as well — an entry dropped without its files would leak disk space that
-nothing references. A corrupt cache file is discarded rather than fatal, since a
-cache is an optimisation and losing it costs time only. A **partially** present file
-set is treated as no cache at all, because sending half an artwork as though it were
-the whole thing is worse than downloading it again.
+實作上踩到的四個失敗模式（`stop_running()` 在錯的執行緒被呼叫、兩個 poller 搶同一個 token、子行程繼承 stdout 管線導致啟動器永遠等不到 EOF、`restart.log` 用系統代碼頁寫成亂碼），以及「重啟後沒有視窗」、「每次啟動都等六秒」兩個症狀，完整記錄在 [docs/NOTES.md](docs/NOTES.md)。
 
-`/cache` shows the contents, the hit/miss counters and the disk usage; `/cache clear`
-empties it. Both are administrator only.
+## e-hentai 畫廊 → Telegraph
 
-### The Telegraph actions post a page, not images
-The gallery pages are already visible on the Telegraph page, so that set is **not**
-also posted into the chat — that only duplicated the gallery and made the result
-look redundant. The reply is one message: the cover, the gallery's facts and tags,
-the page link, and a **重新生成 Telegraph 頁面** button:
+貼上像 `https://e-hentai.org/g/3672745/82d9d6d00e/` 這樣的連結，機器人會回覆畫廊資料與依命名空間分組的每個標籤（Language、Artist、Group、Parody、Character、Female、Male 等等），加上上面那四個動作按鈕（`Telegraph · 顯示圖`、`Telegraph · 原圖`、`歸檔 · 1280`、`歸檔 · 原圖`）。按鈕按下之前什麼都不下載，所以只是好奇的連結只花一次 metadata 請求。
 
-```
-📚 [umeckiti] Hanazono Yurine
-分類 Artist CG　語言 Japanese　評分 3.00　5 頁　7.2 MiB
-• 語言 / Language：日文（japanese）
-• 原作 / Parody：jashin-chan dropkick
-• 女性 / Female：眼罩（eyepatch）, 哥德蘿莉（gothic lolita）, 雙馬尾（twintails）
+一次 HTTP GET 就能取回標題（英文與日文）、分類、語言、評分、頁數、大小、日期、收藏數、封面與完整標籤清單，約 **1.4 秒**。這是在 53 頁畫廊上實測各種替代方案之後選的：`gallery-dl -j` 要 **275 秒**（加上 `metadata: true` 也要 **265 秒**），而它的 `source: metadata` 模式雖然只要 1.4 秒，卻**沒有**分類名稱、沒有語言、標籤還是扁平的 `namespace:tag` 字串。完整量測表在 [docs/NOTES.md](docs/NOTES.md)。
 
-📄 Telegraph（內嵌 5 頁圖片）：https://telegra.ph/...
-（成人內容，Telegraph 頁面可能被移除）
-```
+解析用的正規表示式每一個都對真實的 HTML 驗證過，因為「看起來很明顯」的模式會默默比對到錯的東西：封面藏在行內 background style 裡（頁面第一個 `<img>` 是評分圖），而 `<div id="taglist">` 並沒有直接包含那些 `<tr>` 列。
 
-There is no extra line pointing at the archive mode; the buttons are already on
-screen, so saying so again was noise.
+### 一次請求一則訊息，封面就在裡面
+畫廊封面會變成回覆的本體，結果是**一則訊息**：封面照片，畫廊資料、標籤與頁面連結都是它的說明文字。做法是**編輯機器人已經送出的那則訊息**，而不是再貼一則——把封面另外貼出去會讓每個回覆都變成兩則訊息，讀起來像機器人無緣無故重複自己。
 
-To obtain the actual files, use one of the **歸檔** actions. They are the only
-paths that download and deliver image bytes.
+圖片以**網址**引用，所以是 Telegram 自己去抓，機器人不為它下載任何位元組。它用的是 e-hentai 的靜態縮圖主機（`ehgt.org`），而不是頁面圖片那種有時效的 `hath.network` 連結，所以貼在聊天室裡的封面會一直有效。縮圖不見了不算錯誤：同一則訊息會退回純文字，請求照樣繼續——為了一張封面而拒絕送出整個畫廊，是錯的取捨。兩種情況下都會附上 `重新生成` 按鈕，因為 `edit_media` 換掉訊息本體時會把它弄掉。
 
-This also removed a whole phase: the Telegraph actions no longer download the
-gallery at all, because Telegraph fetches every embedded image itself. They only
-read image URLs, which is one request per page.
+**只有 X/Twitter 會帶來源連結，Pixiv 只送圖片。** 這是明確要求的，而且是每次呼叫的選項（`attach_link`）而不是全域設定，因為兩個平台的設定不同。連結放在第一張的說明文字，所以會顯示在圖片上方，而且只替第一張加說明：Telegram 不接受媒體群組裡每一張都有說明，而且本來就只需要一個連結。**位置由 Telegram 決定，不是我們**——相簿的說明文字是客戶端「對著媒體」畫的，早先把連結掛在後面幾張時，它會落在整組中間（比較與取捨見 NOTES）。
 
-The two Telegraph actions still differ meaningfully — Telegraph loads whatever is
-embedded, so 顯示圖 is a light page (about 0.14 MB a page) and 原圖 a heavy one
-(about 10 MB a page).
+**Telegraph 頁面不會重複封面**：頁面是標題、資料、依命名空間分組的標籤，然後是頁面圖片。封面被略過——它已經在聊天訊息裡，放在頁面頂端只是花掉真正頁面需要的內容額度。
 
-### Tags are shown in Traditional Chinese
-Tag names are rendered as Traditional Chinese (Taiwan) with the original English
-beside them, so nothing is lost if a translation is unfamiliar:
+### 標籤顯示繁體中文
+標籤名稱以繁體中文（台灣）呈現，旁邊保留原始英文，所以遇到不熟的翻譯也不會遺失資訊：
 
 ```
 • 女性 / Female：眼罩（eyepatch）, 哥德蘿莉（gothic lolita）, 雙馬尾（twintails）
 • 其他 / Other：差分集（variant set）
 ```
 
-Proper nouns — artist, group, character and parody names — have no Chinese form
-and are shown alone instead of being repeated: `momozu komamochi`, not
-`momozu komamochi（momozu komamochi）`.
+專有名稱——作者、社團、角色與原作名——沒有中文形式，所以直接顯示而不重複：`momozu komamochi`，不是 `momozu komamochi（momozu komamochi）`。
 
-The table lives in `tag_translations.py` as committed data (about 380 entries),
-not fetched at runtime, so rendering a gallery never depends on a second network
-service. Add an entry there to extend it; unknown tags pass through unchanged
-rather than disappearing.
+對照表在 `tag_translations.py`，是提交進版控的資料（約 380 筆），不是執行時抓的，所以畫一個畫廊永遠不需要第二個網路服務。要擴充就在那裡加一筆；不認得的標籤會原樣通過，而不是消失。e-hentai 會替某些標籤加上 wiki 註記（以前會顯示成 `japanese | definition revised please read the wiki`）——那是站方樣板而不是標籤的一部分，所以在顯示與翻譯之前就被移除。
 
-### The 停止 button stops both kinds of download
-There are two mechanisms, because the download has two shapes:
-
-| Download | How stopping works |
-| --- | --- |
-| gallery-dl (the fallback) | a child process, killed |
-| The parallel fetch | threads **inside this process** — no process to kill, so a flag |
-
-The parallel fetch is the normal path for every mode, including 歸檔. It cannot be
-killed, so stopping is a shared flag the workers read: they check it before each
-request and again after the response comes back, and a result that arrives after the
-stop is discarded rather than written.
-
-This was **broken** when the parallel fetch was introduced. Only the flag was passed
-and nothing registered it, so `stop_running_download` found no entry and answered
-「目前沒有進行中的下載」 while the download ran to completion — the button worked only
-for gallery-dl, which registered a real subprocess. A process-less stop is now its own
-case (`process is None`): the flag is set and no kill is attempted.
-
-The per-request timeout is 30s rather than 120s for the same reason — a request already
-in flight cannot be interrupted, so this bounds how long the button takes to take
-effect on the workers that are mid-download.
-
-**The 補齊缺少的頁面 fallback needed its own fixes.** It runs a child process, so the
-button kills it — but two faults made that pointless:
-
-- There was no stop check **after** the fallback, so the download was reported as
-  completed and the archive was packaged and sent anyway.
-- `download_gallery_media` called `stop_event.clear()` on entry. That dates from when
-  each request spawned its own gallery-dl run and a leftover flag had to be discarded;
-  now the flag is created per request and shared across its phases, so clearing it
-  erased a stop that arrived **between** phases and the fallback ran to completion.
-
-The flag is no longer cleared anywhere, the result is re-checked after the fallback,
-and packaging honours a stop too — a large gallery takes real time to zip while the
-button is still on screen.
-
-A regression test drives the fallback with a fake child process that dies when killed,
-and asserts the process is killed, the result is reported not-completed, a stop pressed
-between phases skips the fallback, and entering the fallback does not clear the flag.
-
-A regression test starts a local HTTP server, runs a 60-page download, presses stop
-from the progress callback, and asserts that most pages were never fetched and that
-the files already written are kept.
-
-### Why 補齊缺少的頁面 used to appear, and what replaced it
-That step is gallery-dl filling gaps after a parallel download came up short. It
-exists because gallery-dl re-signs pages itself, but it is **serial** (3-6 s per
-request), so reaching it is a big slowdown — and the usual cause was not a flaky
-fetch at all.
-
-e-hentai serves page images from **signed, time-limited URLs**, while the cache entry
-carrying them lives **14 days**. A cached sweep that outlives its signature fails for
-**every page at once**:
-
-```
-CACHE_STALE_SECONDS      1209600  (14 days)
-signed URL lifetime      hours
-```
-
-So there are now three escalating steps, and the cheap one comes first:
-
-| Step | Mechanism | Cost |
-| --- | --- | --- |
-| 1 | Cached sweep older than `GALLERY_URL_TTL_SECONDS` is **re-swept** | one parallel sweep |
-| 2 | A short download retries **once with fresh URLs** | one parallel pass |
-| 3 | gallery-dl, only if pages are still missing | serial, minutes |
-
-```ini
-GALLERY_URL_TTL_SECONDS=7200   # 2h: how long a cached URL list is trusted
-```
-
-A stop is not treated as a short download: a cancelled fetch returns without
-refreshing and without starting gallery-dl.
-
-### Page downloads are parallel where pages are still downloaded
-The **歸檔** modes no longer download pages at all — they fetch e-hentai's official
-archive (see below). The Telegraph modes collect URLs only, so pages are fetched in
-parallel by the page-download path that remains available for a gallery whose official
-archive cannot be produced.
-
-That path used to run gallery-dl while the Telegraph modes used a parallel fetch, so
-the same pages were slow in one place and fast in the other. Measured on a 5-page
-gallery:
-
-| Path | Time |
-| --- | --- |
-| gallery-dl, the old route | **27.7s** |
-| parallel fetch | **2.9s** |
-
-The download phase alone is therefore about **9x faster**, and the page-URL sweep is
-cached, so a gallery already looked at skips it entirely. Nothing is downloaded twice
-either: the sweep is stored with the gallery, so whichever action runs first pays for
-it and the other reuses it.
-
-```ini
-EHENTAI_DOWNLOAD_WORKERS=6     # parallel image downloads
-EHENTAI_VIEWER_WORKERS=6       # parallel viewer-page requests
-```
-
-### Download progress is shown as a percentage
-Both slow phases update the status message while they run, with a bar, a
-percentage and a page count:
+### 進度與「停止」
+兩個慢階段都會在執行中更新狀態訊息，附長條圖、百分比與頁數：
 
 ```
 正在下載 5 頁圖片……
@@ -611,7 +407,7 @@ percentage and a page count:
 （可按「停止」中止）
 ```
 
-A real 5-page download, one update per completed page:
+實測 5 頁下載，每完成一頁更新一次：
 
 ```
   5.5s  ██░░░░░░░░ 20% (1/5)
@@ -621,1985 +417,275 @@ A real 5-page download, one update per completed page:
  27.2s  ██████████ 100% (5/5)
 ```
 
-The collection phase — reading one viewer page per gallery page — has its own bar,
-because on a 53-page gallery that step alone takes about a minute.
+收集階段——每頁讀一個 viewer 頁面——有自己的進度條，因為在 53 頁的畫廊上光這一步就要約一分鐘。更新被節流成每 1.5 秒一次編輯，因為 Telegram 對訊息編輯有速率限制；最後狀態一定會寫入，所以訊息永遠不會停在 99%。
 
-How it works: `--Print 'file:<marker>'` makes gallery-dl emit one line per
-completed file *while still downloading*, so counting those lines gives a real
-page count instead of guessing from log wording. Updates are throttled to one edit
-every 1.5 seconds, because Telegram rate-limits message edits; the final state is
-always written, so the message never stops short of 100%.
+下載期間，進度訊息上會有**停止**按鈕。下載一個大畫廊的每一頁原圖要幾分鐘、搬幾百 MB，所以一定要能取消：
 
-Two traps worth recording, since both were hit while building this:
+- 停止會殺掉 gallery-dl 子行程並回報「已停止下載」，不是失敗。（被殺的行程以非零結束，所以取消旗標要在結束碼之前檢查，否則刻意的停止會變成一個訊息空白的下載錯誤。）
+- 在壓縮檔建好之前取消，就不會送出壓縮檔。打包*之後*才停止會留下不完整的壓縮檔，所以請在下載階段停止，而不是傳送途中。
+- 註冊表以聊天室為鍵，所以在一個聊天室按停止不會殺掉另一個聊天室的下載；部分檔案留在該請求的暫存目錄裡，跟著它一起刪除。
 
-- `subprocess.run` cannot be interrupted, so the downloader runs under `Popen`
-  with a line-reader thread to stream progress. `--Print` (capital P) is required
-  rather than `--print`, and its format string must contain a space, because
-  gallery-dl wraps a bare token in braces and then resolves it as a field name.
-- `asyncio.wait_for(queue.get(), timeout=...)` cancels the getter on every
-  timeout, and a queue whose getter keeps being cancelled stops waking reliably —
-  the message then sat unchanged until the download finished. Polling and draining
-  the queue has no cancellation to corrupt.
+停止有兩種機制，因為下載有兩種形狀：gallery-dl（子行程，殺掉）與平行抓取（**本行程內的執行緒**，沒有行程可殺，所以用旗標）。平行抓取是每個模式的正常路徑，包含 `歸檔`；worker 在每次請求前後各檢查一次旗標，停止之後才到的結果會被丟棄而不是寫入。
 
-### A "停止" button interrupts a long download
-While a download runs, the progress message carries a **停止** button. Downloading
-every original page of a large gallery takes minutes and moves hundreds of
-megabytes, so cancelling must be possible.
+### 歸檔用 e-hentai 的官方壓縮檔
+`歸檔` 不再自己建壓縮檔，而是向 e-hentai 的 archiver 要它自己發佈的 ZIP。這既更準確、也少做很多事：**完全不下載任何一頁**——一個 POST 取回壓縮檔網址，一個串流的 GET 送出檔案，檔名是 e-hentai 自己的（`(C106) [circle] title [中国翻訳]-1280x.zip`）。
 
-- Stopping kills the gallery-dl child process and reports **"已停止下載"**, not a
-  failure. (A killed process exits non-zero, so the cancellation flag is checked
-  before the exit status — otherwise a deliberate stop would surface as a
-  download error with an empty message.)
-- Cancelling before the archives are built means no archive is sent. A download
-  stopped *after* packing leaves an incomplete archive, so stop during the
-  download phase rather than mid-send.
-- The registry is keyed by chat, so pressing stop in one chat cannot kill another
-  chat's download.
-- Partial files stay in the request's temporary directory and are removed with it.
-
-
-Measured sizes on a real gallery: the 1280px image is about **0.14 MB** a page
-(1280x1791) and the original about **10 MB** a page (2518x3524), so the two
-"原圖" actions are far heavier than they look.
-
-### 歸檔 uses e-hentai's OFFICIAL archive
-The **歸檔** modes no longer build an archive. They ask e-hentai's archiver for the ZIP
-e-hentai itself publishes, which is both more accurate and far less work: **no page is
-downloaded at all** — one POST returns the archive URL, one streamed GET delivers the
-file, and the filename is e-hentai's own (`(C106) [circle] title [中国翻訳]-1280x.zip`).
-
-The flow has three steps, and every one is required:
-
-| Step | Request | Result |
+| 步驟 | 請求 | 結果 |
 | --- | --- | --- |
-| 1 | `POST archiver.php` with `dltype=org` or `res` | a page saying the file is being prepared |
-| 2 | GET the `hath.network/archive/...` link from it | **HTML**, not the file — a waiting page |
-| 3 | the same URL with **`?start=1`** | the ZIP, with `Content-Disposition` naming it |
+| 1 | `POST archiver.php`，帶 `dltype=org` 或 `res` | 一個說「檔案正在準備」的頁面 |
+| 2 | GET 其中 `hath.network/archive/...` 的連結 | **HTML**，不是檔案——一個等待頁 |
+| 3 | 同一網址加上 **`?start=1`** | ZIP，並由 `Content-Disposition` 命名 |
 
-Step 2 is the trap: that URL returns HTML, so treating it as the download yields a
-16-byte "file". A ranged `GET` (`Range: bytes=0-3`) reads the real filename and total
-size without pulling the whole archive.
+第 2 步是陷阱：那個網址回的是 HTML，把它當成檔案下載會得到 16 位元組的「檔案」。用範圍請求（`Range: bytes=0-3`）讀出真正的檔名與總大小，不必拉下整個壓縮檔。**同一頁上的 H@H 下載器刻意不用**——它需要一個正在跑的 H@H 客戶端，否則只會回答 *"Your H@H client appears to be offline."*。
 
-**The H@H downloader on the same page is deliberately unused** — it requires a running
-H@H client and otherwise answers *"Your H@H client appears to be offline."*
-
-| Option | `dltype` | Measured size | Telegram |
+| 選項 | `dltype` | 實測大小 | Telegram |
 | --- | --- | --- | --- |
-| 歸檔 · 原圖 | `org` | **148.2 MiB** | ❌ over the 50 MB bot limit |
-| 歸檔 · 1280 | `res` | **3.2 MiB** | ✅ |
+| `歸檔 · 原圖` | `org` | **148.2 MiB** | ❌ 超過 50 MB 的機器人上限 |
+| `歸檔 · 1280` | `res` | **3.2 MiB** | ✅ |
 
-The size is reported before the attempt and the upload is still tried, so the answer
-comes from Telegram rather than from a local refusal:
+大小會在嘗試前先回報，而且仍然會試著上傳，所以答案是 Telegram 給的，而不是本機自己拒絕：
 
 ```
 官方歸檔 148.2 MB，超過 Telegram 的 45MB 建議上限，仍嘗試傳送……
 ```
 
-If the upload is refused, the reply says so and points at **歸檔 · 1280**, which is the
-resample and normally fits.
+上傳被拒絕時，回覆會說明並指向 `歸檔 · 1280`（降取樣版本，通常裝得下）。壓縮檔是**串流寫到磁碟**，絕不整份放進記憶體：原圖常常超過 100 MB，先讀進記憶體再交給 Telegram 既浪費又可能耗盡；同一個 `停止` 按鈕也能中止傳輸。官方檔名帶著畫廊標題，裡面會有 Windows 路徑不允許的字元（`:`、`?`、`|`），所以使用前會消毒：路徑分隔符被中和、保留裝置名（`CON`、`NUL`、`COM1`）被避開、過長的名字被縮短。
 
-The archive is **streamed to disk**, never buffered: the original is routinely over
-100 MB, so reading it into memory before handing it to Telegram would be wasteful and
-could exhaust it. The same 停止 button ends the transfer.
+### ⚠️ Telegraph 圖片連結會過期
+Telegraph 是靠**去抓圖片的網址**來嵌入圖片，而 e-hentai 提供的網址（`*.hath.network`）是**有時效、且綁定登入 session** 的。所以今天建好的 Telegraph 頁面，過幾天可能就圖片全壞。標籤與畫廊資料那幾段是靜態 HTML，永遠正確。
 
-The official filename carries the gallery title, which contains characters Windows
-forbids in a path (`:`, `?`, `|`), so it is sanitised before use — path separators are
-neutralised, reserved device names (`CON`, `NUL`, `COM1`) avoided, and overlong names
-shortened.
+要永久保存就用歸檔動作（那些送的是真正的檔案），或者在設定好 R2 的情況下改用 R2——物件網址不會過期。要重建頁面，`重新生成 Telegraph 頁面` 按鈕會替同一個畫廊取得重新簽章的網址、發佈新頁面並原地取代舊訊息；按鈕依聊天室與使用者記住，所以一個人不能重建別人的頁面，更早的 session 留下來的過期按鈕會被拒絕，而不是用猜的。
 
-### The gallery page is the data source
-One HTTP GET returns the title (English and Japanese), category, language,
-rating, page count, size, date, favourites, cover and the full tag list in about
-1.4 seconds. That was chosen after measuring the alternatives on a 53-page
-gallery:
+**為什麼不乾脆把圖片永久代管**——實測結果：`catbox.moe` 回 `412 Invalid uploader`、`0x0.st` 已停用上傳、`uguu.se` 3 小時後刪檔、`tmpfiles.org` 1 小時。這裡沒有免費的永久圖片代管；如果你有付費或自架服務的 API 金鑰（imgbb、Cloudflare R2、自己的伺服器），可以把圖片傳上去並永久嵌入——本專案內建的 R2 支援就是這條路。
 
-| Approach | Time | Category | Language | Tag namespaces |
-| --- | --- | --- | --- | --- |
-| `gallery-dl -j` (plain) | **275 s** | yes | yes | yes |
-| `gallery-dl -j` + `source: metadata` | 1.4 s | **no** | **no** | **no** |
-| `gallery-dl -j` + `metadata: true` | **265 s** | yes | yes | yes |
-| one GET of the gallery page | **1.4 s** | yes | yes | yes |
-
-`gallery-dl -j` walks every image page even when only metadata is requested, which
-is what makes it unusable in a chat. Its `source: metadata` mode calls e-hentai's
-gdata API once and is fast, but that response has no category name, no language
-and no uploader, and returns tags as flat `namespace:tag` strings.
-
-The parsing regexes were each checked against real markup, because the obvious
-patterns silently match the wrong thing: the cover lives in an inline background
-style (the first `<img>` on the page is a rating graphic), and
-`<div id="taglist">` does not contain the `<tr>` rows directly.
-
-### ⚠️ Telegraph image links expire
-Telegraph embeds an image by fetching its URL, and the URLs e-hentai serves
-(`*.hath.network`) are **time-limited and tied to the login session**. A Telegraph
-page built today can therefore show broken images in a few days. The tag and
-facts sections are static HTML and remain correct.
-
-If a permanent copy matters, use an archive action instead — those deliver the
-actual files.
-
-### ⚠️ Telegraph image links expire — use 重新生成
-Telegraph embeds an image by fetching its URL, and the URLs e-hentai serves
-(`*.hath.network`) are **time-limited and tied to the login session**. A page built
-today can show broken images in a few days. The tag and fact sections are static
-HTML and stay correct forever.
-
-A **重新生成 Telegraph 頁面** button is attached to each finished result. Pressing it
-fetches freshly signed URLs for the same gallery and publishes a new page,
-replacing the old message in place. The button is remembered per chat and user, so
-one person cannot rebuild another's page, and a stale button from an earlier
-session is refused rather than guessed at.
-
-**Why not host the images permanently instead.** Measured, not assumed:
-
-| Host | Result |
-| --- | --- |
-| catbox.moe | `412 Invalid uploader` |
-| 0x0.st | uploads disabled ("AI botnet spam") |
-| uguu.se | works, but deletes files after 3 hours |
-| tmpfiles.org | 1 hour |
-
-Free permanent image hosting is not available here. If you have an API key for a
-paid or self-hosted host (imgbb, Cloudflare R2, your own server), the images can be
-uploaded there and embedded permanently — otherwise 重新生成 is the mechanism.
-
-### Public vs adult galleries
-e-hentai marks each gallery with a category such as `Non-H`, `Manga` or
-`Doujinshi`. Public galleries (`Non-H`, `Artbook`) need no login. Adult ones
-require an e-hentai session, and without one the site answers exactly like a
-deleted gallery — which is why the bot says "may need a login" rather than
-"not found".
+### 公開與成人畫廊
+e-hentai 會用分類標記每個畫廊，例如 `Non-H`、`Manga`、`Doujinshi`。公開畫廊（`Non-H`、`Artbook`）不需要登入；成人畫廊需要 session，而沒有 session 時，站方的回答與「畫廊已被刪除」一模一樣——這就是為什麼機器人說「可能需要登入」，而不是說「找不到」。
 
 ```ini
 EHENTAI_COOKIES=cookies/ehentai.txt
+EHENTAI_TIMEOUT=60           # metadata 請求
+EHENTAI_DOWNLOAD_TIMEOUT=900 # 下載每一頁
 ```
 
-The file needs the e-hentai domain's cookies: `ipb_member_id` and
-`ipb_pass_hash` (and `sk` plus `igneous` for exhentai). Both the `/cookies`
-command and `bot.py --check` report what is missing.
+**Telegraph 與成人內容。** Telegraph 的條款禁止成人素材，所以替 H 畫廊建的頁面**可能被移除**。預設仍然會建，因為那是被要求的行為，但這個選擇是明確的：
 
 ```ini
-EHENTAI_TIMEOUT=60           # metadata request
-EHENTAI_DOWNLOAD_TIMEOUT=900 # downloading every page
+TELEGRAPH_ALLOW_ADULT=1   # 1 = 永遠建頁面
+                          # 0 = 成人畫廊只回文字資訊
 ```
 
-### Telegraph and adult content
-Telegraph's terms forbid adult material, so a page built for an H gallery **can be
-removed**. Building it anyway is the default because that is the requested
-behaviour, but the choice is explicit:
+每個頁面都用一個匿名 Telegraph 帳號，所以頁面彼此獨立：一個被移除，其他不受影響。
 
-```ini
-TELEGRAPH_ALLOW_ADULT=1   # 1 = always build the page
-                          # 0 = answer adult galleries with the text info only
-```
+## 自助架設的 Bot API 伺服器
 
-An anonymous Telegraph account is created per page, so pages are independent: if
-one is removed, the others are unaffected.
+公開的 Bot API 把機器人的上傳上限壓在 **50 MB**，而且只接受檔案位元組。自架的 [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) 伺服器把上限拉到 **2000 MB**，並且在以 `--local` 啟動時接受**本機路徑**而不是位元組：
 
-## Why Pixiv files are sent as documents
-Telegram has no way to deliver an image untouched through the photo path:
-`sendPhoto` re-encodes the picture server-side and renames it to `.jpg`, so a
-"photo" is never the original. Pixiv artwork is therefore sent as **documents**,
-which Telegram passes through byte-for-byte, and the original filenames
-(`150653396_p0.jpg`) are preserved.
-
-Consequences worth knowing:
-- Images arrive as files rather than inline photos. Tap to open, use *Save to
-  gallery* on mobile, or download on desktop.
-- Multi-page works are grouped into albums of up to 10, so a 30-page set arrives
-  as three albums instead of thirty messages.
-- A file over `MAX_UPLOAD_MB` is reported and skipped rather than silently
-  shrunk — the point is to deliver the original, not a substitute.
-- X/Twitter keeps the normal photo path, because a compressed preview is what is
-  expected from a post.
-
-
-## Setup
-1. Install Python 3.11+ from https://www.python.org/downloads/ (enable PATH).
-2. Copy `.env.example` to `.env` and set `BOT_TOKEN` to a newly generated token.
-3. Open CMD in this folder and run:
-   ```bat
-   py -m venv .venv
-   .venv\Scripts\activate
-   py -m pip install --upgrade pip
-   py -m pip install -r requirements.txt
-   py -m pip install -U gallery-dl
-   ```
-4. Configure login cookies (see below) if you want age-restricted or
-   login-only Pixiv/X content.
-5. Run `run.bat`.
-6. Test by sending `/start` to the bot.
-
-### If pip cannot write to the venv
-On a host that denies writes under `.venv\Lib\site-packages`, pip stops with
-`PermissionError` while writing wheel metadata. The bot still runs; only Pillow
-is affected. Install it unpacked instead:
-
-```bat
-.venv\Scripts\python.exe install_pillow_offline.py
-```
-
-That unpacks the matching wheel into `vendor\`. `bot.py` appends `vendor\` to
-`sys.path` only when Pillow is not importable normally, and `pixiv_login.py` does
-the same for `websockets`, so a real pip install always wins.
-
-## Login credentials (Twitter / Pixiv)
-The two sites need **different** kinds of credential, and this is the single most
-common source of confusion:
-
-| Site | What it needs | Why |
+| | 公開 API | 自架 |
 | --- | --- | --- |
-| X/Twitter | cookies: `auth_token` + `ct0` | No usable password login for this kind of client |
-| Pixiv | an OAuth **refresh token** | Artwork pages go through Pixiv's App API, which a cookie cannot authorise |
+| 上傳 | 50 MB | 2000 MB |
+| 以本機路徑上傳 | ❌ | ✅（加 `--local`） |
+| 下載 | 20 MB | 無限制 |
 
-### X/Twitter cookies
-1. Log in to X in your normal browser.
-2. Export cookies in **Netscape format** with a browser extension such as
-   *Get cookies.txt LOCALLY* or *cookies.txt*. Use `.txt`, not JSON.
-   - Export while logged in to `x.com` **and** `twitter.com`.
-3. Save it as `cookies/twitter.txt` and point `.env` at it:
-   ```ini
-   TWITTER_COOKIES=cookies/twitter.txt
-   ```
+這就是能讓 **`歸檔 · 原圖`**（148 MB 以上的壓縮檔）真的送達的關鍵。
 
-### Pixiv refresh token
-A `PHPSESSID` cookie is valid for pixiv.net's own web endpoints but *not* for the
-App API that gallery-dl uses, so a refresh token is required.
+### 取得 api_id 與 api_hash
+這兩個**不是** bot token，而且只有你能建立——它們識別的是「一個應用程式」，Telegram 把它綁在你的帳號上。
 
-The authorization code is bound to the PKCE `code_verifier` of the process that
-requested it, and that verifier never leaves the process. A code copied to another
-process can therefore **never** be exchanged, and Pixiv reports that with the same
-`invalid_request` it uses for an expired code. Use the bundled helper, which keeps
-both halves in one run:
+1. 開啟 <https://my.telegram.org>，用**手機號碼**的國際格式登入（例如 `+886912345678`）。Telegram 會送登入碼——到 **Telegram 應用程式**裡、來自 *Telegram* 的對話中找（不是簡訊）。
+2. 進入 **API development tools**（<https://my.telegram.org/apps>），沒有應用程式就填那張短表。沒有人會審核，但欄位**會被驗證**，而被拒絕的欄位只會跳出一個籠統的 `ERROR` 對話框，所以一次填對比一直重試划算：
 
-```bat
-.venv\Scripts\python.exe pixiv_login.py --auto
-```
-
-`--auto` drives a throwaway Chrome (separate profile, so your own browser is
-untouched) and reads the code off the wire automatically. The token is written
-straight into `.env`.
-
-If you prefer gallery-dl's own flow, or `--auto` cannot run:
-
-```bat
-.venv\Scripts\python.exe pixiv_login.py          # manual paste
-.venv\Scripts\gallery-dl.exe oauth:pixiv         # gallery-dl's equivalent
-```
-
-For both manual paths, press F12 → Network *before* logging in, then copy the
-`code` parameter of the last `callback?state=...` request. The code expires **30
-seconds** after login. A `accounts.pixiv.net/post-redirect?...code_challenge=...`
-URL is the *start* of the flow and contains no code; the helpers reject it with an
-explicit reason.
-
-`cookies/pixiv.txt` is still useful for pixiv.net web requests and is checked by
-`/cookies`.
-
-### Verify
-```bat
-.venv\Scripts\python.exe bot.py --check
-```
-This reports each site's real state — including "Pixiv: 缺少 refresh-token" when
-only a cookie is present. Administrators can also send `/cookies` in Telegram
-(see *Who can do what* above).
-
-Add `--live` to make one real request per site and prove the credential actually
-works, rather than merely carrying a future date:
-
-```bat
-.venv\Scripts\python.exe bot.py --check --live
-```
-
-```
-在线验证（会向站点发出一次真实请求）：
-  [OK] X/Twitter：登录有效（注意：X 可能仍不返回推文内容）
-  [OK] Pixiv：PHPSESSID 有效（关注 567，粉丝 2）
-  [OK] Pixiv refresh-token：已配置（不过期）
-```
-
-## Do the credentials expire?
-Yes, but the three credentials behave very differently. Measured on this setup:
-
-| Credential | Lifetime | What happens when it lapses |
-| --- | --- | --- |
-| X/Twitter `auth_token` + `ct0` | ~1 year | **All X access stops.** Re-export the cookies |
-| X/Twitter cookie, if revoked | Immediately | X invalidates sessions server-side on password change or logout |
-| Pixiv `PIXIV_REFRESH_TOKEN` | **Does not expire** | Nothing, unless revoked or the password changes |
-| Pixiv `PHPSESSID` | ~1 month | Only pixiv.net's AJAX endpoints (the R-18 check); artwork downloads keep working |
-
-The bot warns on startup once a credential is within `EXPIRY_WARN_DAYS`
-(default 14) of expiry, and the admin `/cookies` command always shows the
-remaining days, so a failure never arrives unannounced.
-
-### Why there is no automatic cookie grabber
-Reading cookies straight out of the browser is the obvious automation, and it
-does not work reliably here:
-
-- Chrome holds an exclusive lock on its `Cookies` database, so `gallery-dl
-  --cookies-from-browser chrome` fails with `PermissionError` **while Chrome is
-  running** — and copying the file first also fails, because the lock is shared.
-- Closing Chrome does not solve it either: this profile uses Chrome's App-Bound
-  Encryption (`app_bound_encrypted_key` is present in `Local State`), which binds
-  the cookie key to the browser process rather than the Windows user, so
-  gallery-dl cannot decrypt the values even with the file unlocked.
-
-Because of that, the supported workflow is a re-export when warned, plus
-`--check --live` to confirm. Two things make it cheap:
-
-1. The X cookie lasts about a year, and the Pixiv refresh token never expires —
-   so this is a rare task, not a routine one.
-2. Only the cookies for these two sites are needed. Re-running the exporter and
-   overwriting `cookies/twitter.txt` is enough; nothing else has to be touched.
-
-If you would rather automate it, the workable approach is a **separate browser
-profile** used only for these two sites, kept closed while the bot runs, with
-`GALLERY_DL_COOKIES` pointed at an export from it. Ask and it can be set up.
-
-Cookies and tokens expire; when downloads start failing, re-export the cookies
-and re-run the OAuth flow. `cookies/` and `gallery-dl.conf` are gitignored, so
-credentials are never committed.
-
-## Known limitation: X/Twitter returns no results
-Verified repeatedly, including against a long-lived public post (a NASA tweet) and
-X's own unauthenticated syndication endpoint, which returns HTTP 200 with an empty
-body. The cookies are fine — X withholds the tweet body from this kind of client.
-This is an X-side restriction tracked upstream in
-[mikf/gallery-dl#9267](https://github.com/mikf/gallery-dl/issues/9267), not a
-misconfiguration here.
-
-What to do:
-- Confirm the credentials with `bot.py --check`; re-exporting cookies will not
-  help if that already says "已登录".
-- Try `python -m pip install -U gallery-dl` — upstream updates periodically
-  work around X changes.
-- Pixiv is unaffected by this.
-
-The bot reports this case explicitly instead of claiming that login failed.
-
-## A trap worth remembering: an album item needs a FILE, not a path
-`send_media_album` builds the media group, and for each item it must pass an **open
-file object**. A `str` is read by Telegram as a URL or file_id, so a Windows path
-becomes `file:///C:/...` and the whole album is rejected:
-
-```
-BadRequest: Invalid file http url specified: unsupported url protocol
-```
-
-The caller then fell back to one message per page, which looked exactly like the
-album feature not existing. This was invisible to a test that only checked the
-element's type name, so the test now asserts that each element is an *uploaded file*
-(`InputFile` with content), carries the real filename, and is not a path or a
-`file://` url.
-
-The streams are opened lazily and closed in a `finally`, so a failure part-way
-through does not leak handles on files the caller is about to delete.
-
-## A trap worth remembering: gallery-dl's `--` terminator
-`build_gallery_dl_command` writes its options first and then `-- <url>`. That
-terminator stops a URL beginning with a dash being read as an option — but it also
-means **nothing may be appended after it**. An option placed there is parsed as a
-second URL:
-
-```
-[2/3] --download-archive
-[gallery-dl][error] Unsupported URL '--download-archive'
-```
-
-That one mistake broke **every Pixiv and X download at once**, while the credential
-check kept reporting everything healthy, because the credentials were healthy — the
-command was malformed. A regression test now asserts that the terminator appears
-exactly once and that only the URL follows it, for every platform.
-
-The same feature had a second, worse failure: once the flag was in the right place,
-`--download-archive` made a *repeat* download write nothing into the fresh temp
-directory, so a link that had worked returned "沒有找到可傳送的圖片或影片". It has
-been removed entirely — see the caching section.
-
-## Version control
-This project is a git repository. **Commit before making sweeping changes** — that is
-not ceremony. A stray cleanup command once removed `test_bot_features.py` (733 tests)
-and there was no history, no `.pyc`, no backup and no shadow copy to recover it from,
-so it was gone.
-
-```sh
-git status           # what is uncommitted
-git add -A
-git commit -m "..."  # commit early, commit often
-git log --oneline    # what changed
-```
-
-`.gitignore` deliberately excludes everything secret or generated, and this was
-verified rather than assumed:
-
-| Ignored | Why |
-| --- | --- |
-| `.env` | bot token, api id/hash, refresh token |
-| `cookies/` | Twitter, Pixiv and e-hentai session cookies |
-| `authorized.json` | the users, groups and admins lists |
-| `parse_cache.json`, `.cache/` | the parse cache and its files |
-| `restart.log*`, `bot_console.log` | runtime logs |
-| `gallery-dl.conf`, `.gallery-dl-cache/` | generated from `.env` |
-| `.venv/`, `vendor/`, `__pycache__/` | environments and dev-only tools |
-| `bot-api-data/`, `telegram-bot-api*` | self-hosted server state and binary |
-
-`git check-ignore -v <path>` confirms any individual path. Twelve files are tracked:
-the four Python modules, the two runner scripts, `docker-compose.yml`, `run.bat`,
-`requirements.txt`, `README.md`, `.gitignore` and `.env.example`.
-
-### Pushing an update to GitHub
-The remote is <https://github.com/YuNaiAFK/twitter_pixiv_tg_bot_windows> (public), and
-`main` tracks `origin/main`. Whenever the bot changes, push it — that is the off-site
-copy, and its absence is what made the loss of the test suite unrecoverable.
-
-```sh
-git status                              # see what changed
-git add -A
-git commit -m "what changed and why"
-git push
-```
-
-**Verify the exclusions before every push that touches configuration.** The command
-below lists what would actually be published, and must print **`SAFE`**:
-
-```sh
-git ls-files | findstr /I /R "^\.env$ cookies authorized parse_cache restart\.log"
-```
-
-`/R` with anchored patterns is deliberate: a plain `findstr /I "env"` also matches
-`.env.example`, which is a placeholder template and *should* be published. A check that
-cries wolf on a safe file is one people learn to ignore, which defeats it.
-
-#### Why pushes fail, and the proxy that fixes them
-The global git config points at `http://127.0.0.1:10808`, a proxy that is **not
-running**:
-
-```
-fatal: unable to access 'https://github.com/...': Failed to connect to github.com
-port 443 via 127.0.0.1 after 2058 ms: Could not connect to server
-```
-
-Clearing it was the first fix, and it worked while GitHub was reachable directly. It is
-**not enough on this network**: GitHub is filtered too, and clearing the proxy simply
-moved the failure to `Failed to connect to github.com port 443` and
-`Recv failure: Connection was reset`.
-
-The host runs a **SOCKS5** proxy on `127.0.0.1:7897` (verified by its reply to a SOCKS5
-greeting, not assumed), so this repository points git at it:
-
-```sh
-git config --local http.proxy "socks5h://127.0.0.1:7897"
-git config --local https.proxy "socks5h://127.0.0.1:7897"
-```
-
-The `h` in `socks5h` is deliberate: it makes **DNS resolve through the proxy**, which is
-what a filtered network needs — `socks5://` would resolve locally and can then connect
-to an address that is blocked anyway.
-
-Both settings are **local to this repository**; the global one is deliberately left
-alone because other tools may depend on it. If git fails in a *different* repository
-with the same connection error, apply the same two lines there.
-
-Note that this proxy is SOCKS5, not HTTP. Setting an `http://` URL here produces
-`Get "http://...": server gave HTTP response to HTTPS client` or a bare
-`400 Bad Request`, which is a confusing way to discover the mismatch.
-
-## Command-line helpers
-| Command | Purpose |
-| --- | --- |
-| `bot.py` | Run the bot |
-| `bot.py --check` | Print configuration, credentials, gallery-dl and Pillow status |
-| `bot.py --check --live` | The above, plus a real authenticated request per site |
-| `bot.py --dry-run` | Build all handlers and exit without connecting to Telegram |
-| `bot.py --pixiv-token <url\|code>` | Extract the OAuth `code` from a pasted callback URL |
-| `pixiv_login.py [--auto]` | Complete the Pixiv OAuth flow and write the refresh token to `.env` |
-| `install_pillow_offline.py` | Install Pillow into `vendor/` when pip cannot |
-| `test_bot_features.py` | Self-tests for routing, credentials, sending and cleanup |
-
-## Staging directory and caches
-Downloads are staged in a temporary directory per request and deleted
-afterwards, in this order: `WORK_DIR` if set, then `.downloads\` beside
-`bot.py`, then the system temp folder. The first one that accepts a write wins,
-so a read-only or space-limited location degrades instead of failing every
-request. Point `WORK_DIR` at a roomy drive for large Pixiv sets.
-
-`gallery-dl.conf` is generated next to `bot.py` on startup. It exists so
-gallery-dl's SQLite cache lands in `.gallery-dl-cache\` instead of `%APPDATA%`:
-where that profile is read-only, gallery-dl fails with *attempt to write a
-readonly database* and both sites stop working. The file also carries
-`PIXIV_REFRESH_TOKEN` when one is configured. Override either location with
-`GALLERY_DL_CACHE`, or supply a whole config with `GALLERY_DL_CONFIG`.
-
-## Using it in Telegram groups
-- Add the bot to the group.
-- If the bot needs to see ordinary group messages, use `@BotFather` -> `/setprivacy` -> select bot -> `Disable`, then remove and re-add the bot to the group.
-- Alternatively, users can mention/reply to the bot where privacy mode permits it.
-- Do not add the bot as an administrator unless it truly needs admin privileges.
-
-### With privacy mode off, only messages with a link are answered
-Privacy mode is off on this deployment (`can_read_all_group_messages: True`), so
-Telegram delivers **every** group message — including the ones with nothing to parse.
-Two rules keep that from turning into chatter:
-
-- **A message with no link is never answered.** Unconditionally. It used to reply with
-  the help text when the bot *appeared* to be addressed — an `@mention` of its own
-  username, or a reply to one of its own messages — and that was reported as the bot
-  being **triggered by someone else**: replying to a photo the bot had posted earlier
-  made it answer a remark like *"如此巨乳!"* with the usage text.
-  Any such heuristic is a guess about intent, and a guess that is wrong is worse than
-  silence. `/help` covers the legitimate case explicitly and cannot misfire.
-- **Authorization is checked *after* a link is found.** It used to run first, which
-  meant any message from a non-authorized user was answered with
-  "此機器人目前不允許你的帳號使用" — even a plain remark like "i send no link". That
-  is the false positive this ordering fixes.
-
-A refused user never reaches the cache, the downloader or Telegraph: the gate runs
-before all of them. A regression test primes a cache hit and asserts the lookup is
-never made for a refused user.
-
-`bot_was_mentioned` is kept and still answers "was I addressed" correctly — a reply is
-matched on the bot's **own user id** rather than "the sender is any bot", which was
-broader than intended — but **nothing consults it any more**. The characterization suite
-pins its behaviour for the day something needs it.
-
-### One request at a time, not a waiting period
-A user may have **one** request in flight. A second one is refused with an
-explanation of what is happening, and is accepted the moment the first finishes.
-
-This replaced a flat 10-second cooldown that applied to everything, including
-button presses. That version produced an "操作太快了" popup whenever someone picked
-a second action right after the first completed — the remaining cooldown was still
-counting down even though nothing was running — so it slowed real work down while
-adding no protection. A timer answers "how long since the last request", which is
-not the question that matters; "is work running right now" is.
-
-Links keep their own cooldown, because sending a link starts real download work and
-repeated sending is the abuse case. Buttons are not subject to it.
-
-```ini
-USER_COOLDOWN_SECONDS=10   # links only
-REQUEST_STALE_SECONDS=1800 # reclaim a slot if a request died without releasing it
-```
-
-A slot is always released, including when the work raises, and the stale limit
-means no crash can lock a user out permanently.
-
-## Security
-- A token exposed in chat should be revoked via `@BotFather` `/revoke`; put the new token only in `.env`.
-- Never share `.env` or cookies. `.env` and `cookies/` are gitignored; keep it that way.
-- Leave `ALLOWED_USER_IDS` empty for public access; set IDs to restrict usage. `/id` displays the numeric Telegram user and chat IDs.
-- Configure `ADMIN_USER_IDS` before exposing the bot publicly; otherwise
-  `/cookies` and `/status` are simply unavailable, which is the safe default.
-- Only X/Twitter and Pixiv URLs are ever fetched, so a visitor cannot use the bot
-  to reach an arbitrary address.
-- Public deployment needs stronger abuse protection and monitoring before large-scale use.
-- Only download or redistribute content you are authorized to access.
-
-## Limitations
-- Public `t.me/<name>` URLs cannot be reliably classified as groups versus channels/users/bots based on URL alone.
-- The bot does not join or validate Telegram invite links.
-- Only X/Twitter and Pixiv are supported; links on other sites are not fetched.
-- X/Twitter frequently returns no content to this kind of client (see above).
-- Site changes/authentication can affect gallery-dl.
-- Current sample uses polling and a temporary directory; it is a single-process prototype.
-
-## Self-hosted Bot API server (optional, removes the 50 MB ceiling)
-The public Bot API caps a bot's upload at **50 MB** and only accepts file bytes. A
-self-hosted [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) server raises
-that to **2000 MB** and, when started with `--local`, accepts a **local path** instead
-of the bytes:
-
-| | Public API | Self-hosted |
-| --- | --- | --- |
-| Upload | 50 MB | 2000 MB |
-| Upload by local path | ❌ | ✅ with `--local` |
-| Download | 20 MB | no limit |
-
-This is what would let **歸檔 · 原圖** (a 148 MB archive and up) actually arrive.
-
-### How to get api_id and api_hash
-These are **not** the bot token and cannot be created by anyone but you — they identify
-an *application*, and Telegram ties them to your account.
-
-1. Open <https://my.telegram.org> and sign in with your **phone number** in
-   international format (e.g. `+886912345678`). Telegram sends a login code — look for
-   it in the **Telegram app**, in the chat from *Telegram* (not by SMS).
-2. Go to **API development tools** (<https://my.telegram.org/apps>).
-3. If no app exists, fill in the short form. Nothing is reviewed, but the fields **are**
-   validated, and a rejected field shows only a generic `ERROR` dialog — so get these
-   right the first time rather than burning attempts:
-
-   | Field | Rule | Example |
+   | 欄位 | 規則 | 範例 |
    | --- | --- | --- |
-   | **App title** | up to 64 chars; no `@`, `#` or other symbols; avoid the reserved word *telegram* | `shiroko9008parselinkbot` |
-   | **Short name** | **lowercase letters and digits only**, 5–32 chars, no spaces or hyphens | `skr9008plbot` |
-   | **URL** | may be left empty | |
-   | **Platform** | pick one, e.g. *Desktop* | |
+   | **App title** | 最多 64 字元；不能有 `@`、`#` 等符號；避開保留字 *telegram* | `shiroko9008parselinkbot` |
+   | **Short name** | **只有小寫字母與數字**，5–32 字元，不能有空格或連字號 | `skr9008plbot` |
+   | **URL** | 可以留空 | |
+   | **Platform** | 選一個，例如 *Desktop* | |
 
-   **The short name is lowercase-only**, which is the rule most easily missed: the page's
-   own hint says only *"alphanumeric, 5–32 characters"* and does **not** mention case, so
-   `skr9008PLBot` looks valid and is refused. The submission then sits on *Saving…* and
-   raises `my.telegram.org 顯示 ERROR`.
+   **short name 只能小寫**是最容易漏掉的規則：頁面上的提示只寫「英數字、5–32 字元」，**沒提大小寫**，所以 `skr9008PLBot` 看起來合法卻會被拒絕；送出後頁面停在 *Saving…*，然後跳出 `my.telegram.org 顯示 ERROR`。那個對話框從不說原因（它把原始 XHR 物件交給 `alert()`），要看到真正的錯誤得在瀏覽器主控台重送一次——做法記在 [docs/NOTES.md](docs/NOTES.md)。
 
-   **That `ERROR` dialog never says why.** The page's own `createApp()` hands the raw
-   jQuery XHR object to `alert()` on failure, so a real message from the server is
-   replaced by a useless `ERROR` — only a *successful* HTTP response has its body
-   alerted. To see the actual reason, run this in the browser console on `/apps`
-   (F12 → Console):
-
-   ```js
-   $.post('/apps/create', {hash:$('[name=hash]').val(),
-     app_title:'shiroko9008parselinkbot', app_shortname:'skr9008plbot',
-     app_url:'https://example.com', app_platform:'desktop', app_desc:''})
-    .done(t => alert('OK: '+JSON.stringify(t)))
-    .fail((x,s,e) => alert('HTTP '+x.status+' :: '+x.responseText));
-   ```
-
-   It prints the status and body instead of swallowing them. Interpreting the answer:
-
-   | Result | Meaning |
-   | --- | --- |
-   | `OK: ...` | created — reload `/apps` to read the `api_id` / `api_hash` |
-   | `HTTP 401 :: Unauthorized` | the session or the page's `hash` expired — reload `/apps` and retry |
-   | `HTTP 429` or a *too many tries* body | the login rate limit — **stop retrying**, wait hours or change network |
-   | any other body text | a field was rejected; the text names which |
-
-4. Submit. The page then shows:
-   - **App api_id** — a number, e.g. `1234567`
-   - **App api_hash** — 32 hex characters, e.g. `0123456789abcdef0123456789abcdef`
-5. Put them in `.env`:
+3. 送出後會顯示 **App api_id**（例如 `1234567`）與 **App api_hash**（32 個十六進位字元，例如 `0123456789abcdef0123456789abcdef`）。寫進 `.env`：
 
 ```ini
 TELEGRAM_API_ID=1234567
 TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
 ```
 
-6. Sanity-check the format: `python run_local_api.py --verify-credentials`.
-
-**That check only validates the format.** Telegram offers no endpoint that confirms an
-`api_id`/`api_hash` pair without authenticated access, so the only real test is to start
-the server — it authenticates on startup and fails loudly if they are wrong:
+4. 檢查格式：`python run_local_api.py --verify-credentials`。**那個檢查只驗證格式**——Telegram 沒有提供「不帶認證就確認 api_id/api_hash」的端點，所以唯一真正的測試是啟動伺服器，它會在啟動時認證，錯了就大聲失敗：
 
 ```sh
 docker compose up -d && docker compose logs -f
 ```
 
-Treat both as secrets. Anyone holding them can act as your application, and Telegram can
-restrict an account whose credentials are abused. Do **not** paste them into chats,
-issues, or commits — `.env` is already in `.gitignore`.
+把兩個都當成機密。持有它們的人可以冒充你的應用程式，而 Telegram 可以限制憑證被濫用的帳號；**不要**貼進聊天、issue 或 commit——`.env` 已經在 `.gitignore` 裡。
 
-### Setup with Docker (recommended — no compiler needed)
-There are no official prebuilt Windows binaries and building one needs a C++17
-compiler, CMake, OpenSSL, zlib and gperf. The `aiogram/telegram-bot-api` image avoids
-all of that.
-
-1. **Get your own `api_id` and `api_hash`** from
-   <https://my.telegram.org> → *API development tools*. These belong to an
-   **application**, not to the bot, and cannot be generated for you.
-2. **Install Docker Desktop** and start it. On Windows 11 this needs the WSL2 or
-   Hyper-V backend, which requires administrator rights.
-3. **Put the credentials in `.env`**:
-
-```ini
-TELEGRAM_API_ID=1234567
-TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
-```
-
-4. **Start the server**:
+### 用 Docker 安裝（建議，不需要編譯器）
+Windows 沒有官方預先編譯的執行檔，自己編譯需要 C++17 編譯器、CMake、OpenSSL、zlib 與 gperf；`aiogram/telegram-bot-api` 映像檔把這些全部省掉。先安裝並啟動 Docker Desktop（Windows 11 上需要 WSL2 或 Hyper-V 後端，也就需要管理員權限），把憑證放進 `.env`，然後：
 
 ```sh
 docker compose up -d
-python run_local_api.py --check      # confirms the container answers on 8081
+python run_local_api.py --check      # 確認容器在 8081 上回應
 ```
 
-5. **Point the bot at it** and restart with `run.bat`:
+接著讓機器人指向它，並用 `run.bat` 重啟：
 
 ```ini
 TELEGRAM_API_BASE=http://127.0.0.1:8081
 TELEGRAM_LOCAL=1
 ```
 
-`docker-compose.yml` is committed and commented. The environment variables it sets are
-the ones the image's own `docker-entrypoint.sh` translates into arguments — notably:
+`docker-compose.yml` 是提交進版控並加註解的。它設定的環境變數，就是映像檔自己的 `docker-entrypoint.sh` 會轉成參數的那些——特別是：
 
 ```sh
 append_flag_from_env "TELEGRAM_LOCAL" "--local"
 ```
 
-So `TELEGRAM_LOCAL: "1"` is what produces `--local`. Without it the server keeps the
-public 50 MB limit and refuses local paths, and the whole switch gains nothing.
-`TELEGRAM_API_ID` and `TELEGRAM_API_HASH` use `:?` in the compose file, so a missing
-credential stops compose instead of starting a server that cannot work.
+所以 `TELEGRAM_LOCAL: "1"` 才會產生 `--local`。少了它，伺服器仍套用公開的 50 MB 上限並拒絕本機路徑，整個切換等於白做。compose 檔裡 `TELEGRAM_API_ID` 與 `TELEGRAM_API_HASH` 使用 `:?`，所以憑證少一個會讓 compose 停下來，而不是啟動一個不可能工作的伺服器。
 
-### Setup with a native binary
-No Docker, but no compiler either? Point the runner at a binary you built or trust:
+不要 Docker、也不想編譯？把 runner 指向你編好或信任的執行檔（編譯說明：<https://tdlib.github.io/telegram-bot-api/build.html>）：
 
 ```sh
 python run_local_api.py --binary "C:\path\to\telegram-bot-api.exe"
 ```
 
-Build instructions: <https://tdlib.github.io/telegram-bot-api/build.html>.
-
-### gallery-dl ignores the Windows system proxy - pass it explicitly
-Pixiv downloads took **115.7 seconds and then failed** with
-``ConnectTimeoutError: Connection to app-api.pixiv.net timed out``. The same command with
-``HTTPS_PROXY`` set took **1.3 seconds**.
-
-The cause is that this machine routes through a **system proxy** held in the registry
-(``HKCU\\...\\Internet Settings``, ``ProxyEnable=1``, ``ProxyServer=127.0.0.1:7897``),
-and the two HTTP stacks disagree about it:
-
-| Client | Reads the system proxy? | Result to ``app-api.pixiv.net`` |
-| --- | --- | --- |
-| ``httpx`` (``trust_env``) | yes | 404 in 1.3s |
-| raw TCP connect | n/a | **timeout, every attempt** |
-| ``gallery-dl`` | **no** | three 30s timeouts, then failure |
-
-So the bot must pass the proxy itself. ``gallery_dl_env()`` does that, and **both**
-gallery-dl call sites use it.
-
-**Both** matters: there are two. ``download_with_gallery_dl`` runs a finished subprocess,
-and ``download_gallery_media`` builds its own ``Popen`` so it can stream progress. Fixing
-only the first had no effect on the slow path at all - the measured 115.7s was unchanged -
-which is worth remembering before concluding a fix works because the code looks right.
-
-An explicit ``HTTPS_PROXY`` in the environment wins over the registry, so this can be
-overridden or disabled without editing the registry.
-
-### httpx ignores the Windows registry proxy — every e-hentai request must set it
-
-**This is the cause of "e-hentai hangs" and it is not e-hentai's fault.** httpx does not
-read the Windows system proxy, so on this machine every e-hentai request went out
-**directly** and timed out, while the same URL loaded fine in a browser. Measured, side
-by side:
+### run.bat 會先確保伺服器活著
+伺服器必須比機器人先起來，而以前沒有任何地方這樣說。少了它，機器人會默默退回公開 API，上傳上限從 **2000 MB 掉回 50 MB**——能送出的東西差一個數量級，而這件事只以一行埋在啟動日誌裡的訊息呈現。`run.bat` 現在會先呼叫 `run_local_api.py --ensure`，把缺的東西拉起來，並等到伺服器真的回應為止：
 
 ```
-httpx, no explicit proxy   -> ConnectTimeout, every time
-httpx, proxy=...           -> HTTP 200
-browser                    -> works
+檢查自架 Bot API 伺服器……
+  啟動轉接（17900 -> 127.0.0.1:7897）……
+  轉接埠 17900：已啟動
+  Docker 引擎尚未啟動，正在開啟 Docker Desktop.exe……
+  等待 Docker 引擎就緒（首次啟動可能需要一兩分鐘）……
+  Docker 引擎：就緒
+  容器：已在執行
+  等待伺服器就緒……
+  伺服器（port 8081）：就緒
 ```
 
-A browser reads the system proxy; httpx does not. That single difference explains the
-whole symptom, and it was misread as e-hentai blocking the IP for a long time — including
-a note here that "a proxy does not help", which was **wrong**: the proxy was not being
-used at all.
+它是**冪等**的：第二次執行會在三者都存在時什麼都不做，不到一秒（「伺服器（port 8081）：已在執行，不需要啟動」「轉接埠 17900：已在執行」）。必須有三個東西活著，而每一個壞掉時都會指向別的原因：
 
-`ehentai.proxy_url()` reads `HTTPS_PROXY`/`ALL_PROXY` first and falls back to the registry
-(`HKCU\...\Internet Settings`), and `ehentai.http_client_kwargs()` returns the keyword
-arguments every client needs. **All nine httpx clients in `bot.py` and `ehentai.py` use
-it** — the gallery fetch, the viewer sweep, page downloads, the archive probe, the
-archiver POST, and the archive download. A characterization check walks both files and
-fails if any `httpx.Client(...)` is built without it, because one bare client is enough to
-hang on its own.
+1. **Docker 引擎**——沒有它，compose 會在具名管線（`dockerDesktopLinuxEngine`）上失敗，讀起來像 Docker 安裝有問題，而不是「引擎沒開」。`--ensure` 會自己啟動 Docker Desktop 並等最多四分鐘。
+2. **主機轉接**——沒有它，容器完全連不到 Telegram，因為代理只聽 loopback；TDLib 會把它回報成一般連線失敗。轉接以分離方式啟動，所以比啟動它的控制台活得久（實測：殺掉 `run.bat` 之後 17900 仍在監聽）。
+3. **伺服器**——沒有它就是 50 MB 上限。
 
-The helper returns the proxy in `http://host:port` form even though the port speaks SOCKS5
-as well: httpx needs the `socksio` extra for `socks5://`, and HTTP CONNECT works here
-without that dependency.
+失敗**不是致命的**：機器人仍會對著公開 API 啟動，並以一則警告說明上限與「解釋原因的指令」。擋住啟動比上傳上限小更糟。`TELEGRAM_SKIP_LOCAL_API=1` 會跳過整個步驟，給沒有 Docker、也不想要 Docker 的機器用。
 
-### SECURITY AUDIT — what was found and what to do
+### 被過濾的網路：伺服器需要透過代理走 MTProto
+這台機器的網路上，Telegram 的 MTProto 主機**部分被過濾**：直接連線時有些位址開、有些被擋，而**容器直接連線時全部被擋**（Docker 被過濾得更兇）；兩者透過主機的 SOCKS5 就全部可通。所以未經處理的映像檔起不來——它會啟動、看起來健康，然後卡在 `getMe`、日誌一片空白，很容易被誤認為 `api_id` 填錯。
 
-Four independent audits were run over this codebase (secrets, injection, authorization,
-cache/file integrity). This section records the outcome, including the parts that are
-**not** fixed and the one action that is the operator's.
-
-#### Action required: rotate the bot token
-The bot token was committed to this **public** repository in four places, all quoting the
-same genuine boot error. The token has since been rotated (`/revoke`), and the leaked one
-is confirmed dead — `getMe` with it returns 401. Nothing further is needed for that leak,
-though the bot **id** is now permanently public and should be treated as such.
-
-#### Fixed
-
-| Severity | Problem | Fix |
-| --- | --- | --- |
-| HIGH | Cache index names were joined to `CACHE_DIR` with only an `is_file()` check, so `.cache/../.env` was accepted — **the bot could be made to upload its own token file** — and the same join was used for deletion | `cache_file_path()` validates the name shape, rejects absolutes, and requires the result to resolve to a direct child of the cache directory; used by both the read and delete paths |
-| HIGH | The bot could write its **current** token into the log: httpx echoes the request URL, which embeds it, and `restart.log` is the file people paste into bug reports | `redact_secrets()`; verified against the real leak string, and by shape so a token rotated after the failing request is still caught |
-| MEDIUM | Admin roster disclosed to every authorized user via `/authorized` | Non-admins see the lists but not the admin list |
-| MEDIUM | A valid `authorized.json` containing `"admins": []` locked the bot out of every admin command permanently | The `.env` bootstrap admin is restored when the file has none |
-| MEDIUM | The `stop` button ran with **no** authorization check, and `_running_downloads` is keyed by chat — any chat member, authorized or not, could kill someone else's download | The presser is checked before every branch |
-| MEDIUM | Cache written with `if not target.exists()`, and names are derived from the URL alone — a file planted at that name was served as that URL's media | Atomic write via a temp file and `os.replace` |
-| MEDIUM | Cache bounded by entry count only; measured 101 MB from 29 files, with no byte ceiling | `CACHE_MAX_BYTES`, evicting whole entries oldest-first |
-| MEDIUM | Every staging-dir candidate was created and one returned, so the rest leaked — **2,027 empty directories** measured in %TEMP% | Candidates created lazily, rejected ones removed, and `sweep_stale_work_dirs()` clears what accumulated |
-| MEDIUM | Non-admins could read the admin roster; the docs described an allowlist as a blocklist | See above; wording and the mode label corrected |
-| LOW | The archive URL only had to *contain* `hath.network/archive/`, so a lookalike host would be fetched **with the account's cookies attached** | Hostname checked against `hath.network` before anything is fetched |
-| LOW | Every retry logged `archiver.php?…&token=…`, a live session token | `redact_url()` logs the path with credential parameters removed |
-| LOW | `prune()` unguarded, so a maintenance failure failed an already-delivered request | Guarded |
-
-### A stray python window appeared beside the bot's own console
-
-Reported as "why does a python window pop up as well?". It was not the bot - it was the
-**proxy relay**, and the cause was the interpreter used to start it.
-
-`.venv\Scripts\python.exe` is a venv **launcher**, not the interpreter: it re-executes the
-real one as a child. Spawning that pair put a visible, empty console on screen, and neither
-`CREATE_NO_WINDOW` nor `DETACHED_PROCESS` suppressed it - both were tried first:
-
-    venv stub        (python.exe): NEW windows = [(33140, '...\.venv\Scripts\python.exe')]
-    base interpreter (python.exe): NEW windows = []
-
-`sys._base_executable` is the real interpreter and starts with no window. Both background
-spawns use it now - the relay in `run_local_api.py` and the `/restart` replacement in `bot.py`
-- through `detached_interpreter()`.
-
-The cost has to be paid explicitly: the base interpreter does not know about the venv, so
-`child_environment()` adds the venv's `site-packages` to `PYTHONPATH`. Without it the child
-cannot import `telegram` and dies immediately:
-
-    prefix    C:\Python314
-    imports   ['httpx=FAIL', 'telegram=FAIL', 'PIL=FAIL', 'gallery_dl=FAIL']
-
-`list_console_windows.py` is kept because it is what settled this: it enumerates every visible
-console window and its owning process, so "which process put that window there" is answered by
-running it rather than by guessing.
-
-## The private list is a blocklist, not an allowlist
-
-It used to be an allowlist: one entry meant **only** those users could parse. That is the wrong
-shape for a bot whose parsing is meant to be open to any visitor. Adding one abusive user cut
-off every ordinary visitor instead - the opposite of the intent, and a mistake nobody notices
-until people complain that the bot stopped working.
-
-    before   blocked = {5}   ->  user 5 allowed, EVERYONE ELSE refused
-    now      blocked = {5}   ->  user 5 refused, everyone else allowed
-
-| the list | empty | with entries |
-| --- | --- | --- |
-| **private chats** (blocklist) | everyone may parse | listed users refused, everyone else welcome |
-| **group chats** (allowlist) | all or none, by `AUTH_GROUP_LOCKED` | only the listed groups |
-
-Groups stay an allowlist on purpose: a bot in a public group should serve the groups it was
-deliberately added to, not every group that happens to contain it. Administrators pass
-everywhere, so a mistake in the list can never lock the operator out of their own bot.
-
-### Commands
-
-| command | private chat | group |
-| --- | --- | --- |
-| `/revoke <ID>` | **block** that user | remove that group's authorization |
-| `/grant <ID>` | **unblock** that user | authorize that group |
-| `/blocked` | list the blocked users | — |
-| `/lock` | retired, explains what replaced it | — |
-| `/lockgroup on\|off` | — | gate mode for groups |
-
-`/lock` is gone as a setting: a blocklist is not a gate, so there is no mode to choose. It is
-still registered, and answers with what replaced it rather than silence, because an operator
-with `/lock` in their notes will type it.
-
-### The security hole the change exposed
-
-The list commands used to take `list_manager_only`, which admitted administrators **and
-authorized users** - sound while the list admitted people, since passing access on was the
-point. With a blocklist the same rule hands control to the people it blocks: **a blocked user
-could unblock themselves, and block anyone else.** Every list command is `admin_only` now, and
-`user_can_manage_list` and `list_manager_only` are both gone rather than left unused.
-
-The same mistake was in `post_init`: the scoped command menus were set for administrators *and*
-`AUTHORIZATION.allowed`, which is the blocklist. Blocked users would have been shown the
-operator commands in their Telegram menu. They would have been refused when used, but
-advertising them is still wrong - and it would confirm to a blocked user that the bot is
-watching.
-
-### An existing authorized.json still loads
-
-The field is still called `allowed` in the file so nothing has to be migrated, and there is a
-`blocked` key that takes precedence when present. An old allowlist therefore arrives as a
-blocklist, which **blocks the users it listed**. That is the deliberate direction: a short list
-of ids is far more likely to be abusers than to be the complete set of everyone permitted, and
-`/blocked` shows plainly who ended up on it. `ALLOWED_USER_IDS` in `.env` is read the same way.
-
-`AUTH_LOCKED` is simply ignored now - there is no gate for it to configure.
-
-## A refused group is answered with silence, not a refusal
-
-The authorization refusal is a useful answer in a **private** chat: the person who added the
-bot sees why nothing happened and can ask to be authorized. In a **group** it is the opposite -
-the bot answers every link anyone posts in a chat it was told not to serve, which is noise in
-someone else's conversation, and it advertises the bot's presence to people who were not asking
-it anything. The members cannot act on the refusal either.
-
-So the refusal is now decided by the chat type:
-
-| the chat | the answer |
-| --- | --- |
-| group, not authorized | **silence** |
-| supergroup, not authorized | **silence** |
-| private, not authorized | 此機器人目前不允許你的帳號使用。 |
-| authorized group | the files, as before |
-
-The guard is the first thing `handle_message` does, so a refused group never reaches any other
-reply - the cooldown notice, the unsupported-link notice and the failure messages are all
-unreachable for it. The button callbacks are gated by the same rule with `show_alert`, which is
-a popup only the person who pressed sees, and a refused group was never sent a message with
-buttons to press in the first place.
-
-## A legacy pixiv link was served another artwork's files
-
-Reported from a log: a `member_illust.php?...&illust_id=...` link failed with
-`NotFoundError`, and the operator hint blamed credentials for it. Three separate faults were
-behind that one line.
-
-### 1. The cache key dropped the artwork id
-
-`normalize_cache_key` removed the whole query string, but pixiv's legacy form carries the id
-**only** there:
-
-    https://www.pixiv.net/member_illust.php?mode=medium&illust_id=122010932
-
-Every such link therefore normalised to `https://www.pixiv.net/member_illust.php` - **one
-cache entry shared by every artwork using that path**. Reproduced: after parsing one artwork,
-a second `illust_id` on the same path was served the first one's files and never downloaded.
-
-Parameters that name a resource (`illust_id`, `novel_id`, `id`) now survive, sorted so order
-cannot split an entry. Everything else - `?s=20`, `&t=abc` - is still dropped, so the
-canonicalisation that stops one post being cached twice still works:
-
-    ...member_illust.php?mode=medium&illust_id=122010932 -> ...member_illust.php?illust_id=122010932
-    ...member_illust.php?mode=medium&illust_id=150824857 -> ...member_illust.php?illust_id=150824857
-    https://x.com/u/status/123?s=20&t=abc               -> https://x.com/u/status/123
-    https://twitter.com/u/status/123                    -> https://x.com/u/status/123
-
-### 2. The reason was recorded only on success
-
-`download_with_gallery_dl` raised on a non-zero exit **before** recording gallery-dl's output,
-so `LAST_DOWNLOAD_REASON` stayed empty for exactly the runs worth explaining - a deleted work
-exits 4 with `NotFoundError`. The hint then fell through to its per-platform guess:
-
-    classify_download_output(real output) -> 'missing'     (recognised)
-    admin_hint('pixiv')                   -> credentials   (nothing had recorded it)
-
-An operator chasing a taken-down artwork was sent to redo an OAuth flow that was never the
-problem. The output is now recorded before the exit code is checked:
-
-    作品不存在或連結已失效（gallery-dl 回報 not found）。這不是憑證問題。
-
-### 3. One transient failure turned a deletion into silence
-
-`pixiv_work_state` returned `unknown` - and `unknown` means silence - when a single request
-failed. Observed on a work that answers 404 every other time. It now retries three times, so a
-dropped connection or a rate-limited token refresh cannot hide a dead link. A state that never
-resolves is still `unknown`, because retrying must not turn "cannot verify" into an accusation.
-
-End to end after all three: the reported link answers
-「這個 Pixiv 作品目前無法瀏覽：可能已被作者刪除，或設為非公開。」, and a **live** work on the
-same legacy path downloads normally instead of inheriting the poisoned cache entry.
-
-## Windows shows "Open File - Security Warning" every time
-
-Double-clicking `run.bat` (or a shortcut to it) prompts:
-
-    打开文件 - 安全警告
-    你要打开此文件吗？
-    发行商: 未知发布者
-    来自 Internet 的文件可能对你有所帮助，但此文件类型可能危害你的计算机。
-
-**The cause is not a zone mark.** Verified absent on this machine: no `Zone.Identifier`
-stream (checked with `dir /r` and the `FindFirstStreamW` API), SmartScreen off
-(`SmartScreenEnabled=off`, `EnableSmartScreen=0`), Smart App Control off
-(`VerifiedAndReputablePolicyState=0`), no AppLocker/WDAC policy, D: is a local NTFS drive
-with no reparse points or cloud sync.
-
-### What it actually is
-
-The project folder carries an **inheritable Low integrity label**:
-
-    D:\TG_Bot\twitter_pixiv_tg_bot_windows
-      Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)
-
-`(OI)(CI)` makes it inherit to every file, so all 746+ files were `Low Mandatory Level`.
-Low integrity is the level sandboxes and browsers write at, so Windows treats those files as
-untrusted and warns before running them - **without needing a zone mark**. It is a second,
-independent mechanism, which is why searching for a zone mark found nothing.
-
-Confirm it with:
-
-    icacls "D:\TG_Bot\twitter_pixiv_tg_bot_windows"
-
-### The fix
-
-An **Administrator** PowerShell, once:
-
-    icacls "D:\TG_Bot\twitter_pixiv_tg_bot_windows" /setintegritylevel m /t /c
-
-To undo it:
-
-    icacls "D:\TG_Bot\twitter_pixiv_tg_bot_windows" /setintegritylevel l /t /c
-
-A non-elevated attempt changes only some files (139 of 3703 here) and reports
-`Access is denied` for the rest, so elevation is required. After the fix every file reads
-`Medium Mandatory Level`, and the bot's cache, archive cache and download directories were
-re-tested as writable.
-
-### If it comes back
-
-The label can return when the project is copied or extracted again. Check with the `icacls`
-command above and re-apply.
-
-Also worth checking, since it produces a very similar prompt: **火绒安全软件** (Huorong
-Security) was installed on this machine with `HipsDaemon` running. Its HIPS module intercepts
-script execution and shows an unknown-publisher warning of its own. If the integrity label is
-already `Medium` and the prompt persists, add the project folder to its trust list
-(防護中心 → 信任區 → 新增資料夾).
-
-### A restart left no window, and every start waited six seconds
-
-Two symptoms with **one root cause**, which is why they are together.
-
-`RESTART_STARTUP_DELAY` is a documented `.env` value, and it was also the flag that decided
-"am I a replacement process?". `load_dotenv()` therefore set it for **every** start, so:
-
-1. **every** start believed it was a replacement, and `run.bat` printed
-   `等待 6.0 秒讓前一個程序結束後再開始輪詢……` before doing anything;
-2. the refusal guard added for a second instance was **skipped**, because a "replacement" is
-   allowed to continue - so two windows could both poll the same token.
-
-A separate marker that only the spawner sets fixes both:
-
-    已啟動 → BOT_IS_REPLACEMENT=1 → /restart 的替代程序 → 等待（上限 6s）
-    run.bat  → 沒有這個變數        → 一般啟動        → 完全不等
-
-**Measured: a plain start now reaches "等待 Telegram 訊息" in 1.81s, and the six-second line
-is gone.**
-
-#### The blank window
-
-`/restart` spawned the replacement with:
-
-    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-
-That is a process with **no console at all**, writing only to `restart.log`. The visible
-window belonged to `run.bat`, so when the old process exited **that window closed and nothing
-took its place** - the bot ran on with no window to look at. What you saw was a console whose
-title was the interpreter path and whose body was empty.
-
-The replacement now gets its own console:
-
-    CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP
-
-so after a restart there is exactly **one** window, and it is the live one. Its output goes to
-that window and is also appended to `restart.log` (the child installs a file handler), because
-the restart confirmation tells the operator to read that file.
-
-`CREATE_NO_WINDOW` was there so an accidental `print` could not fail; `CREATE_NEW_CONSOLE`
-satisfies that too, since a console exists either way.
-
-#### A second window is now refused
-
-A plain start that cannot take the single-instance lock **stops** instead of polling:
-
-    已經有另一個機器人正在執行，這次啟動會結束。
-    請關閉另一個視窗後再試一次（或直接使用那一個）。
-
-A *replacement* still continues without the lock, because refusing would leave the bot
-offline - which is worse than a possible Conflict.
-
-### A restart slept for six seconds even when nothing was running
-
-The line you will have seen:
-
-    等待 6.0 秒讓前一個程序結束後再開始輪詢……
-
-It exists for a real reason - the process being replaced takes a moment to release
-Telegram's ``getUpdates`` lock, and a second poller on the same token gets "Conflict:
-terminated by other getUpdates request", which is how a restart can finish with no bot
-running. But the wait was **unconditional**, so every restart paid the full six seconds
-**even when the old process had already exited** - which is the usual case.
-
-A single-instance lock answers the question that actually matters - *is the previous instance
-still there?* - and the operating system answers it, releasing the lock when that process dies
-**however it dies**:
-
-| the previous process | old | new |
-| --- | --- | --- |
-| already gone (the usual case) | 6.000s | **~0.00s** |
-| still shutting down | 6.000s | waits only as long as it takes, ceiling still 6s |
-| killed with no chance to clean up | 6.000s | lock released by the OS anyway |
-
-Measured: a replacement started while the old process was still exiting became ready in
-**1.2s** instead of a flat 6s, and with nothing holding the lock it takes it in **0.001s**.
-
-`RESTART_STARTUP_DELAY` is now a **ceiling, not a delay** - it bounds how long a replacement
-will wait for the lock, and it still defaults to 6s so nothing behaves worse than before. A
-normal start from `run.bat` does not set it at all and never waits.
-
-The lock is also released explicitly in a `finally`, not only when the process exits, so a
-replacement started straight after the operator stops the bot does not have to wait for the
-operating system to reap the old one.
-
-### run.bat now starts the self-hosted server
-
-The server has to be up before the bot, and nothing said so. Without it the bot silently
-falls back to the public API and the upload limit drops from **2000 MB to 50 MB** - a
-ten-fold difference in what can be delivered, reported only as one line buried in the
-startup log, if it is read at all.
-
-`run.bat` now calls `run_local_api.py --ensure` first, which brings up whatever is missing
-and waits until the server actually answers:
-
-    檢查自架 Bot API 伺服器……
-      啟動轉接（17900 -> 127.0.0.1:7897）……
-      轉接埠 17900：已啟動
-      Docker 引擎尚未啟動，正在開啟 Docker Desktop.exe……
-      等待 Docker 引擎就緒（首次啟動可能需要一兩分鐘）……
-      Docker 引擎：就緒
-      容器：已在執行
-      等待伺服器就緒……
-      伺服器（port 8081）：就緒
-
-**Idempotent**: a second run detects all three and does nothing, in under a second:
-
-    伺服器（port 8081）：已在執行，不需要啟動
-    轉接埠 17900：已在執行
-
-Three things have to be up, and each fails in a way that names something else:
-
-1. **the Docker engine** - without it compose fails on a named pipe (``dockerDesktopLinuxEngine``),
-   which reads as a Docker installation problem rather than "the engine is stopped".
-   `--ensure` launches Docker Desktop itself and waits up to four minutes.
-2. **the host relay** - without it the container cannot reach Telegram at all, because the
-   proxy listens on loopback only. TDLib reports this as a generic connection failure.
-   The relay is started detached, so it outlives the console that launched it - verified by
-   killing `run.bat` and confirming port 17900 still listening.
-3. **the server** - without it, the 50 MB limit.
-
-A failure is **not fatal**: the bot still starts against the public API, with a warning
-naming the limit and the command that explains why. Blocking the start would be worse than a
-smaller upload limit.
-
-`TELEGRAM_SKIP_LOCAL_API=1` skips the whole step, for a machine that has no Docker and does
-not want it.
-
-#### Two bugs written while adding this
-
-- `subprocess.CREATE_DETACHED_PROCESS` does not exist - the constant is `DETACHED_PROCESS`,
-  with no `CREATE_` prefix.
-- The upstream proxy port was read from `TELEGRAM_MT_PROXY`, which is
-  `socks5://192.168.65.254:17900` - **the relay's own address**, so the relay was configured
-  to forward to itself, on 17900. The upstream is the host proxy on 7897, which comes from
-  the SOCKS5 setting the bot itself uses; `upstream_proxy_port()` reads it.
-
-### A private Pixiv work was reported as a broken link
-
-The narrow rule that replaced a wrong one: **a work that no longer exists is reported, and
-everything else is silent.**
-
-Before this, an empty result always produced a message, and for a private or age-restricted
-work that message was wrong twice over:
-
-    沒有找到可傳送的圖片或影片。
-    取不到作品內容，連結可能已失效。
-
-The link was fine. It needed a login this bot did not have, which is not something the sender
-can act on - and "連結可能已失效" blamed them for it. The bot also left its own status and
-source messages behind, so a link that resolved to nothing produced *more* clutter than one
-that worked.
-
-#### An un-published work answers 200, so the status code says nothing
-
-Reported with a real link: `pixiv.net/artworks/150822697`. A first attempt called it readable
-because the app API answered **200** - and it does, with the content blanked:
-
-    unpublished   {"illust": {"id": 150822697, "title": "", "visible": false,
-                              "total_view": 0, "total_bookmarks": 0}}      status 200
-    live          {"illust": {"id": 150824857, "title": "しろこ", "visible": true,
-                              "total_view": 436, "total_bookmarks": 143}}   status 200
-
-`visible` is the signal, not the status code. The title and the counters are blank as well,
-but `visible` says so directly rather than by inference. So the rule is now:
-
-| the work | how it answers | result |
-| --- | --- | --- |
-| live | 200, `visible: true` | download |
-| age-restricted, credentials work | 200, `visible: true` | download |
-| **taken down by the author** | **200, `visible: false`** | **report** |
-| deleted | 404 | **report** |
-| anything else | 500, timeout | silence |
-
-The notice covers both causes in one sentence, because they are indistinguishable to a
-visitor and gallery-dl cannot tell them apart either:
-
-    這個 Pixiv 作品目前無法瀏覽：可能已被作者刪除，或設為非公開。
-    （若作者之後重新公開，重新傳送連結即可）
-
-#### gallery-dl cannot tell a deletion from a missing login
-
-It reports the same error for both, because the **web** API answers 404 either way:
-
-    [pixiv][error] NotFoundError: Requested resource (gallery/image) could not be found
-
-Measured against the **app** API, which does distinguish them:
-
-    app API, no credentials   400  login required
-    app API, with token       200  the work
-    web API, no credentials   404  identical to a deletion
-
-So `pixiv_work_state()` asks the app API with the configured credentials, and the answer
-decides:
-
-| the work | state | what the user sees |
-| --- | --- | --- |
-| readable (downloaded) | — | the files, no error |
-| private, credentials work | `ok` | nothing (the download succeeded) |
-| private, credentials broken | `unknown` | **nothing** - silence |
-| taken down or deleted | `unavailable` | 這個 Pixiv 作品目前無法瀏覽… |
-
-**`unknown` is silent on purpose.** Telling someone their link is dead when the bot simply
-cannot verify it is worse than saying nothing.
-
-A private work the bot *can* read is downloaded normally, which is what the request asked
-for: "私人画廊如果在登录的时候能解析出来则不需要提示错误".
-
-#### Two bugs found while checking this
-
-- **`classify_download_output` could not recognise the real error.** It looked for
-  `"not found"` with a space; gallery-dl prints `NotFoundError:` and "could not be found".
-  Neither matched, so a deleted work classified as `""` and the operator hint fell back to a
-  guess about credentials - sending an operator to redo an OAuth flow that was never the
-  problem. Both spellings are matched now.
-- **`pixiv_illust_id` required five or more digits**, so a short id silently yielded `""` and
-  every deletion was then reported as silence instead.
-
-### Notices are silent, and a Pixiv page is not a work either
-
-Two changes that belong together: an unparseable link now produces **no reply at all**, and
-the classification that makes silence safe was extended to Pixiv.
-
-#### Silent by default
-
-`REPLY_UNSUPPORTED_LINKS` now defaults to **0**. A link the bot cannot parse gets no
-message - not the generic "只支援 X/Twitter、Pixiv 與 e-hentai" notice, and not the
-X-specific explanation of what the page is. In a public group a reply for every unparseable
-link is noise in a conversation the bot was not invited into.
-
-The explanation strings are kept, because `REPLY_UNSUPPORTED_LINKS=1` restores them and that
-is what an operator wants while checking whether a link is genuinely unsupported or simply
-misdetected.
-
-**Silence is only safe because the classification runs anyway.** A non-post X link is still
-detected and dropped before the downloader starts; without that, "silent" would mean waiting
-**three minutes** and then hearing nothing. The tests assert this ordering.
-
-#### Pixiv had the same problem, with worse symptoms
-
-Extending the check to Pixiv was not optional once notices went quiet. Measured with
-gallery-dl:
-
-    /artworks/150824857                2 files in 46.7s   -> parse
-    /en/artworks/150824857             2 files in 31.0s   -> parse
-    /member_illust.php?...illust_id=…  2 files in 20.8s   -> parse
-    /users/12345                       0 files in  2.5s   -> nothing at all
-    /search?word=cat                   TIMEOUT after 180s
-    /tags/cat                          TIMEOUT after 180s
-    /ranking.php                       TIMEOUT after 180s
-    /discover                          "Unsupported URL" in 0.6s
-
-A Pixiv user page produced **no reply even before** the notices were turned off: the
-downloader found nothing there, so the failure message was the only thing that could have
-explained it. Worse, it left the status message behind - measured as two messages for a link
-that resolves to nothing. The other shapes ran the full three minutes.
-
-`classify_link()` now dispatches to a per-platform classifier, so the handler has **one**
-check rather than one per site. Handling only X is precisely how Pixiv was missed. Both
-classifiers stay conservative: anything not positively identified as a page is passed to the
-downloader, because a wrong "not supported" would refuse a link that works.
-
-After the change every one of the shapes above answers in **0.0s with no message**, while
-`/artworks/N`, `/en/artworks/N`, `member_illust.php?illust_id=N` and `/novel/show.php?id=N`
-still parse.
-
-### An x.com profile was handed to the downloader, which spent 180 seconds on it
-
-Every x.com URL used to go straight to gallery-dl, and only some of them lead to media.
-Measured on the real thing:
-
-    /status/123          1 file in 3.9s   -> parse
-    /i/status/123        1 file in 3.3s   -> parse
-    /status/123/photo/1  1 file in 3.8s   -> parse
-    /pohitashi          TIMEOUT after 180s
-    /pohitashi/media    TIMEOUT after 180s
-
-A profile is a timeline, and gallery-dl treats it as "download everything this account ever
-posted". So pasting one made the user wait **three minutes** and then read a generic
-"沒有找到可傳送的圖片或影片" - which says nothing about the page they sent.
-
-`classify_twitter_url()` identifies the shape before anything is downloaded and answers with
-what the page actually is:
-
-    這是 X（Twitter）的使用者主頁（@pohitashi），不是單一貼文連結。
-    主頁會包含該帳號的所有貼文，無法在這裡一次解析，請貼上單一貼文的網址。
-
-Answered in **0.0s** instead of 180s, and the same for the other non-post shapes: profile
-tabs (媒體, 含回覆的貼文, 喜歡的內容, 追蹤者…), search results, hashtag pages, lists,
-communities, broadcasts, `/i/user`, intent/share links, and the home, explore, settings,
-notifications, messages and legal pages.
-
-#### Conservative on purpose
-
-The dangerous direction is refusing a link that works, so anything post-shaped is passed
-through untouched - including forms whose exact behaviour was not measured. Only shapes that
-are certainly not a single post are classified as other, and a `tweet` verdict falls through
-to the normal path unchanged.
-
-Two details that are easy to get wrong, both pinned by tests:
-
-- **The tab is the second path segment** (`/<user>/media`), not the first. Matching the first
-  segment looked right and silently missed every tab - they fell through to the vague
-  catch-all instead of naming the tab.
-- **A user may be named like a page.** `/media` is a real account name, and so is `/search`;
-  only `/<user>/<tab>` is a tab. The reserved words are checked first, so `/search` is a
-  search page and `/media` is a profile.
-
-Verified end to end through the real handler: a post still downloads its media, pixiv is
-untouched, and every non-post shape answers in 0.0s.
-
-### A Telegraph page's images were all broken: the original URLs need a session
-
-Reported as "生成的链接点开后图片无法加载". Fetching the page and testing every embedded image
-anonymously - which is exactly what Telegraph's own servers do - showed the cause:
-
-    12 images on exhentai.org   -> 0/3 loadable, content-type text/html (the login page)
-    12 images on <node>.hath.network -> 3/3 loadable, content-type image/jpeg
-
-The gallery page offers two URLs per page, and they are not equivalent:
-
-    <img id="img" src="https://<node>.hath.network/h/...">           public  - 200 image/webp
-    <a href="https://exhentai.org/fullimg/3778922/1/xxx/001.jpg">   session - 302 to login
-
-The second is the **original** image. 顯示圖 embedded the first form and worked; 原圖 embedded
-the second and was broken on every page, because Telegraph fetches each image itself with no
-cookies. So the 原圖 mode had never produced a working page.
-
-#### The fix: resolve the redirect the original hides behind
-
-`/fullimg/` answers with a 302 whose target is on `hath.network` - and **that target is
-publicly fetchable** (measured anonymously: `200 image/jpeg, 6121400B`). The bot already holds
-the session, so it can ask for the redirect and embed the public URL instead:
-
-    exhentai.org/fullimg/...  --302-->  yqcohbpjgjmcamalcfry.hath.network/om/.../001.jpg
-                                        ^ anonymously loadable
-
-`resolve_public_image_urls()` does this for a whole gallery, preserving length and order so a
-failure cannot shift every later page. Used by publishing **and** by 重新生成, because both
-embed the same list - fixing only the first would have left the button rebuilding a broken page.
-
-Measured on a real 27-page gallery: 20 originals converted in 17.7s, and for a 10-page set
-7.1s. 顯示圖 mode converts nothing (already public) and costs no requests.
-
-#### Verifying the target with HEAD, not a ranged GET
-
-The obvious way to confirm the redirect target works is a ranged GET, and it is wrong here -
-measured, this CDN **ignores the Range header** and answers a ranged GET with the whole file:
-
-    resolve the redirect (headers only)   2.5s
-    HEAD the target                       1.4s
-    ranged GET bytes=0-1023               7.7s -> and 6121400 bytes came back
-
-So verification uses HEAD, which costs nothing and is enough to prove the URL is served. Not
-a cosmetic detail: the first version of this used a ranged GET and would have downloaded every
-original image in the gallery, about 6 MB each.
-
-An unresolvable page is left as the original URL and **logged with a count**, rather than
-silently dropped or silently broken, so the number of missing images is known.
-
-### 重新生成 always failed once the cover loaded
-
-```
-WARNING twitter_pixiv_bot: 更新頁面訊息失敗：There is no text in the message to edit
-```
-
-A second, independent consequence of the cover feature. `edit_message_to_cover` turns the
-result message into the cover **photo**, and Telegram refuses `edit_message_text` on a media
-message. The 重新生成 handler assumed a text message, so pressing it on any gallery whose
-cover had loaded logged a failure and posted a **second copy** instead of updating in place.
-Galleries whose cover had *not* loaded were unaffected, which is why it looked intermittent.
-
-A photo's caption *can* be edited, and Telegram renders it below the image, so the cover
-survives the update and the one-message-per-request rule holds. `update_result_message()`
-picks the call from the message itself:
-
-    message.photo present  -> edit_caption
-    otherwise              -> edit_text
-
-The check reads the message object, which carries its own media from the update, so it
-reflects what the message **is now** rather than what the handler assumed when it was
-written. A photo with an empty caption is refused (Telegram requires a non-empty caption on
-media) and the caller sends separately, because a second message beats silence.
-
-Both branches were checked for the same trap: the cover is applied only in the Telegraph
-action and the archive action only edits text, and the two run from mutually exclusive
-button presses - so neither can meet a message the other converted.
-
-### Every exhentai cover was missing, and the log said only "Failed to get http url content"
-
-```
-WARNING twitter_pixiv_bot: 封面編輯失敗：https://s.exhentai.org/w/02/714/75349-4sjx86ns.webp
-                            （Failed to get http url content）
-```
-
-The code claimed the cover was "e-hentai's static thumbnail (`ehgt.org`)". It is not: an
-exhentai gallery's cover is served from **`s.exhentai.org`**, and that host requires the
-session. Telegram fetches `InputMediaPhoto(media=url)` itself, with no cookies and no
-referer, so it was refused - and because a failed cover is only a warning plus a missing
-picture, this had been silently failing on every exhentai gallery.
-
-Measured on the URL from the log:
-
-    https://s.exhentai.org/w/02/714/75349-4sjx86ns.webp  -> 403   (anonymous)
-    https://ehgt.org/w/02/714/75349-4sjx86ns.webp        -> 200   image/webp, 29.8 KB
-
-**The paths are byte-identical** - only the host differs. Confirmed by fetching one gallery
-through both hosts, which is what makes the fix a substitution rather than a guess:
-
-    exhentai.org  https://s.exhentai.org/w/02/240/36544-r7iw06st.webp
-    e-hentai.org  https://ehgt.org/w/02/240/36544-r7iw06st.webp
-
-`public_thumbnail_url()` rewrites the session-bound hosts to `ehgt.org`, and refuses
-anything else. Two limits keep it honest:
-
-- **Only thumbnail paths.** The rewrite is a host substitution, so it is safe exactly
-  because the path is carried over unchanged; a non-image URL is refused rather than turned
-  into a request to an unrelated host.
-- **Only hosts known to be fetchable.** An unknown host is refused rather than sent and
-  failed, because Telegram's error names neither the host nor the reason - guessing costs a
-  round trip and produces a log line nobody can act on.
-
-Verified on both real galleries after the change: anonymous requests return
-`200 image/webp`, so the cover now renders.
-
-### Cache audit: two more ways one resource was cached twice
-
-Following the archive-cache report, every cache in the codebase was checked for the same
-class of defect - a store and a lookup that do not agree on the key. Two more were real.
-
-#### Host aliases were separate cache entries
-
-`normalize_cache_key` lowercased the scheme and host and dropped the query, fragment and
-trailing slash, but it did not know that some hosts are the same site. Verified against the
-live sites rather than assumed:
-
-    https://twitter.com/...      -> 301 -> https://x.com/...          (same post)
-    https://pixiv.net/...        -> 301 -> https://www.pixiv.net/...  (same artwork)
-    https://www.e-hentai.org/... -> 302 -> https://e-hentai.org/...   (same gallery)
-    http://...                   -> 301 -> https://...                (same resource)
-
-The media cache has no canonicalisation of its own beyond this function, so a post reached
-through `twitter.com` and then `x.com` was **two entries with two copies of the same files
-on disk**. Six forms of one tweet now collapse to one key:
-
-    https://x.com/u/status/1          \
-    https://twitter.com/u/status/1     |
-    https://www.x.com/u/status/1       |  all ->  https://x.com/u/status/1
-    http://twitter.com/u/status/1      |
-    https://twitter.com/u/status/1?s=20|
-    https://x.com/u/status/1/         /
-
-The alias table is explicit rather than rule-based, because the canonical form differs per
-site - pixiv's is the `www` one - and because **a host outside the supported set must never
-be renamed**. A suffix match would have merged `notx.com` with `x.com`; a test pins that it
-does not.
-
-#### Files an earlier store orphaned were never reclaimed
-
-The media cache names files `<url hash>_<index><suffix>`. `store()` replaces the whole
-entry, so a re-parse that produced a different file set - fewer pages, or the same pages in
-a different format - indexed the new names and abandoned the old ones, which nothing then
-deleted. The measured cache had no orphans, so this had not bitten yet; the mechanism was
-there.
-
-`orphaned_cache_files()` treats the index as the complete list of what is legitimate and
-removes the rest, at the moment they become unreachable (the write path) and once at
-startup for anything written before this existed. It is deliberately narrow, and the test
-asserts the dangerous direction: the live files, the archive cache in its subdirectory, and
-an unrelated file dropped in the cache directory all survive.
-
-#### Checked and found sound
-
-- **`ParseCache.store`/`lookup`/`age` all key through `normalize_cache_key`**, so they agree
-  by construction; the defects above were all in *what* the key was given.
-- **The viewer-URL TTL gate is correct at both boundaries** (7195s reuses, 7205s refreshes),
-  and `GALLERY_URL_TTL_SECONDS` (2h) is properly shorter than `CACHE_STALE_SECONDS` (14d) -
-  the signed URLs expire long before the entry that carries them.
-- **The archive cache is hit before the resolve**, so the 3s round trip is saved too.
-- **`_regenerate_cache`** is bounded (200) and keyed by `(chat, user)`, so one person cannot
-  regenerate another's page.
-- **`_requests_in_flight`** is bounded to one entry per user and popped by `end_request`.
-- **A gallery entry cannot be overwritten by a media entry**: e-hentai URLs never reach the
-  media store, which is only called from the X/Pixiv handler.
-
-### The e-hentai archive cache did not work: one gallery was stored twice
-
-Reported as "归档下载快取功能没有作用". Measuring where an archive request spends its time
-showed which cache mattered, and then why it never hit.
-
-**Where the 41 seconds go** (real 27-page gallery, 歸檔 · 原圖):
-
-| stage | time | a cache removes |
-| --- | --- | --- |
-| read gallery metadata | 1.7s | — |
-| viewer URL sweep (27 pages) | 4.5s | gallery cache |
-| resolve the archive link | 3.1s | archive cache |
-| download 76.3 MiB | 31.9s | archive cache |
-| **total** | **41.2s** | |
-
-#### The gallery cache missed because the key included the host
-
-e-hentai.org and exhentai.org serve the same gallery under the same `gid` and `token`, but
-the cache entry was stored under whatever URL the request arrived with. The cache was found
-holding the gallery **twice**:
-
-    https://e-hentai.org/g/3778922/19330e2349   -> 27 display_urls
-    https://exhentai.org/g/3778922/19330e2349   ->  0 display_urls
-
-So submitting an exhentai link and then pressing a button was a cache miss, and the entry a
-button press wrote never satisfied the link handler. Whichever host a gallery was first seen
-through, only that one entry was ever reused - the second was dead weight.
-
-`gallery_cache_key()` now keys on `gid`/`token`, which collapses six URL variants of one
-gallery (both hosts, trailing slash, `www.`, `?p=N`) into a single entry:
-
-    https://exhentai.org/g/3778922/19330e2349/     \
-    https://e-hentai.org/g/3778922/19330e2349/      |
-    https://e-hentai.org/g/3778922/19330e2349       |  all ->
-    https://e-hentai.org/g/3778922/19330e2349/?p=2  |  https://e-hentai.org/g/3778922/19330e2349/
-    https://www.e-hentai.org/g/3778922/19330e2349/  |
-    https://exhentai.org/g/3778922/19330e2349/?p=3 /
-
-#### The archive file itself was never kept
-
-There was no cache for the downloaded archive at all - every request made e-hentai repackage
-the gallery and re-transferred the whole file. That is 35 of the 41 seconds. It is now kept
-under `.cache/archives/`, keyed by gallery **and** variant (1280 and 原圖 are different
-files), and a repeat is a resend:
-
-    49.7s   ->   0 ms        (76.3 MiB, second request)
-
-The check runs **before** `resolve_official_archive`, not after: resolving is itself a
-network round trip to the archiver, and it is one of the two steps the cache exists to
-remove. A test pins that ordering.
-
-Details that matter:
-
-- **Bounded on its own.** `ARCHIVE_CACHE_MAX_BYTES` (default 8 GiB) is separate from the
-  media cache's 2 GiB, because the magnitudes differ by orders of magnitude: 300 cached
-  artworks are ~100 MB, while 300 cached archives would be tens of GB. Least recently used
-  is evicted first, so a gallery you keep returning to survives.
-- **Can be switched off** with `ARCHIVE_CACHE=0`, without editing code - which is what a
-  debugging session usually wants.
-- **Written atomically** via a temp file and rename, so a kill part-way through cannot leave
-  a truncated file that later looks like a complete archive. A 0-byte entry is never served.
-- **A failed resend falls back to downloading.** A cache is an optimisation; no failure of
-  it may cost the user their file.
-- **Shown and clearable in `/cache`**, which now reports the archive cache separately - it
-  lives inside `CACHE_DIR`, so it is excluded from the media figure or it would be counted
-  twice.
-
-The cold path is unchanged: the first request for a gallery still costs the full 41s.
-
-### A warning could stop the bot from starting, and a blank `.env` would
-
-Found while testing the change above, and both are the same mistake in two forms:
-**a failure path that was never taken during development.**
-
-#### `logger` was defined below code that used it
-
-`logger` was created hundreds of lines into the file, but `Authorization.load()` runs at
-import time well above it - and both `load()` and `save()` log warnings from their failure
-paths. On a normal start neither path is taken, so the missing name never showed. The
-moment one was taken, the bot died at import with:
-
-    NameError: name 'logger' is not defined
-
-pointing at a warning call rather than at the cause. Logging is now configured before
-anything that logs. **A warning must never be able to stop the bot from starting.**
-
-#### `os.getenv("X", default)` does not default for an empty value
-
-`.env.example` lists every optional key, and the instructions say to copy it. Every
-optional value in it was blank - and `int("")` raises:
-
-    ValueError: invalid literal for int() with base 10: ''
-
-so copying the template produced a bot that would not start, with an error naming a line
-far from the cause. There was a quieter version of the same trap for paths: `Path("")` is
-the current directory, so a blank `AUTH_FILE` or `CACHE_DIR` silently pointed at the
-repository folder instead of the intended file.
-
-Both are handled now by `env_number()` and `env_text()`, which treat a missing, blank or
-whitespace-only value as unset. A test copies `.env.example` verbatim into a scratch
-directory, blanks **every** value, and asserts the bot still imports:
-
-    AUTH_FILE  = authorized.json
-    CACHE_FILE = parse_cache.json
-    CACHE_DIR  = .cache
-    MAX_FILES  = 20   DEADLINE = 300
-
-Writing that test caught two more mistakes of my own: a helper referenced `time` where the
-module imports it as `_time`, so it threw `NameError` and silently returned `False`; and a
-mechanical regex that rewrote `int(os.getenv(...))` matched across a `try/except` boundary
-and produced a syntax error. Fixed sites by hand after that.
-
-### The archive had no total time bound, and page images sat in memory
-
-**Two separate problems in the same download path.**
-
-#### The official archive was bounded per read but not in total
-
-The only limit was a 300s *per-read* timeout, which a slow but steady transfer never
-trips - so a stalled or throttled download could stage an arbitrarily large file for an
-unbounded time. There is now one wall-clock deadline for the whole transfer,
-`ARCHIVE_DEADLINE_SECONDS` (default **300s / 5 minutes**), covering the probe, every range
-worker and the single-stream fallback together.
-
-Two details that are easy to get wrong:
-
-- **One deadline, not one per path.** It is created before the parallel/single decision and
-  handed to both, so a fallback to a single stream cannot start a fresh budget and double
-  the wait.
-- **The timeout is its own exception type.** A range request can also raise `EhentaiError`
-  for an HTTP status, and that one *is* worth retrying. Reusing the same type would have let
-  a timeout be retried as a "failed range", burning a second full budget and then reporting
-  a **corrupt download** instead of a timeout.
-
-A per-read timeout could not have caught the case that matters, so the test serves a stream
-that trickles bytes forever and asserts it is aborted:
-
-    pre-expired deadline -> aborted in 1.2s after 256 KiB
-    budget 2.0s          -> aborted after 2.6s
-
-For reference, a real 76.3 MiB original completes in about 27s here, so the 300s budget is
-roughly ten times the normal case and only a genuinely stalled transfer reaches it.
-
-#### Page images were read entirely into memory
-
-`download_gallery_direct` did `response.content` and then wrote the bytes, with
-`EHENTAI_DOWNLOAD_WORKERS` running at once - several full images resident simultaneously for
-no reason, and nothing capped a single oversized file. Each page is now streamed to a
-`.part` file in 256 KiB chunks and renamed into place, so memory is one chunk per worker
-regardless of image size.
-
-Measured, single worker, 64 MiB page:
-
-    peak traced RAM: 4.03 MiB   (6.3% of the file size)
-
-and the streamed files are byte-identical to the source (verified by hash over a local
-server). The rename is what makes it safe: a half-written file exists only under its
-`.part` name, so a failure part-way through can never look like a complete image.
-
-### The 停止 button did nothing, and the reason was one missing line
-
-PTB processes **one update at a time** by default, and a button press is an update. While a
-long download held the single slot, the press was never dispatched, so it could not set the
-stop flag until the download had already finished and cleared it. The message the user got
-was "目前沒有進行中的下載" - while the download was still running.
-
-Reproduced against PTB's own update processor before changing anything:
-
-    current (1 at a time)      stop dispatched while download ran: False
-    concurrent_updates(4)      stop dispatched while download ran: True
-
-The fix is `concurrent_updates(MAX_CONCURRENT_UPDATES)`, which also removes a denial of
-service: one 15-minute request used to freeze **every** other user, not just the button.
-
-#### The first attempt at admission control was wrong, and measuring showed it
-
-Concurrency alone would multiply the per-request worker pools, which were sized against
-serial execution, so heavy gallery work is bounded by `gallery_semaphore`. The first version
-made a request **wait** for a slot. Measured with six jobs submitted:
-
-    stop dispatched while 6 jobs queued: False
-    peak concurrent heavy jobs: 2 (bound is 2)
-
-A job parked on the semaphore is still inside its handler, and a handler holds one of the
-`MAX_CONCURRENT_UPDATES` slots for the whole wait - so every slot was occupied by a job doing
-nothing, and the stop press was not dispatched until one finished. **The same dead button,
-moved to a different trigger.** The code now takes the slot without waiting and refuses a
-third request immediately:
-
-    stop dispatched while others run/queue : True
-    peak concurrent jobs : 2 (bound 2)
-    served / refused     : 2 / 4
-
-"Busy, try again" beats a frozen bot, and the refusal arrives at once instead of minutes
-later.
-
-#### The tests for this were wrong first, too
-
-The initial tests built their **own** `Application` with `concurrent_updates`, so deleting the
-call from the bot left them all passing - they were asserting on the test's code, not the
-bot's. That is why `build_application()` now exists: it is the one place the Application is
-assembled, and the tests go through it. Removing the line now fails three checks, including
-the end-to-end one that presses stop and asserts the running job observes the flag.
-
-### The official archive has no total bound (still open)
-
-#### Known and NOT fixed
-- **The archive is pre-sized from an untrusted `Content-Range` header.** The total
-  transfer time is now bounded, so this can no longer stage a file indefinitely, but a
-  hostile header could still ask for a large pre-allocation up front.
-- `parse_cache.json` and `.cache/` are **writable by any authenticated local user** on a
-  default Windows profile ACL, and `.env` is readable by them. This is what makes the cache
-  findings reachable. On a shared machine:
-  `icacls .env /inheritance:r /grant:r "%USERNAME%:(R,W)"`
-- `api_hash` is passed to the local Bot API server on its command line, so it is visible to
-  any local user through a process listing.
-
-#### Checked and clean
-No command-injection vector: only two `gallery-dl` invocations, both argv lists with
-`shell=False`, `--` always last. No `eval`/`exec`/`pickle`/`yaml.load` in first-party code.
-No path traversal in `sanitize_filename` or ZIP entry names, and the bot never extracts an
-archive it downloads. No cache-key collision across different resources. No non-admin path
-to administrator, and the last admin cannot be demoted or revoked. `admin_only` is
-fail-closed when no admins are configured. No credential file is tracked and `.gitignore`
-covers every one of them; the real `api_hash` and `api_id` never reached a commit.
-
-### SECURITY: the bot description was hijacked
-The bot's Telegram description was found holding a promotional link:
-
-```
-🔥 Best AI Porn here:
-👉 https://evadast.com/telegram?start=ref_c3966075e4
-🔞 🔥 Лучшее AI-порно здесь:
-👉 https://evadast.com/telegram?start=ref_c3966075e4
-```
-
-Two languages, and a `ref_` code, so it is a paid referral rather than a mistake. **Nothing
-in this repository has ever set a description** - `getMyDescription` was queried directly
-and the text was there, while no code path writes it. It could only have been written by
-someone holding the bot token.
-
-**Treat this as a credential compromise, not a cosmetic problem.** Whoever can set a
-description holds the same token that reads updates and sends messages as the bot. Anyone
-who used the bot while that text was live may have had their links and messages exposed to
-that party.
-
-What to do, in order:
-
-1. **Rotate the token** with BotFather (`/revoke`) and put the new one in `.env`. This is
-   the actual fix; everything below only repairs the symptom.
-2. Check BotFather for anything else that was changed - the name, the about text, the
-   profile photo, and any linked channel.
-3. Restart the bot, which re-publishes its own profile text (below).
-
-The bot now sets `set_my_description` and `set_my_short_description` on **every startup**
-from `BOT_DESCRIPTION` / `BOT_SHORT_DESCRIPTION` (both overridable from `.env`). That makes
-the profile self-healing: an injected description survives only until the next restart.
-A failure to set them is logged and ignored, because an unset description is cosmetic
-while failing to boot is not.
-
-**Why a description is worth attacking:** it is what Telegram shows a user *before* they
-send anything, so it is the highest-reach text a bot has. A referral link there is seen by
-every visitor.
-
-### The viewer-link pattern was hard-coded to e-hentai.org
-`_VIEWER_LINK_RE` matched only `https://e-hentai.org/s/...`, so **every exhentai gallery
-had zero viewer links** and the feature failed there with "讀不到畫廊的圖片清單。連結可能有誤，
-或畫廊已被刪除。" - a message that sends the user looking for a broken link when the page
-was fine:
-
-    e-hentai.org   https://e-hentai.org/s/...   -> 27 matches
-    exhentai.org   https://exhentai.org/s/...   ->  0 matches
-
-The pattern now accepts both hosts. A test pins both, and that an unrelated host is not
-mistaken for one.
-
-### exhentai paginates at 20 - and 20 happened to equal MAX_FILES
-exhentai shows 20 images per page ("Showing 1 - 20 of 27 images") while e-hentai returns
-the whole gallery at once. The cap was applied **inside** the paging loop:
-
-    for page_index in range(1, pages):
-        if len(links) >= max_images:
-            break
-
-Since `max_images` is `MAX_FILES` and exhentai's page size is exactly 20, the first page
-filled the budget and the loop broke immediately. **The pagination code was dead on
-arrival** and a 27-image gallery stayed at 20. The cap is now applied after paging.
-
-A gallery larger than the cap is also **reported** rather than silently shortened - the
-progress message keeps "（作品共 27 張，單次最多 20 張）" on its final edit, which matters
-because that is the copy the user actually reads. Before, the truncation was invisible;
-use `歸檔` for the complete set.
-
-### urllib does not read the Windows registry proxy either
-The live credential check used `urllib.request.urlopen`, which honours only the
-`http_proxy` environment variables - not the registry. Every check therefore failed with
-"URLError: handshake operation timed out" and reported **valid credentials as
-unverifiable**: measured 30.4s with X/Twitter and Pixiv both "無法連線" while the same
-cookies downloaded perfectly. It now uses the same proxied httpx client as everything
-else, and reports in 2.8s with all three checks passing.
-
-The same omission was in `probe_telegram_limits`, whose `httpx.get` had no proxy: the
-probe failed, was reported as "using the public API", and silently dropped the upload
-ceiling from 2000 MB back to 50 MB.
-
-### A note on diagnosing this class of problem
-Every one of the failures above was originally blamed on the remote site. The check that
-settled each one was **comparing our own request against a known-good one** - a browser,
-or the same call with `proxy=` passed explicitly. When a site works in a browser and not
-from code, suspect the client's configuration before the site's policies.
-
-### e-hentai's 39-byte refusal is a real answer, not a timeout
-Separately from the proxy problem, e-hentai answers some requests with **HTTP 200** and a
-39-byte body:
-
-```
-Key missing, or incorrect key provided.
-```
-
-**A status check cannot see this, because it is a 200.** It is detected by its body in
-`parse_gallery_page` and reported as an access refusal rather than as "連結有誤或畫廊已被
-刪除", which would send the user hunting for a problem that is not there. `EHENTAI_COOKIES`
-matters for it: a fresh cookie can lift the refusal when the cause is session-related.
-
-Retrying cannot help, because it is a considered answer rather than a dropped connection.
-
-### e-hentai also throttles bursts
-The front page can answer 200 while gallery paths time out, which is a real TCP-level
-throttle and is what `request_with_retry` exists for. **Its window is sized against the
-measured behaviour rather than to look reasonable:** three attempts with a short fixed
-delay. An earlier five-attempt doubling schedule reached roughly 120 requests during
-testing and the host then began refusing gallery paths outright, so heavier retrying made
-things worse rather than better.
-
-Only connection-level failures are retried. An HTTP status is a considered answer, so
-retrying it would repeat the refusal while making the user wait.
-
-### Cookie files may hold several sites — filter by domain
-A Netscape cookie file is not necessarily single-site. The one here carried `.pixiv.net`
-and `.x.com` rows alongside the e-hentai ones, and the reader sent **every** cookie to
-**every** e-hentai request — a multi-site leak. It is now filtered against
-`ehentai.COOKIE_DOMAINS`, with a suffix comparison so a leading-dot row still matches its
-own subdomains. Measured 1707 characters of header before, 1041 after, with the foreign
-cookies gone.
-
-### `base_url` must end with `/bot` — the token is appended, not inserted
-Pointing the bot at a self-hosted server is one line, and getting it subtly wrong kills
-the bot during bootstrap:
-
-```python
-builder.base_url(telegram_base_url())   # must end with "/bot"
-```
-
-python-telegram-bot parses that value like this:
-
-```python
-def _parse_base_url(value, token):
-    ...
-    return value + token          # APPENDS the token
-```
-
-It does **not** substitute a `{token}` placeholder, so the value must already end with
-`/bot` — which is why the library's own default is `"https://api.telegram.org/bot"`.
-Passing the bare server root produced a URL with the token glued onto the port:
-
-```
-Bot.base_url = 'http://127.0.0.1:<REDACTED-TOKEN>'
-httpx.InvalidURL: Invalid port: '<REDACTED-TOKEN>'
-```
-
-That message points nowhere near the cause — it reads like a malformed token or a bad
-port, not a missing `/bot`. Hence the module exposes **two** helpers, which must not be
-swapped:
-
-| Helper | Shape | For |
-| --- | --- | --- |
-| `telegram_server_root()` | `http://127.0.0.1:8081` | building a URL yourself |
-| `telegram_base_url()` | `http://127.0.0.1:8081/bot` | PTB's `base_url()` |
-
-`telegram_base_url()` also returns `""` when no local server is set, so `main()` can test
-it for truthiness and skip `base_url()` entirely. A characterization check pins PTB's
-actual behaviour, so a release that switches to a `{token}` placeholder fails loudly at
-that point rather than at the next boot.
-
-### Filtered networks: the server needs MTProto through a proxy
-Telegram's MTProto hosts are **partly filtered** on this network. Measured:
-
-| From | Result |
-| --- | --- |
-| host, direct | some addresses open (`91.108.4.204`), others blocked (`149.154.167.50`) |
-| container, direct | **all** blocked — Docker is filtered harder than the host |
-| either, through the host SOCKS5 | **all** open |
-
-So the upstream image cannot log in unaided. It starts, looks healthy, and hangs on
-`getMe` with an empty log — easily mistaken for a wrong `api_id`. `TDLib` **ignores proxy
-environment variables**, and the server's own `--proxy` is webhook-only, so no
-configuration of that image fixes it.
-
-`Dockerfile.bot-api-proxy` wraps the image and adds the one thing that works:
-
-| Piece | Role |
-| --- | --- |
-| `redsocks` | listens locally, relays through an upstream SOCKS5 proxy |
-| `iptables` NAT rules | send everything bound for Telegram's ranges to redsocks |
-
-TDLib is never told anything, so there is nothing for it to ignore. The Telegram
-**ranges** are redirected whole rather than by address list, because TDLib fetches the
-current data-centre addresses at runtime and keeps discovering more — a list would work
-until it silently did not. `NET_ADMIN` is required and is the only added capability.
+`TDLib` **會忽略代理相關的環境變數**，而伺服器自己的 `--proxy` 只給 webhook 用，所以那個映像檔再怎麼設定都救不回來。`Dockerfile.bot-api-proxy` 包住映像檔並加上唯一有效的做法：`redsocks` 在本地監聽、把流量轉給上游 SOCKS5，再用 `iptables` NAT 規則把發往 Telegram 位址範圍的流量整段導過去。TDLib 什麼都不知道，所以也沒有東西可以被它忽略；需要 `NET_ADMIN`，也是唯一新增的能力。詳情與歷史（Windows bind mount、過期 volume）見 [docs/NOTES.md](docs/NOTES.md)。
 
 ```ini
 TELEGRAM_MT_PROXY=socks5://192.168.65.254:17900
 ```
 
-**The host proxy must be reachable from a container**, which is the part that trips
-people up. It binds to `127.0.0.1` only, so a container cannot use it, and
-`host.docker.internal` does not help — it resolves to the Docker VM's address, where
-nothing listens. `host_proxy_relay.py` bridges that:
+**主機代理必須能從容器連到**，這是最常讓人卡住的地方。它只綁 `127.0.0.1`，容器用不到，而 `host.docker.internal` 也沒用——它解析到 Docker VM 的位址，那裡沒有東西在聽。`host_proxy_relay.py` 負責搭橋（它是 **TCP 轉接，不是代理**——客戶端仍自己做 SOCKS5 握手——而且沒有相依套件）：
 
 ```sh
 python host_proxy_relay.py            # 0.0.0.0:17900 -> 127.0.0.1:7897
-python host_proxy_relay.py --selftest # prove the whole chain (run inside the container)
+python host_proxy_relay.py --selftest # 驗證整條鏈路（在容器裡跑）
 ```
 
-It is a **TCP relay, not a proxy** — the client still performs the SOCKS5 handshake — and
-it has no dependencies.
-
-**An inbound firewall rule is required**, because Windows blocks connections from the
-container by default. Without it the relay works perfectly from the host while the
-container reports it as unreachable, which is a confusing pair of facts to hold at once:
+**還需要一條 inbound 防火牆規則**，因為 Windows 預設會擋掉來自容器的連線。少了它，轉接在主機上完美運作，容器卻回報連不到：
 
 ```powershell
-# Administrator PowerShell, once:
+# 以管理員 PowerShell 執行一次：
 New-NetFirewallRule -DisplayName "bot-api relay" -Direction Inbound `
   -Protocol TCP -LocalPort 17900 -Action Allow
 ```
 
-**The relay must be running whenever the bot is.** The server cannot reach Telegram
-without it, so it belongs in startup rather than a terminal. Diagnose the three layers
-separately, in this order:
+**轉接必須跟機器人一起活著**：伺服器沒有它就連不到 Telegram，所以它屬於啟動流程，而不是某個終端機視窗。診斷時要分三層、依序做：
 
 ```sh
-# 1. relay works locally?      (host)      -> SOCKS5 CONNECT ok
-# 2. container reaches relay?  (container) -> --selftest reports CONNECT ok
-# 3. server logs in?           (host)      -> getMe returns 200
+# 1. 轉接在本機通嗎？   （主機）     -> SOCKS5 CONNECT ok
+# 2. 容器連得到轉接嗎？ （容器）     -> --selftest 回報 CONNECT ok
+# 3. 伺服器登入得了嗎？ （主機）     -> getMe 回 200
 ```
 
-### Historical note: what the network looked like before the proxy
-The two faults below were real and are fixed, but the *symptom* they shared — a healthy
-container that hangs on `getMe` — is the same one the missing proxy produces. Check the
-three layers above before suspecting either.
-
-| Fault | Effect | Fix |
-| --- | --- | --- |
-| The work dir was a **Windows bind mount** (9p/drvfs) | TDLib's binlog rename failed, `Signal: 6`, the server crash-looped and answered 502 to everything — indistinguishable from bad credentials | a **named volume**, which is ext4 |
-| A stale volume from a failed run | TDLib never got past initialisation, log silent | wipe the volume, not just the container |
-
-### `--local` is the flag that matters
-Without it the server still enforces the public 50 MB limit, so switching gains
-nothing. `TELEGRAM_LOCAL=1` is the bot's own statement that the server runs that way —
-the server does not report its mode, and assuming `--local` were on would make **every**
-file send fail rather than degrade gracefully.
-
-The bot **probes** the server at startup rather than assuming: it calls `getMe` and only
-raises its limits if a server actually answers. An unreachable or misconfigured server
-therefore leaves the public limits in force, and `/status` reports which limits are
-active and why.
+### `--local` 才是關鍵旗標
+沒有它，伺服器仍套用公開的 50 MB 上限，切換等於沒換。`TELEGRAM_LOCAL=1` 是機器人自己對「伺服器是那樣跑的」的聲明——伺服器不會回報自己的模式，而**假設** `--local` 開著會讓每一次檔案傳送都失敗，而不是優雅降級。機器人啟動時是**探測**而不是假設：它呼叫 `getMe`，只有在真的有伺服器回應時才提高上限。所以連不到或設定錯誤的伺服器會讓公開上限繼續生效，而 `/status` 會回報目前生效的上限與原因。
 
 ```ini
-TELEGRAM_API_BASE=              # empty = use api.telegram.org
-TELEGRAM_LOCAL=                 # 1 only if the server runs with --local
+TELEGRAM_API_BASE=              # 空白 = 用 api.telegram.org
+TELEGRAM_LOCAL=                 # 只有伺服器以 --local 執行時才設 1
 ```
 
-`run_local_api.py` is a thin, readable wrapper. With Docker available it prefers the
-container (no compiler needed); it reads `.env`, checks for the credentials, probes
-whether something already answers on port 8081, redacts the `api_hash` when printing a
-command line, and reports what is missing. It does **not** build the server.
+`run_local_api.py` 是一層薄而可讀的包裝：有 Docker 時優先用容器（不需要編譯器），會讀 `.env`、檢查憑證、探測 8081 是否已有東西在回應、印出指令列時遮蔽 `api_hash`，並回報缺什麼。它**不**負責編譯伺服器。
+
+## 常見問題 / 已知限制
+
+### X/Twitter 常常沒有結果
+反覆驗證過，包含對一則長期存在的公開貼文（NASA 的推文），以及 X 自己未認證的 syndication 端點——後者回 HTTP 200 但內容是空的。cookie 沒問題：是 **X 對這類客戶端不給推文內容**。這是 X 端的限制，上游追蹤在 [mikf/gallery-dl#9267](https://github.com/mikf/gallery-dl/issues/9267)，不是這裡設定錯了。
+
+- 用 `bot.py --check` 確認憑證；如果那裡已經顯示「已登入」，重匯 cookie 不會有幫助。
+- 試 `python -m pip install -U gallery-dl`——上游的更新偶爾會繞過 X 的改動。
+- Pixiv 不受影響。
+
+機器人會明確回報這個情況，而不是聲稱登入失敗。
+
+### e-hentai 好像「卡住」
+**這是代理問題，不是 e-hentai 的錯。** `httpx` 不讀 Windows 的系統代理，所以在這台機器上每個 e-hentai 請求都直接出去然後逾時，而同一個網址在瀏覽器裡正常。`ehentai.http_client_kwargs()` 會回傳每個 client 都需要的關鍵字參數，`bot.py` 與 `ehentai.py` 裡**全部九個** httpx client 都用它；有一項特徵化檢查會走過兩個檔案，任何沒有用它的 `httpx.Client(...)` 都會讓檢查失敗。完整量測見 [docs/NOTES.md](docs/NOTES.md)。
+
+### 上傳超過 50 MB
+`歸檔 · 原圖` 常見是 148 MB 以上，公開 API 收不下。改用 `歸檔 · 1280`（約 3.2 MiB），或架自架 Bot API 伺服器把上限提到 2000 MB（見上一節）。
+
+### 封面不見了，或 `重新生成` 失敗過
+exhentai 畫廊的封面放在 `s.exhentai.org`，那個主機需要 session，而 Telegram 抓圖時不帶 cookie，所以會被拒絕；程式會把這個主機改寫成公開的 `ehgt.org`（路徑完全相同），未知主機則拒絕改寫。另一方面，`edit_message_to_cover` 會把結果訊息變成封面**照片**，而 Telegram 拒絕對媒體訊息做 `edit_message_text`；現在 `update_result_message()` 會看訊息本身：有 `message.photo` 就 `edit_caption`，否則 `edit_text`。
+
+### 「Key missing, or incorrect key provided.」
+e-hentai 有時候用 **HTTP 200** 加一段 39 位元組的內容回答。**狀態碼檢查看不到它，因為它是 200**；程式靠內容辨識，並回報為「存取被拒絕」，而不是「連結有誤或畫廊已被刪除」——後者會讓使用者去找一個不存在的問題。`EHENTAI_COOKIES` 對這種情況有用：當原因是 session 相關時，換一份新 cookie 可以解掉。重試沒有幫助，因為那是一個經過考慮的回答，不是斷線。
+
+### Windows 每次都跳「開啟檔案 - 安全性警告」
+雙擊 `run.bat`（或它的捷徑）會問「你要開啟此檔案嗎？」並標示「未知的發行者」。**原因不是 zone mark**（實測不存在），而是專案資料夾帶著可繼承的 **Low 完整性標籤**，Windows 因此把它們當成不可信。以**管理員** PowerShell 修一次：
+
+```powershell
+icacls "D:\TG_Bot\twitter_pixiv_tg_bot_windows" /setintegritylevel m /t /c
+```
+
+要還原就 `/setintegritylevel l /t /c`。沒有提權的嘗試只會改到一部分檔案（實測 3703 個中的 139 個），其餘回報 `Access is denied`，所以一定要提權。完整的調查（SmartScreen、AppLocker、`Zone.Identifier`、火絨安全軟體）在 [docs/NOTES.md](docs/NOTES.md)。
+
+### `停止` 按鈕沒有反應過
+PTB 預設**一次只處理一個 update**，而按鈕按一下就是一個 update。長時間下載佔住那個位置時，按鍵根本不會被派送，所以 `停止` 一直到下載結束、旗標被清掉之後才生效。現在用 `concurrent_updates(MAX_CONCURRENT_UPDATES)`，順帶解掉一個阻斷服務問題：一個 15 分鐘的請求以前會凍住**所有**其他使用者。重試的錯誤設計（等待 semaphore 反而讓同一個按鈕再次失效）記在 NOTES。
+
+### 其他已知限制
+- 公開的 `t.me/<name>` 網址無法只靠網址可靠地分類成群組、頻道、使用者或機器人。
+- 機器人不會加入或驗證 Telegram 邀請連結。
+- 只支援 X/Twitter 與 Pixiv 的作品連結，以及 e-hentai 的畫廊連結；其他站點不抓取。
+- 站方改版或認證變更都可能影響 gallery-dl。
+- 目前的範例用 polling 與暫存目錄，是單一行程的原型。
+- 對外大規模使用之前，需要更強的濫用防護與監控。
+
+### 安全性
+- 在聊天裡曝露的 token 要立刻用 `@BotFather` 的 `/revoke` 換掉；新 token 只放 `.env`。
+- 不要分享 `.env` 或 cookie。`.env` 與 `cookies/` 都被 gitignore，請保持這樣。
+- 公開使用時把 `BLOCKED_USER_IDS` 留空；要限制就把 ID 填進去。`/id` 會顯示數字的使用者與聊天 ID。
+- 對外公開之前先設好 `ADMIN_USER_IDS`；否則 `/cookies` 與 `/status` 就是不可用，而那正是安全的預設。
+- 只會抓 X/Twitter、Pixiv 與 e-hentai 的網址，所以訪客無法用機器人去碰任意位址。
+- 只下載或轉發你有權存取的內容；對外大規模使用前請先強化濫用防護。
+
+### 指令列小工具
+`bot.py` 啟動機器人；`bot.py --check` 印出設定、憑證、gallery-dl 與 Pillow 狀態；`bot.py --check --live` 再加上每站一次真實的認證請求；`bot.py --dry-run` 建好所有 handler 後結束、不連 Telegram；`bot.py --pixiv-token <url|code>` 從貼上的 callback URL 取出 OAuth `code`；`pixiv_login.py [--auto]` 完成 Pixiv OAuth 流程並把 refresh token 寫進 `.env`；`install_pillow_offline.py` 在 pip 裝不了時把 Pillow 裝進 `vendor/`；`test_bot_features.py` 是路由、憑證、送出與清理的自測。
+
+## 致謝 / 授權
+
+這個機器人站在一整排開源專案上：
+
+| 專案／服務 | 用途 |
+| --- | --- |
+| [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) | Telegram Bot API 的 Python 封裝 |
+| [gallery-dl](https://github.com/mikf/gallery-dl) | X/Twitter 與 Pixiv 的下載引擎 |
+| [httpx](https://www.python-httpx.org/) | 所有對外 HTTP 請求 |
+| [Pillow](https://python-pillow.org/) | 超大照片的縮圖處理 |
+| [python-dotenv](https://github.com/theskumar/python-dotenv) | 讀取 `.env` |
+| [websockets](https://github.com/python-websockets/websockets) | `pixiv_login.py --auto` 讀 Chrome DevTools |
+| [boto3](https://github.com/boto/boto3) | Cloudflare R2 的 S3 用戶端（選用） |
+| [telegram-bot-api / TDLib](https://github.com/tdlib/telegram-bot-api) | 自架 Bot API 伺服器 |
+| [Cloudflare R2](https://developers.cloudflare.com/r2/) | 不會過期的圖片代管（選用） |
+| [e-hentai](https://e-hentai.org/)／[exhentai](https://exhentai.org/) | 畫廊資料、圖片與官方壓縮檔 |
+| [Telegraph](https://telegra.ph/) | 畫廊頁面的發佈平台 |
+
+另外感謝 [mikf/gallery-dl#9267](https://github.com/mikf/gallery-dl/issues/9267) 的追蹤紀錄，以及 `tag_translations.py` 裡那份標籤對照表（約 380 筆）。程式碼在 <https://github.com/YuNaiAFK/twitter_pixiv_tg_bot_windows>。
+
+**授權：** 本儲存庫目前沒有 `LICENSE` 檔案，README 也沒有聲明授權條款；在再利用之前請先向作者確認。
+
+**免責：** 請尊重各站的服務條款與著作權（下載權限見上面的安全性一節），成人內容的發佈——尤其是 Telegraph 頁面——可能違反平台政策而被移除。實作歷史、疑難雜症與安全稽核紀錄都在 [docs/NOTES.md](docs/NOTES.md)。
