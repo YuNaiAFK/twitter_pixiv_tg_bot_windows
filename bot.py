@@ -5482,10 +5482,11 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
 
         info = build_gallery_info(gallery)
         notes = []
+        # The functional notice stays: it explains why the Telegraph action is unavailable. The
+        # adult-content notice that used to follow it does not - "Telegraph 頁面可能被移除" is an
+        # opinion about someone else's moderation policy, and not an actionable one.
         if gallery.is_adult and not TELEGRAPH_ALLOW_ADULT:
             notes.append("（成人畫廊，依設定不建立 Telegraph 頁面）")
-        elif gallery.is_adult:
-            notes.append("（成人內容，Telegraph 頁面可能被移除）")
 
         prompt = "\n".join([
             info,
@@ -5669,8 +5670,6 @@ async def run_regenerate(query, user, entry: dict) -> None:
                           f"{len(embed)} 頁圖片）")
     else:
         text_lines.append(f"（已重新生成，網址不變，內嵌 {len(embed)} 頁圖片）")
-    if gallery.is_adult:
-        text_lines.append("（成人內容，Telegraph 頁面可能被移除）")
 
     # Keep the page the press produced: the next press edits this one, at this URL.
     remember_regenerate(query.message.chat_id, user.id, gallery, mode, page)
@@ -6306,8 +6305,6 @@ async def run_gallery_images(message, status, gallery, mode: str,
                 f"\n📄 Telegraph（內嵌 {len(embed)} 頁圖片）：{telegraph_url}")
     if telegraph_note:
         summary_lines.append(f"\n{telegraph_note}")
-    if gallery.is_adult:
-        summary_lines.append("（成人內容，Telegraph 頁面可能被移除）")
     summary = "\n".join(summary_lines)
 
     # Remember this so the page can be re-signed later: e-hentai's image links
@@ -7531,8 +7528,6 @@ async def run_gallery_archive(message, status, gallery, mode: str,
         f"\n📦 已傳送官方歸檔（{label}，"
         f"{ehentai.format_filesize(archive_bytes)}）",
     ]
-    if gallery.is_adult:
-        summary.append("（成人內容）")
     await status.edit_text("\n".join(summary),
                            link_preview_options=source_link_options())
 
