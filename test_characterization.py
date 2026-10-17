@@ -2670,6 +2670,62 @@ def _r2_recording_survives_a_telegraph_write() -> bool:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _every_telegraph_path_hosts_on_r2() -> bool:
+    """
+    Both ways a page is built must route the images through R2.
+
+    Checked by reading the source around each create/edit_telegraph_page call rather than by running
+    it: a page built with expiring links works perfectly at the moment it is built, so the fault only
+    appears hours later and no single run can observe it.
+    """
+    import inspect
+
+    source = inspect.getsource(bot)
+    lines = source.splitlines()
+
+    # Find each call that creates or edits a page, then look back for the R2 step that must precede
+    # it within the same function body.
+    sites = []
+    for index, line in enumerate(lines):
+        if "ehentai.edit_telegraph_page" in line or "ehentai.create_telegraph_page" in line:
+            sites.append(index)
+
+    if not sites:
+        note("no Telegraph call sites found at all")
+        return False
+
+    for index in sites:
+        # Walk back to the start of the enclosing statement block and look for the R2 call. The
+        # window is generous because the regenerate path has comments between the two.
+        window = "\n".join(lines[max(0, index - 40):index])
+        if "host_on_r2" not in window:
+            note(f"a Telegraph call at line {index + 1} has no host_on_r2 before it:\n"
+                 + "\n".join(f"    {l}" for l in lines[max(0, index - 6):index + 2]))
+            return False
+    return True
+
+
+def _host_on_r2_is_called_twice_not_once() -> bool:
+    """
+    Exactly two call sites: publishing and regenerating.
+
+    A count rather than a search, so that removing one is as visible as adding a path that forgets
+    it. Two is the number of ways a page is produced - run_gallery_images and run_regenerate.
+    """
+    import inspect
+
+    source = inspect.getsource(bot)
+    calls = source.count("await host_on_r2(")
+    if calls != 2:
+        note(f"expected 2 call sites for host_on_r2, found {calls}")
+        return False
+
+    if "async def host_on_r2(" not in source:
+        note("host_on_r2 is called but not defined")
+        return False
+    return True
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -4697,6 +4753,13 @@ check("a failed R2 upload still delivers the gallery",
 check("recording R2 urls keeps the sweep and the Telegraph page",
       _r2_recording_survives_a_telegraph_write(),
       "all three share one cache payload and each has to merge")
+
+check("every path that builds a Telegraph page hosts its images on R2",
+      _every_telegraph_path_hosts_on_r2(),
+      "regenerating without R2 rebuilt the page with links that expire again")
+check("there are exactly two R2 host call sites",
+      _host_on_r2_is_called_twice_not_once(),
+      "a missing one is invisible until the page breaks hours later")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),
