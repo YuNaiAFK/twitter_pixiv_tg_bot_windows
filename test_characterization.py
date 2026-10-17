@@ -2415,6 +2415,11 @@ class _R2Harness:
         self.uploaded = []
         self.saved = []
         self.texts = []
+        self.used_bytes = 0
+        self.used_objects = 0
+        self.budget_seen = None
+        self.already_used_seen = None
+        self.notified = []
 
     def run(self, gallery, mode="view", embed=None):
         import asyncio
@@ -2434,10 +2439,16 @@ class _R2Harness:
         def fake_settings():
             return settings
 
+        # host_on_r2 asks the bucket how full it is before downloading anything.
+        def fake_bucket_usage(settings, **k):
+            return (harness.used_bytes, harness.used_objects)
+
         def fake_upload_many(urls, *, settings, workers=6, timeout=60, referer="",
                              cookies=None, key_prefix="galleries", progress=None,
-                             stop_event=None):
+                             stop_event=None, already_used=0, budget=0):
             harness.uploaded.append(list(urls))
+            harness.budget_seen = budget
+            harness.already_used_seen = already_used
             if progress is not None:
                 for i in range(1, len(urls) + 1):
                     progress(i, len(urls))
@@ -2465,7 +2476,10 @@ class _R2Harness:
             harness.texts.append(text)
             return True
 
-        real = {n: getattr(bot.r2, n) for n in ("r2_settings", "upload_many")}
+        real = {n: getattr(bot.r2, n)
+                for n in ("r2_settings", "upload_many", "bucket_usage")}
+        real_admins = bot.ADMIN_USER_IDS
+        bot.ADMIN_USER_IDS = {4242}
         real_cache, real_dir = bot.PARSE_CACHE, bot.CACHE_DIR
         real_save = bot.remember_r2_urls
         work = Path(tempfile.mkdtemp(prefix="r2h-"))
@@ -2474,6 +2488,7 @@ class _R2Harness:
 
         bot.r2.r2_settings = fake_settings
         bot.r2.upload_many = fake_upload_many
+        bot.r2.bucket_usage = fake_bucket_usage
 
         def fake_remember(url, gal, mode_, urls):
             harness.saved.append((mode_, list(urls)))
@@ -2484,7 +2499,15 @@ class _R2Harness:
         if harness.cached:
             real_save(gallery.page_url, gallery, mode, harness.cached)
 
-        status = type("S", (), {"edit_text": staticmethod(fake_edit_text)})()
+        class FakeBot:
+            async def send_message(self, chat_id, text, **k):
+                harness.notified.append((chat_id, text))
+                return True
+
+        status = type("S", (), {
+            "edit_text": staticmethod(fake_edit_text),
+            "get_bot": staticmethod(lambda: FakeBot()),
+        })()
 
         async def scenario():
             return await bot.host_on_r2(embed, gallery, mode, status)
@@ -2496,6 +2519,7 @@ class _R2Harness:
                 setattr(bot.r2, n, v)
             bot.PARSE_CACHE, bot.CACHE_DIR = real_cache, real_dir
             bot.remember_r2_urls = real_save
+            bot.ADMIN_USER_IDS = real_admins
             shutil.rmtree(work, ignore_errors=True)
 
         harness.result = result
@@ -2778,6 +2802,178 @@ def _a_stale_original_button_is_rejected() -> bool:
         if bot.parse_gallery_callback(f"eh|{mode}|2783744|3ec7dfe53d") is None:
             note(f"a valid mode was rejected: {mode}")
             return False
+    return True
+
+
+def _the_ceiling_is_below_the_allowance() -> bool:
+    """
+    The enforced limit must be under the allowance, not equal to it.
+
+    Cloudflare's free tier is 10 GB of storage per month, billed by the month and by the time an
+    object exists. Reaching exactly 10 GB and pruning a week later still exceeds it for that month, so
+    the ceiling has to sit below - and the two numbers have to be different values, which is the
+    thing a single constant would get wrong without anyone noticing.
+    """
+    import os
+
+    saved = {k: os.environ.get(k) for k in ("R2_FREE_BYTES", "R2_LIMIT_PERCENT")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+
+        if bot.r2.free_bytes() != 10 * 1000 ** 3:
+            note(f"the default allowance is {bot.r2.free_bytes()}, expected 10 GB decimal")
+            return False
+        if bot.r2.limit_bytes() >= bot.r2.free_bytes():
+            note(f"the ceiling ({bot.r2.limit_bytes()}) is not below the allowance "
+                 f"({bot.r2.free_bytes()})")
+            return False
+        if not 50 <= bot.r2.limit_percent() < 100:
+            note(f"the limit percentage is {bot.r2.limit_percent()}, which is not a sane headroom")
+            return False
+
+        # A malformed value must not silently disable the limit.
+        os.environ["R2_FREE_BYTES"] = "lots"
+        if bot.r2.free_bytes() != 10 * 1000 ** 3:
+            note(f"a malformed R2_FREE_BYTES gave {bot.r2.free_bytes()} instead of the default")
+            return False
+        os.environ["R2_LIMIT_PERCENT"] = "0"
+        if bot.r2.limit_bytes() <= 0:
+            note("a zero percentage produced a zero ceiling, which would refuse everything")
+            return False
+        return True
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _the_upload_stops_at_the_ceiling() -> bool:
+    """
+    Images are refused once the ceiling is reached, and only then.
+
+    Driven through upload_many with a stubbed fetcher and client, so the arithmetic is exact: ten
+    one-megabyte images, five megabytes already stored, an eight megabyte ceiling. Three fit and
+    seven must not be written.
+    """
+    import contextlib
+
+    real_make = bot.r2._make_client
+    real_fetch = bot.r2.fetch_image
+
+    class FakeClient:
+        def __init__(self):
+            self.puts = []
+
+        def head_object(self, **k):
+            raise Exception("absent")
+
+        def put_object(self, Bucket, Key, Body, **k):
+            self.puts.append(len(Body))
+            return {}
+
+    class Settings:
+        bucket = "b"
+        public_base = "https://img.example"
+
+        @property
+        def endpoint(self):
+            return "https://x.r2.cloudflarestorage.com"
+
+        def public_url(self, key):
+            return f"https://img.example/{key}"
+
+    MB = 1024 * 1024
+    fake = FakeClient()
+    bot.r2._make_client = lambda settings, timeout: fake
+    bot.r2.fetch_image = lambda url, **k: (b"x" * MB, "image/jpeg")
+    try:
+        urls = [f"https://example.com/{i}.jpg" for i in range(10)]
+
+        report = bot.r2.upload_many(urls, settings=Settings(), workers=1,
+                                    budget=8 * MB, already_used=5 * MB)
+        if report.uploaded != 3:
+            note(f"{report.uploaded} images were uploaded, expected 3 (5+3 fits in 8)")
+            return False
+        if sum(fake.puts) > 3 * MB:
+            note(f"{sum(fake.puts)} bytes were written, which exceeds the ceiling")
+            return False
+        if not report.budget_stopped:
+            note("the report does not say the ceiling stopped it")
+            return False
+        if len(report.urls()) != len(urls):
+            note("the url list changed length, so the caller cannot build a page")
+            return False
+
+        # Already over: nothing at all may be written.
+        fake.puts.clear()
+        over = bot.r2.upload_many(urls, settings=Settings(), workers=1,
+                                  budget=8 * MB, already_used=9 * MB)
+        if over.uploaded or fake.puts:
+            note(f"{over.uploaded} images were uploaded and {len(fake.puts)} writes happened "
+                 f"although the ceiling was already passed")
+            return False
+
+        # And with no budget, everything goes: the check must not be on by accident.
+        fake.puts.clear()
+        unlimited = bot.r2.upload_many(urls, settings=Settings(), workers=1)
+        if unlimited.uploaded != len(urls):
+            note(f"without a budget only {unlimited.uploaded} of {len(urls)} were uploaded")
+            return False
+        return True
+    finally:
+        bot.r2._make_client = real_make
+        bot.r2.fetch_image = real_fetch
+
+
+def _a_full_bucket_refuses_before_downloading() -> bool:
+    """
+    When the allowance is already spent, host_on_r2 must refuse without fetching anything.
+
+    Downloading thirty megabytes and then deciding not to upload them wastes the phone's bandwidth
+    and the operator's time, and the answer was knowable beforehand. The administrator is told as
+    well, because a gallery silently served with expiring links is a decision they should hear about.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    harness = _R2Harness()
+    harness.used_bytes = bot.r2.limit_bytes() + 1
+    h = harness.run(gallery)
+
+    if h.uploaded:
+        note(f"it downloaded and uploaded despite a full bucket: {len(h.uploaded[0])} urls")
+        return False
+    if h.result != ["https://hath.network/a.jpg", "https://hath.network/b.jpg"]:
+        note(f"the urls were changed: {h.result}")
+        return False
+    if not h.notified:
+        note("the administrator was not told")
+        return False
+    if not any("額度" in text for _, text in h.notified):
+        note(f"the notice does not mention the allowance: {h.notified}")
+        return False
+    return True
+
+
+def _the_ceiling_is_passed_to_the_uploader() -> bool:
+    """
+    host_on_r2 must hand the ceiling and the current usage to upload_many.
+
+    Reading the usage and then not passing it would look identical from outside - the check would
+    simply never fire - and the images would be uploaded past the allowance with no error anywhere.
+    """
+    gallery = _fake_gallery("111", "aaaa")
+    harness = _R2Harness()
+    harness.used_bytes = 1000
+    h = harness.run(gallery)
+
+    if h.budget_seen != bot.r2.limit_bytes():
+        note(f"the ceiling passed was {h.budget_seen!r}, expected {bot.r2.limit_bytes()}")
+        return False
+    if h.already_used_seen != 1000:
+        note(f"the usage passed was {h.already_used_seen!r}, expected the 1000 the bucket reported")
+        return False
     return True
 
 
@@ -4822,6 +5018,19 @@ check("the gallery keyboard offers exactly three actions, with one Telegraph mod
 check("a stale button carrying the removed mode is rejected",
       _a_stale_original_button_is_rejected(),
       "buttons live in old messages, so the allowlist is what stops them dispatching")
+
+check("the R2 ceiling is below the free allowance, and survives a bad value",
+      _the_ceiling_is_below_the_allowance(),
+      "storage is billed monthly, so reaching the allowance exactly is still an overage")
+check("an upload stops at the ceiling, having written only what fits",
+      _the_upload_stops_at_the_ceiling(),
+      "the failure mode is a bill rather than an exception")
+check("a full bucket is refused before anything is downloaded",
+      _a_full_bucket_refuses_before_downloading(),
+      "fetching thirty megabytes to then refuse them wastes the bandwidth")
+check("host_on_r2 passes the ceiling and the current usage to the uploader",
+      _the_ceiling_is_passed_to_the_uploader(),
+      "reading the usage and not passing it looks identical from outside")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),

@@ -54,6 +54,59 @@ DEFAULT_TIMEOUT = 60.0
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 
 
+# The free allowance Cloudflare documents, in bytes: 10 GB of storage per month.
+#
+# 10 * 1000**3 rather than 10 * 1024**3. Cloudflare bills in GB, and using the larger binary figure
+# would let real usage pass the allowance before this stopped anything.
+DEFAULT_FREE_BYTES = 10 * 1000 ** 3
+
+# Where to stop, as a percentage of the allowance. Not 100: storage is billed monthly and by the time
+# an object exists, so a gallery that reaches exactly the allowance and is pruned a week later has
+# still exceeded it for that month. A little headroom costs nothing and removes the whole question.
+DEFAULT_LIMIT_PERCENT = 95
+
+
+def free_bytes() -> int:
+    """The storage allowance to stay under, from R2_FREE_BYTES."""
+    raw = os.environ.get("R2_FREE_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_FREE_BYTES
+    try:
+        value = int(float(raw))
+    except ValueError:
+        return DEFAULT_FREE_BYTES
+    return value if value > 0 else DEFAULT_FREE_BYTES
+
+
+def limit_percent() -> float:
+    """How much of the allowance may be used, from R2_LIMIT_PERCENT."""
+    raw = os.environ.get("R2_LIMIT_PERCENT", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_LIMIT_PERCENT
+    except ValueError:
+        value = DEFAULT_LIMIT_PERCENT
+    return min(max(value, 1.0), 100.0)
+
+
+def limit_bytes() -> int:
+    """
+    The byte ceiling actually enforced.
+
+    Separate from free_bytes so a message can state the allowance truthfully while the enforced limit
+    stays below it - the two numbers are different and conflating them is how the ceiling ends up at
+    the allowance by accident.
+    """
+    return int(free_bytes() * limit_percent() / 100.0)
+
+
+def format_bytes(value: float) -> str:
+    """A size a person can read. Decimal units, matching how Cloudflare bills."""
+    for unit, scale in (("GB", 1000 ** 3), ("MB", 1000 ** 2), ("KB", 1000)):
+        if abs(value) >= scale:
+            return f"{value / scale:.2f} {unit}"
+    return f"{value:.0f} B"
+
+
 class R2Error(Exception):
     """Anything that stopped an upload. The message is meant to be readable in a log."""
 
@@ -178,6 +231,10 @@ class UploadReport:
     failed: int = 0
     bytes_sent: int = 0
     results: list = field(default_factory=list)
+    # Set when the free-tier ceiling stopped the upload. Distinct from `failed`, because nothing went
+    # wrong: the images would have uploaded fine and were refused on purpose.
+    budget_stopped: bool = False
+    budget_message: str = ""
 
     @property
     def ok(self) -> bool:
@@ -195,6 +252,9 @@ class UploadReport:
     def summary(self) -> str:
         if not self.total:
             return "沒有圖片需要上傳"
+        if self.budget_stopped:
+            return (f"上傳 {self.uploaded} 張後因 R2 免費額度停止"
+                    f"（{self.budget_message}）")
         parts = [f"上傳 {self.uploaded} 張"]
         if self.reused:
             parts.append(f"沿用 {self.reused} 張")
@@ -282,6 +342,8 @@ def upload_many(
     key_prefix: str = GALLERY_PREFIX,
     progress=None,
     stop_event=None,
+    already_used: int = 0,
+    budget: int = 0,
 ) -> UploadReport:
     """
     Download each URL and put it in R2, in parallel, keeping the original order.
@@ -292,6 +354,12 @@ def upload_many(
 
     ``progress`` is called with (done, total) after each image. ``stop_event`` is checked before each
     upload so a cancelled request stops promptly rather than after the whole gallery.
+
+    **``budget`` is a byte ceiling and ``already_used`` is what is stored before this run.** Together
+    they answer whether each image still fits, which is the only point at which that can be answered
+    without uploading it first. When the ceiling is reached the remaining images are left alone and
+    the report says so via ``budget_stopped`` - distinct from ``failed``, because nothing went wrong
+    and a caller that treats them the same would report a fault where there was a decision.
     """
     if not settings:
         raise R2Error("未設定 R2")
@@ -304,11 +372,18 @@ def upload_many(
     client = _make_client(settings, timeout)
     lock = threading.Lock()
     done = 0
+    # Bytes this run has committed plus what was already stored. Shared across the workers, so it is
+    # read and added to under the lock; a per-image check against a stale total would let several
+    # images through at once and overshoot by however many workers are running.
+    committed = [already_used]
+    budget_hit = [False]
 
     def one(item):
         index, url = item
         if stop_event is not None and stop_event.is_set():
             return index, UploadResult(url, error="已取消")
+        if budget_hit[0]:
+            return index, UploadResult(url, error="已達 R2 免費額度上限")
         try:
             data, content_type = fetch_image(url, timeout=timeout, referer=referer,
                                              cookies=cookies)
@@ -330,6 +405,17 @@ def upload_many(
         except Exception:  # noqa: BLE001
             pass
 
+        # **Refuse before the put, not after.** An upload that has happened is an upload that is
+        # billed for the month, so the ceiling has to be consulted before the bytes are written -
+        # which also means the check is `already stored + this image <= budget`, not `<`.
+        if budget:
+            with lock:
+                if committed[0] + len(data) > budget:
+                    budget_hit[0] = True
+                    result.error = "已達 R2 免費額度上限"
+                    return index, result
+                committed[0] += len(data)
+
         try:
             client.put_object(
                 Bucket=settings.bucket,
@@ -340,6 +426,11 @@ def upload_many(
             )
             return index, result
         except Exception as exc:  # noqa: BLE001
+            # The bytes were counted before the attempt, so a failure has to give them back or the
+            # remaining images are refused against a total that was never stored.
+            if budget:
+                with lock:
+                    committed[0] -= len(data)
             result.error = f"{type(exc).__name__}: {exc}"
             return index, result
 
@@ -356,7 +447,12 @@ def upload_many(
 
             with lock:
                 done += 1
-                if result.error:
+                if result.error == "已達 R2 免費額度上限":
+                    # Counted separately from a failure: nothing went wrong, and the caller reports
+                    # it to the administrator rather than as an error.
+                    report.budget_stopped = True
+                    report.failed += 1
+                elif result.error:
                     report.failed += 1
                 elif result.skipped:
                     report.reused += 1
@@ -374,6 +470,51 @@ def upload_many(
     report.results = [r if r is not None else UploadResult(items[i], error="未完成")
                       for i, r in enumerate(results)]
     return report
+
+
+def bucket_usage(settings: R2Settings, *, prefix: str = GALLERY_PREFIX,
+                 timeout: float = 60.0) -> tuple:
+    """
+    (bytes, object count) currently stored under the prefix.
+
+    **Read from the bucket rather than from a counter the bot keeps.** A local count drifts the first
+    time anything is removed through the Cloudflare dashboard, and afterwards it either refuses
+    uploads that would fit or allows ones that would not - and the second of those costs money.
+    Listing is a class B operation and the free allowance is ten million of them a month, so asking
+    is not a cost worth avoiding; ListObjectsV2 returns up to a thousand keys per call anyway.
+
+    Raises R2Error rather than returning a guess when the listing fails. A caller that cannot know
+    the usage has to decide what to do, and assuming zero would defeat the check entirely.
+    """
+    client = _make_client(settings, timeout)
+    total = 0
+    count = 0
+    token = None
+    try:
+        while True:
+            kwargs = {"Bucket": settings.bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            page = client.list_objects_v2(**kwargs)
+            for item in page.get("Contents", []):
+                total += int(item.get("Size", 0))
+                count += 1
+            if not page.get("IsTruncated"):
+                break
+            token = page.get("NextContinuationToken")
+    except Exception as exc:  # noqa: BLE001
+        raise R2Error(f"無法讀取 R2 使用量：{type(exc).__name__}: {exc}") from exc
+    return total, count
+
+
+def budget_line(used: int, count: int = 0) -> str:
+    """One readable line describing how full the allowance is."""
+    free = free_bytes()
+    cap = limit_bytes()
+    percent = (used / free * 100) if free else 0.0
+    tail = f"，{count} 個物件" if count else ""
+    return (f"已使用 {format_bytes(used)}／{format_bytes(free)}（{percent:.1f}%）{tail}"
+            f"；停止上限 {format_bytes(cap)}（{limit_percent():.0f}%）")
 
 
 def check_connection(settings: R2Settings, *, timeout: float = 20.0) -> tuple:
