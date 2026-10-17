@@ -5536,8 +5536,6 @@ def gallery_keyboard(gid: str, token: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("Telegraph · 顯示圖",
                                  callback_data=f"eh|view|{gid}|{token}"),
-            InlineKeyboardButton("Telegraph · 原圖",
-                                 callback_data=f"eh|orig|{gid}|{token}"),
         ],
         [
             InlineKeyboardButton("歸檔 · 1280", callback_data=f"eh|zip1280|{gid}|{token}"),
@@ -5610,7 +5608,8 @@ async def run_regenerate(query, user, entry: dict) -> None:
         )
         await asyncio.to_thread(remember_gallery, gallery.page_url, gallery,
                                 (display_urls, original_urls))
-        embed = original_urls if mode == "orig" else display_urls
+        # The display URLs: there is only one Telegraph mode now.
+        embed = display_urls
         # Same conversion as publishing: the button embeds the same list, so without this
         # a regenerated page would be broken again on every page.
         embed = await public_embed_urls(embed, gallery, query.message)
@@ -5768,7 +5767,7 @@ def parse_gallery_callback(data: str) -> tuple[str, str, str] | None:
     if len(parts) != 4:
         return None
     mode, gid, token = parts[1], parts[2], parts[3]
-    if mode not in {"view", "orig", "zip1280", "ziporig", "stop", "regen"}:
+    if mode not in {"view", "zip1280", "ziporig", "stop", "regen"}:
         return None
     if not gid.isdigit() or not token.isalnum():
         return None
@@ -5861,7 +5860,6 @@ async def run_gallery_action(query, message, user, mode: str,
 
     label = {
         "view": "Telegraph · 顯示圖",
-        "orig": "Telegraph · 原圖",
         "zip1280": "歸檔 · 1280",
         "ziporig": "歸檔 · 原圖",
     }[mode]
@@ -5916,7 +5914,7 @@ async def run_gallery_action(query, message, user, mode: str,
                 await asyncio.to_thread(remember_gallery, gallery_url, gallery)
             source_note = build_caption(gallery_url)
 
-            if mode in {"view", "orig"}:
+            if mode == "view":
                 await run_gallery_images(
                     message, status, gallery, mode, temp_dir, source_note, user
                 )
@@ -6169,7 +6167,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
             link_preview_options=source_link_options(),
         )
 
-        embed = display_urls if mode == "view" else (original_urls or display_urls)
+        # The display URLs. The original-resolution page was removed.
+        embed = display_urls
         embed = await public_embed_urls(embed, gallery, status, report=True)
 
         # **Copy them somewhere permanent before the page is built.**

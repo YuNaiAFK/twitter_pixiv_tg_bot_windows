@@ -2726,6 +2726,61 @@ def _host_on_r2_is_called_twice_not_once() -> bool:
     return True
 
 
+def _the_gallery_keyboard_has_exactly_three_actions() -> bool:
+    """
+    The buttons a user sees, read from the markup the bot builds.
+
+    Asserted as a whole set rather than by absence, so that adding a fourth action is as visible as
+    removing one of these three.
+    """
+    keyboard = bot.gallery_keyboard("2783744", "3ec7dfe53d")
+    rows = keyboard.inline_keyboard
+    labels = [button.text for row in rows for button in row]
+    callbacks = [button.callback_data for row in rows for button in row
+                 if getattr(button, "callback_data", None)]
+
+    expected_labels = [
+        "Telegraph · 顯示圖",
+        "歸檔 · 1280",
+        "歸檔 · 原圖",
+        "取消",
+    ]
+    if sorted(labels) != sorted(expected_labels):
+        note(f"the keyboard is {labels}, expected {expected_labels}")
+        return False
+
+    # The Telegraph actions carry the mode in the callback. Only "view" may appear there.
+    telegraph_modes = [c.split("|")[1] for c in callbacks if c.startswith("eh|")]
+    telegraph_modes = [m for m in telegraph_modes if m not in {"zip1280", "ziporig", "cancel"}]
+    if telegraph_modes != ["view"]:
+        note(f"the Telegraph modes in the keyboard are {telegraph_modes}, expected ['view']")
+        return False
+    return True
+
+
+def _a_stale_original_button_is_rejected() -> bool:
+    """
+    A callback carrying the removed mode must not dispatch.
+
+    Buttons live in messages that are never updated, so one carrying "orig" can be pressed long after
+    the mode is gone - by a client with a cached keyboard, or from a chat history from before the
+    change. The allowlist is what turns that into nothing rather than into a branch that no longer
+    exists.
+    """
+    parsed = bot.parse_gallery_callback("eh|orig|2783744|3ec7dfe53d")
+    if parsed is not None:
+        note(f"a removed mode was accepted: {parsed}")
+        return False
+
+    # And the modes that remain are still accepted, so the check is not passing by rejecting
+    # everything.
+    for mode in ("view", "zip1280", "ziporig"):
+        if bot.parse_gallery_callback(f"eh|{mode}|2783744|3ec7dfe53d") is None:
+            note(f"a valid mode was rejected: {mode}")
+            return False
+    return True
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -4760,6 +4815,13 @@ check("every path that builds a Telegraph page hosts its images on R2",
 check("there are exactly two R2 host call sites",
       _host_on_r2_is_called_twice_not_once(),
       "a missing one is invisible until the page breaks hours later")
+
+check("the gallery keyboard offers exactly three actions, with one Telegraph mode",
+      _the_gallery_keyboard_has_exactly_three_actions(),
+      "re-adding the original-resolution page would silently cost about 2 GB per gallery")
+check("a stale button carrying the removed mode is rejected",
+      _a_stale_original_button_is_rejected(),
+      "buttons live in old messages, so the allowlist is what stops them dispatching")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),
