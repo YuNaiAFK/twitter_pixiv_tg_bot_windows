@@ -127,6 +127,34 @@ def env_text(name: str, default: str = "") -> str:
     return text if text else default
 
 
+PROJECT_DIR = BASE_DIR.parent
+
+
+def resolve_env_path(raw: str, default: Path, *, label: str = "") -> Path:
+    """
+    Resolve a path from .env against the project directory.
+
+    **Why not the working directory.** `Path("parse_cache.json")` is relative to wherever the process
+    was started. The bot is started from the project root by run-bot.sh, so it used
+    `<project>/parse_cache.json`; a diagnostic run from `bot/` resolved the same setting to
+    `<project>/bot/parse_cache.json` and found an empty cache. Two files, one name, different
+    contents, and nothing in the code said which was meant.
+
+    An absolute value is returned unchanged. An empty one falls back to the default, which is itself
+    built from the project directory.
+    """
+    raw = (raw or "").strip().strip('"').strip("'")
+    if not raw:
+        return default
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    resolved = PROJECT_DIR / candidate
+    if label:
+        logger.info("%s 以專案目錄解析相對路徑：%s -> %s", label, raw, resolved)
+    return resolved
+
+
 def env_number(name: str, default, *, kind=int):
     """
     Read a number from the environment, treating blank as unset.
@@ -403,7 +431,8 @@ BLOCKED_USER_IDS = {
 # (and a bootstrap for the first administrator, which cannot be granted in-chat
 # for the obvious reason); everything else can be managed with /block, /unblock,
 # /blocked, /promote, /demote and /grant, and survives restarts through this file.
-AUTH_FILE = Path(env_text("AUTH_FILE", str(BASE_DIR / "authorized.json")))
+AUTH_FILE = resolve_env_path(
+    env_text("AUTH_FILE", ""), PROJECT_DIR / "authorized.json", label="AUTH_FILE")
 
 # Group chats keep a gate mode, because "which groups may use this" is genuinely a choice:
 # with no groups authorized, this decides whether every group is welcome or none is.
@@ -805,8 +834,10 @@ def get_host(url: str) -> str:
 # What is deliberately NOT cached is the failure case: a link that failed is
 # retried, because the usual cause is a transient one or a credential that the
 # operator has since fixed.
-CACHE_FILE = Path(env_text("CACHE_FILE", str(BASE_DIR / "parse_cache.json")))
-CACHE_DIR = Path(env_text("CACHE_DIR", str(BASE_DIR / ".cache")))
+CACHE_FILE = resolve_env_path(
+    env_text("CACHE_FILE", ""), PROJECT_DIR / "parse_cache.json", label="CACHE_FILE")
+CACHE_DIR = resolve_env_path(
+    env_text("CACHE_DIR", ""), PROJECT_DIR / ".cache", label="CACHE_DIR")
 
 # A media cache is a copy of files the bot already downloaded. Kept bounded so it
 # cannot fill the disk: entries older than this are dropped when the cache is
@@ -844,7 +875,8 @@ CACHE_MAX_BYTES = env_number("CACHE_MAX_BYTES", 2 * 1024 * 1024 * 1024)
 # Storage is kept apart from the media cache and bounded on its own, because the
 # magnitudes differ by orders of magnitude: 300 cached artworks are ~100 MB, while
 # 300 cached archives would be tens of GB.
-ARCHIVE_CACHE_DIR = Path(env_text("ARCHIVE_CACHE_DIR", str(CACHE_DIR / "archives")))
+ARCHIVE_CACHE_DIR = resolve_env_path(
+    env_text("ARCHIVE_CACHE_DIR", ""), CACHE_DIR / "archives", label="ARCHIVE_CACHE_DIR")
 
 # Measured for scale: 5 archives of ~76 MiB is 0.37 GiB, 50 is 3.7 GiB. This is a disk
 # budget, not a target; the least recently used entry is evicted when it is exceeded.
@@ -1954,9 +1986,12 @@ def is_safe_to_clear(path: Path) -> bool:
     if resolved == Path(resolved.anchor):
         return False
 
-    base = BASE_DIR.resolve()
+    base = PROJECT_DIR.resolve()
     if resolved == base:
         # Emptying the project directory would delete the bot itself.
+        return False
+
+    if resolved == BASE_DIR.resolve():
         return False
 
     forbidden = {Path(os.environ.get("SystemRoot", "C:/Windows")).resolve()}
