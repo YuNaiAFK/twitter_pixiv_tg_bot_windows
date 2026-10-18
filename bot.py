@@ -5467,7 +5467,9 @@ def build_gallery_info(gallery, telegraph_url: str = "", *, html: bool = False) 
             href = escape_html(telegraph_url).replace('"', "&quot;")
             lines.append(f'預覽: <a href="{href}">{title}</a>')
         else:
-            lines.append(f"預覽: {title}")
+            # "名稱", not "預覽", when there is no page yet - the first reply is a menu, nothing has
+            # been published, and calling that line 預覽 promises a page that does not exist.
+            lines.append(f"名稱: {title}")
 
     # The URL the sender used rather than the normalised page_url, so an exhentai link stays one.
     source = gallery.url or gallery.page_url
