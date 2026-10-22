@@ -2,8 +2,12 @@ python-telegram-bot>=21.0,<23.0
 python-dotenv>=1.0,<2.0
 # Downscales oversized photos and tall screenshots so Telegram accepts them as
 # photos instead of documents.
-Pillow>=10.0
+Pillow>=13.0.0  # 13.0.0 fixes 24 CVEs reachable from this code path
 # Only needed by pixiv_login.py --auto, which reads the OAuth code from Chrome's
 # DevTools Protocol instead of asking you to find it in the Network tab.
 # Not needed to run the bot or the manual login mode.
 websockets>=12.0
+
+# Pinned for its CA bundle: versions before 2026.10.19 shipped a root whose
+# intermediate keys were compromised and revoked.
+certifi>=2026.10.19

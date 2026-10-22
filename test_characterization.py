@@ -2980,6 +2980,40 @@ def _the_ceiling_is_passed_to_the_uploader() -> bool:
     return True
 
 
+def _pillow_is_restricted_to_safe_formats() -> bool:
+    """
+    downscale_image must never hand a file to an unsafe Pillow decoder.
+
+    The bot opens images downloaded from Twitter, Pixiv and e-hentai, so the bytes are attacker-
+    controlled. `Image.open` dispatches on magic bytes rather than on the extension, which means a
+    file named `page.jpg` beginning with `%!PS` reaches the PostScript decoder - and EPS shells out to
+    Ghostscript, where a filename starting with `-` is argument injection. Several of the CVEs fixed
+    in Pillow 13 were in exactly those decoders.
+
+    Checked two ways: the constant exists and is what it should be, and the call site actually passes
+    it. A constant nobody passes would look fine and protect nothing.
+    """
+    if not hasattr(bot, "PILLOW_FORMATS"):
+        note("PILLOW_FORMATS is not defined, so downscale_image cannot be passing it")
+        return False
+    expected = ("JPEG", "PNG", "GIF", "WEBP", "BMP")
+    if tuple(bot.PILLOW_FORMATS) != expected:
+        note(f"PILLOW_FORMATS is {bot.PILLOW_FORMATS}, expected {expected}")
+        return False
+    # The dangerous ones must not be in the list.
+    for unsafe in ("EPS", "PDF", "XBM", "MSP", "MIC", "PS", "PSD", "TGA"):
+        if unsafe in bot.PILLOW_FORMATS:
+            note(f"{unsafe} is allowed, which is one of the decoders the recent CVEs were in")
+            return False
+
+    import inspect
+    source = inspect.getsource(bot.downscale_image)
+    if "formats=PILLOW_FORMATS" not in source:
+        note("downscale_image calls Image.open without formats=, so the allowlist is unused")
+        return False
+    return True
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -5034,6 +5068,10 @@ check("a full bucket is refused before anything is downloaded",
 check("host_on_r2 passes the ceiling and the current usage to the uploader",
       _the_ceiling_is_passed_to_the_uploader(),
       "reading the usage and not passing it looks identical from outside")
+
+check("Pillow is restricted to safe image formats",
+      _pillow_is_restricted_to_safe_formats(),
+      "an attacker-supplied file disguised as .jpg would otherwise reach the EPS/XBM/PDF decoders")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),

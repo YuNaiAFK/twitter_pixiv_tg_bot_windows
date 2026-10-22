@@ -429,6 +429,10 @@ ATTACH_SOURCE_LINK = os.getenv("ATTACH_SOURCE_LINK", "1").strip().lower() not in
 SOURCE_LABEL = os.getenv("SOURCE_LABEL", "原始連結")
 
 # Optional Pillow-based downscale for photos over Telegram's photo limit.
+# The image formats Pillow is allowed to decode. See downscale_image for why this is a
+# security boundary rather than a preference.
+PILLOW_FORMATS = ("JPEG", "PNG", "GIF", "WEBP", "BMP")
+
 PHOTO_DOWNSCALE_MAX_EDGE = env_number("PHOTO_DOWNSCALE_MAX_EDGE", 2560)
 PHOTO_DOWNSCALE_QUALITY = env_number("PHOTO_DOWNSCALE_QUALITY", 88)
 
@@ -4776,9 +4780,15 @@ def downscale_image(
     jpeg_quality = PHOTO_DOWNSCALE_QUALITY if quality is None else quality
 
     try:
-        with Image.open(file_path) as image:
-            # A very large original is a legitimate input here, so the
-            # decompression-bomb limit is left at the library default on purpose.
+        with Image.open(file_path, formats=PILLOW_FORMATS) as image:
+            # A very large original is a legitimate input here, so the decompression-bomb limit is
+            # left at the library default on purpose.
+            #
+            # **`formats` is a security boundary, not a filter.** Image.open dispatches on the file's
+            # magic bytes, so a file named `.jpg` that begins with `%!PS` reaches the PostScript
+            # decoder - and EPS shells out to Ghostscript, where a filename beginning with `-` is
+            # argument injection. Naming the formats means those plugins are never loaded. See
+            # PILLOW_FORMATS.
             image = image.convert("RGB")
             image.thumbnail((edge, edge), Image.LANCZOS)
             output_path = target_dir / f"{file_path.stem}_small.jpg"
