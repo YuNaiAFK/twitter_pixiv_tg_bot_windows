@@ -3505,8 +3505,8 @@ print("=== 2. Public surface: commands ===")
 # Every command that existed must still be registered. A dropped CommandHandler is
 # invisible until someone tries the command.
 EXPECTED_COMMANDS = {
-    "authorized", "blocked", "cache", "cookies", "demote", "grant", "help", "id",
-    "lock", "lockgroup", "promote", "restart", "revoke", "start", "status",
+    "audit", "authorized", "blocked", "cache", "cookies", "demote", "grant", "help",
+    "id", "lock", "lockgroup", "promote", "restart", "revoke", "start", "status",
 }
 _found = set()
 for _node in ast.walk(_TREE):

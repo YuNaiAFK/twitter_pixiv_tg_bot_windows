@@ -3940,6 +3940,187 @@ async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+OSV_API = "https://api.osv.dev/v1"
+OSV_BATCH = 200
+
+
+def installed_packages() -> list:
+    """
+    [(name, version)] for everything installed in this interpreter.
+
+    Read from the metadata rather than kept by hand: the point is to find a vulnerable *transitive*
+    dependency, and a hand-kept list is exactly how one gets left out. Names are lowercased because
+    that is how OSV compares them.
+    """
+    from importlib import metadata
+
+    found = []
+    for dist in metadata.distributions():
+        try:
+            name = (dist.metadata["Name"] or "").strip()
+            version = (dist.version or "").strip()
+        except Exception:  # noqa: BLE001 - one broken dist-info must not abort the scan
+            continue
+        if name and version:
+            found.append((name.lower(), version))
+    return sorted(set(found))
+
+
+def _osv_query_batch(client, packages: list) -> dict:
+    """name -> [vulnerability id, ...] for the packages that have anything."""
+    results: dict = {}
+    payload = {"queries": [
+        {"package": {"name": name, "ecosystem": "PyPI"}, "version": version}
+        for name, version in packages
+    ]}
+    response = client.post(f"{OSV_API}/querybatch", json=payload)
+    response.raise_for_status()
+    for (name, _), result in zip(packages, response.json().get("results", [])):
+        ids = [v.get("id") for v in (result.get("vulns") or []) if v.get("id")]
+        if ids:
+            results[name] = ids
+    return results
+
+
+def _osv_vuln(client, vuln_id: str) -> dict:
+    """
+    The summary and the first fixed version.
+
+    A failed lookup is not fatal: the id alone is still actionable, and refusing to report anything
+    because one detail request timed out would be the wrong trade on a slow phone connection.
+    """
+    try:
+        response = client.get(f"{OSV_API}/vulns/{vuln_id}")
+        response.raise_for_status()
+        data = response.json()
+    except Exception:  # noqa: BLE001
+        return {"id": vuln_id, "summary": "", "fixed": ""}
+
+    fixed = ""
+    for affected in data.get("affected") or []:
+        for rng in affected.get("ranges") or []:
+            for event in rng.get("events") or []:
+                if event.get("fixed"):
+                    fixed = event["fixed"]
+                    break
+            if fixed:
+                break
+        if fixed:
+            break
+    return {"id": vuln_id, "summary": (data.get("summary") or "").strip(), "fixed": fixed}
+
+
+def audit_packages() -> dict:
+    """
+    Check every installed package against OSV. Blocking - call through asyncio.to_thread.
+
+    Returns {"total", "findings": [{"package", "version", "vulns"}], "error"}.
+    """
+    packages = installed_packages()
+    report: dict = {"total": len(packages), "findings": [], "error": ""}
+    if not packages:
+        report["error"] = "讀不到已安裝的套件清單"
+        return report
+
+    try:
+        # A longer timeout than usual: the batch body is a few kilobytes and the answer has to be
+        # computed against a database rather than served from a cache.
+        with httpx.Client(headers={"User-Agent": "twitter-pixiv-tg-bot/audit"},
+                          **ehentai.http_client_kwargs(45.0)) as client:
+            flagged: dict = {}
+            for start in range(0, len(packages), OSV_BATCH):
+                chunk = packages[start:start + OSV_BATCH]
+                flagged.update(_osv_query_batch(client, chunk))
+
+            versions = dict(packages)
+            for name in sorted(flagged):
+                vulns = [_osv_vuln(client, vid) for vid in sorted(flagged[name])]
+                report["findings"].append(
+                    {"package": name, "version": versions[name], "vulns": vulns})
+    except Exception as exc:  # noqa: BLE001
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    return report
+
+
+def format_audit_report(report: dict) -> str:
+    """Render the result for chat, well inside Telegram's 4096-character cap."""
+    if report.get("error"):
+        return (
+            "🔍 套件漏洞檢查\n\n"
+            f"無法完成檢查：{report['error']}\n\n"
+            "這不代表沒有漏洞，只代表這次查不到 —— 請確認代理可用後再試。"
+        )
+
+    total = report.get("total", 0)
+    findings = report.get("findings") or []
+    if not findings:
+        return (
+            "🔍 套件漏洞檢查\n\n"
+            f"檢查 {total} 個套件，沒有發現已知漏洞。\n\n"
+            "資料來源：OSV（https://osv.dev）"
+        )
+
+    count = sum(len(f["vulns"]) for f in findings)
+    lines = [
+        "🔍 套件漏洞檢查",
+        "",
+        f"檢查 {total} 個套件，發現 {count} 個已知漏洞：",
+        "",
+    ]
+    upgrades = []
+    for finding in findings:
+        lines.append(f"• {finding['package']} {finding['version']}"
+                     f" — {len(finding['vulns'])} 個")
+        fixed = next((v["fixed"] for v in finding["vulns"] if v.get("fixed")), "")
+        if fixed:
+            lines.append(f"  修復於 {fixed}")
+        upgrades.append(f"-U {finding['package']}")
+        # Three ids are enough to copy one into a search box. The rest would push a bad day over the
+        # message limit, and the version to upgrade to is the actionable part anyway.
+        ids = [v["id"] for v in finding["vulns"]]
+        shown = ", ".join(ids[:3])
+        if len(ids) > 3:
+            shown += f" 等 {len(ids)} 個"
+        lines.append(f"  {shown}")
+        lines.append("")
+
+    lines.append("升級方式（在 Termux 執行）：")
+    lines.append(f"python -m pip install {' '.join(upgrades)}")
+    return "\n".join(lines)
+
+
+async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Check the installed packages for known vulnerabilities.
+
+    Administrator-only like the other operator commands: it reports version numbers and the commands
+    to run on the host, which is not information to hand to an arbitrary member of a public group.
+    """
+    message = update.effective_message
+    status = await send_status(message, "正在檢查套件漏洞（這需要幾秒）……")
+
+    report = await asyncio.to_thread(audit_packages)
+    text = format_audit_report(report)
+
+    # Telegram refuses an over-long message rather than truncating it, so the cut happens here and
+    # the full text goes to the log.
+    if len(text) > 3800:
+        logger.warning("套件漏洞檢查結果過長，完整內容：\n%s", text)
+        text = text[:3600] + "\n\n（訊息過長已截斷，完整清單見 data/bot.log）"
+
+    findings = report.get("findings") or []
+    if findings:
+        logger.warning("套件漏洞檢查發現 %s 個問題套件：%s",
+                       len(findings), [(f["package"], f["version"]) for f in findings])
+    elif not report.get("error"):
+        logger.info("套件漏洞檢查：%s 個套件，沒有已知漏洞", report.get("total"))
+
+    try:
+        await status.edit_text(text, link_preview_options=source_link_options())
+    except TelegramError:
+        await message.reply_text(text, link_preview_options=source_link_options())
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Operator summary of the running configuration."""
     lines = [
@@ -3955,6 +4136,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
            if LOCAL_API_SERVER else "（公開 API）"),
         f"• 連結冷卻時間：{USER_COOLDOWN_SECONDS} 秒（按鈕不受此限制）",
         "• 同一使用者同時只能有一個請求在處理中",
+        "• 套件漏洞檢查：/audit",
     ]
     if BLOCKED_USER_IDS:
         lines.append(f"• .env 封鎖名單：{len(BLOCKED_USER_IDS)} 人（啟動時的起始值）")
@@ -8756,6 +8938,10 @@ def main():
     # and "why is it sending the old files" are both diagnosed here.
     application.add_handler(
         CommandHandler("cache", admin_only(cache_command))
+    )
+    # "Is anything I depend on known-broken" answerable from a phone.
+    application.add_handler(
+        CommandHandler("audit", admin_only(audit_command))
     )
     # A restart is the only way to apply a .env or credential change without host
     # access, and it briefly takes the bot offline, so it is administrator only.
