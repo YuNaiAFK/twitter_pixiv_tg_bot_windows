@@ -8817,6 +8817,63 @@ def build_application() -> Application:
     return builder.post_init(post_init).build()
 
 
+def wait_for_telegram(*, timeout_seconds: float = 900.0, interval: float = 5.0) -> bool:
+    """
+    Block until the Bot API answers getMe, or give up after the timeout. Returns success.
+
+    **This exists because of a reboot.** `run_polling()` calls `get_me()` during startup inside
+    python-telegram-bot's `network_retry_loop`, which makes a handful of attempts and then raises.
+    On a phone the VPN comes up minutes after boot, and v2rayNG needs a manual start - so the bot
+    started into a dead network, raised TimedOut within three seconds, and the process exited. The
+    log had already printed 機器人已啟動, so it looked like a bot that was running and ignoring
+    messages.
+
+    Fifteen minutes is deliberate. Nothing restarts the bot on this phone - Termux:Boot runs once -
+    so waiting is recoverable and exiting is not. The wait is logged every minute so a person
+    watching the app can see why nothing has happened yet.
+
+    Uses the same base URL and the same proxy decision as the client that will follow, because a
+    preflight that reaches Telegram by a different route would answer the wrong question.
+    """
+    url = (telegram_base_url() or "https://api.telegram.org/bot") + f"{BOT_TOKEN}/getMe"
+    if telegram_base_is_local():
+        # Loopback must not go through the VPN; same reason as the request kwargs below.
+        kwargs = {"timeout": 10.0}
+    else:
+        kwargs = ehentai.http_client_kwargs(10.0)
+
+    deadline = time.monotonic() + timeout_seconds
+    attempt = 0
+    last_log = 0.0
+    while True:
+        attempt += 1
+        try:
+            with httpx.Client(**kwargs) as client:
+                if client.get(url).status_code == 200:
+                    if attempt > 1:
+                        logger.info("Telegram 已可連線（第 %s 次嘗試）。", attempt)
+                    return True
+        except Exception as exc:  # noqa: BLE001 - every failure here means "not yet"
+            if attempt == 1:
+                logger.warning("Telegram 目前連不上（%s），等待網路就緒……",
+                               type(exc).__name__)
+
+        if time.monotonic() >= deadline:
+            logger.error("等待 Telegram 連線逾時（%.0f 秒，%s 次嘗試）。"
+                         "請確認梯子已啟動，然後執行 scripts/run-bot.sh --background。",
+                         timeout_seconds, attempt)
+            return False
+
+        # Once a minute, so the log shows the wait without becoming a per-attempt flood.
+        now = time.monotonic()
+        if now - last_log >= 60.0:
+            last_log = now
+            remaining = deadline - now
+            logger.warning("仍在等待 Telegram（已嘗試 %s 次，剩餘 %.0f 秒）……",
+                           attempt, remaining)
+        time.sleep(interval)
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in {"--check", "--selfcheck"}:
         raise SystemExit(run_self_check())
@@ -9007,6 +9064,13 @@ def main():
         return
 
     log_startup_configuration()
+    # Connect first, announce afterwards; see wait_for_telegram.
+    ready = wait_for_telegram(
+        timeout_seconds=float(env_text("STARTUP_WAIT_SECONDS", "900") or 900)
+    )
+    if not ready:
+        raise SystemExit(1)
+
     logger.info("機器人已啟動，等待 Telegram 訊息。")
     try:
         application.run_polling(drop_pending_updates=True)

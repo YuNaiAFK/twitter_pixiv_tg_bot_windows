@@ -3014,6 +3014,86 @@ def _pillow_is_restricted_to_safe_formats() -> bool:
     return True
 
 
+def _the_bot_waits_for_the_network_before_announcing_itself() -> bool:
+    """
+    The bot must not announce 機器人已啟動 before the connection is real, and must wait rather than die.
+
+    The failure this locks out happened on a real reboot: the phone came up, the boot hook waited
+    120 s for the VPN, v2rayNG needed a manual start, the hook ran start-all.sh anyway, and
+    run_polling() raised TimedOut from get_me() three seconds later. The process exited. The log had
+    already printed 機器人已啟動, so it read as a working bot ignoring messages.
+
+    **Read with ast, not with str.find.** The first version of this check searched the source text and
+    reported the line as being in the wrong order, because the *comment* explaining the fix mentions
+    `run_polling()` and 機器人已啟動 before the code does. That is the third time in this project a
+    string-presence check fired on its own explanatory text; the parse tree cannot make that mistake,
+    because a comment is not in it.
+    """
+    import ast
+    import inspect
+
+    if not hasattr(bot, "wait_for_telegram"):
+        note("wait_for_telegram is not defined, so nothing waits for the network")
+        return False
+
+    tree = ast.parse(inspect.getsource(bot.main))
+    func = tree.body[0]
+    if not isinstance(func, ast.FunctionDef):
+        note("main() did not parse as a function")
+        return False
+
+    def calls(node, name):
+        return (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == name)
+
+    def method_calls(node, attr):
+        return (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == attr)
+
+    wait_at = log_at = poll_at = None
+    for index, stmt in enumerate(func.body):
+        for node in ast.walk(stmt):
+            if calls(node, "wait_for_telegram") and wait_at is None:
+                wait_at = index
+            # logger.info("機器人已啟動", ...) - the announcement.
+            if (method_calls(node, "info")
+                    and any(isinstance(a, ast.Constant) and isinstance(a.value, str)
+                            and "機器人已啟動" in a.value for a in node.args)):
+                log_at = index
+            if method_calls(node, "run_polling"):
+                poll_at = index
+
+    if wait_at is None:
+        note("main() never calls wait_for_telegram, so a dead network still kills the bot")
+        return False
+    if log_at is None or poll_at is None:
+        note("the announcement or run_polling is gone - this check needs updating")
+        return False
+    if not (wait_at < log_at):
+        note("main() announces 機器人已啟動 before waiting for the network - the exact symptom: "
+             "a log that says it is running while it is not")
+        return False
+    if not (wait_at < poll_at):
+        note("main() calls run_polling before waiting")
+        return False
+
+    # The wait's result must be checked, or a timeout would fall through into polling anyway.
+    guarded = any(
+        isinstance(stmt, ast.If)
+        and isinstance(stmt.test, ast.UnaryOp)
+        and isinstance(stmt.test.op, ast.Not)
+        and isinstance(stmt.test.operand, ast.Name)
+        and stmt.test.operand.id == "ready"
+        for stmt in func.body
+    )
+    if not guarded:
+        note("the wait's result is not checked with `if not ready`, so a timeout would still poll")
+        return False
+    return True
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -3873,8 +3953,21 @@ for _mod_name, _path in (("ehentai.py", HERE / "ehentai.py"),
             _i += 1
             _stmt += " " + _lines[_i].strip()
             _depth += _lines[_i].count("(") - _lines[_i].count(")")
-        if "http_client_kwargs" not in _stmt and "http_client or" not in _stmt:
-            _bare.append(_stmt.strip()[:70])
+        if "http_client_kwargs" in _stmt or "http_client or" in _stmt:
+            continue
+        # One deliberate exception: wait_for_telegram picks its kwargs by whether the Bot API is
+        # local, because proxying 127.0.0.1 through the VPN is the bug telegram_base_is_local()
+        # prevents - so the call site cannot name the helper. Matched on the enclosing function so
+        # the exception cannot grow to cover a client that really did lose its proxy.
+        _enclosing = ""
+        for _back in range(_i, -1, -1):
+            if _lines[_back].startswith(("def ", "async def ")):
+                _enclosing = _lines[_back].split("(")[0].replace("def ", "").replace(
+                    "async ", "").strip()
+                break
+        if _enclosing == "wait_for_telegram":
+            continue
+        _bare.append(_stmt.strip()[:70])
     check(f"every httpx.Client in {_mod_name} carries the proxy",
           not _bare, f"bare clients: {_bare}")
 
@@ -5072,6 +5165,10 @@ check("host_on_r2 passes the ceiling and the current usage to the uploader",
 check("Pillow is restricted to safe image formats",
       _pillow_is_restricted_to_safe_formats(),
       "an attacker-supplied file disguised as .jpg would otherwise reach the EPS/XBM/PDF decoders")
+
+check("the bot waits for the network before announcing itself",
+      _the_bot_waits_for_the_network_before_announcing_itself(),
+      "a rebooting phone starts the bot before the VPN, and the log said 已啟動 while it was dying")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),
