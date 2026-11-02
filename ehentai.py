@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 import urllib.parse
@@ -384,6 +385,71 @@ def request_with_retry(client, method: str, url: str, *, attempts: int = 3,
     ) from last_exc
 
 
+_PROXY_CHECK_TTL = 30.0
+_proxy_state = {"url": "", "ok": True, "at": 0.0}
+_proxy_logged = {"ok": "", "bad": ""}
+
+
+def _loopback_target(url: str):
+    """
+    (host, port) when this proxy is on the local machine, otherwise None.
+
+    Only loopback is worth probing. A remote proxy is a deliberate choice and being briefly slow is
+    not the same as being absent; probing it on every request would cost latency and could fail
+    transiently. The mode switch that causes this problem is always local.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url if "://" in url else f"http://{url}")
+    except ValueError:
+        return None
+    host = (parts.hostname or "").strip().lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return None
+    port = parts.port
+    if port is None:
+        port = 443 if parts.scheme == "https" else 80
+    return host, int(port)
+
+
+def _proxy_is_listening(url: str) -> bool:
+    """
+    Whether a loopback proxy is accepting connections. True for anything not on loopback.
+
+    Cached for _PROXY_CHECK_TTL so a burst of requests does not open a socket each time.
+    """
+    target = _loopback_target(url)
+    if target is None:
+        return True
+
+    now = time.monotonic()
+    if _proxy_state["url"] == url and now - _proxy_state["at"] < _PROXY_CHECK_TTL:
+        return _proxy_state["ok"]
+
+    host, port = target
+    ok = False
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            ok = True
+    except OSError:
+        ok = False
+
+    previous = _proxy_state["ok"] if _proxy_state["url"] == url else None
+    _proxy_state.update({"url": url, "ok": ok, "at": now})
+
+    # Log on change only. A per-request warning would be noise; a change is the thing worth knowing.
+    if not ok and _proxy_logged["bad"] != url:
+        _proxy_logged["bad"] = url
+        logger.warning("代理 %s 沒有在監聽，暫時改用直連。"
+                       "（v2rayNG 的「僅 TUN／VPN」模式就是這樣：流量已被導向，"
+                       "再設代理只會讓每個請求失敗在一個關閉的埠上）", url)
+    elif ok and previous is False and _proxy_logged["ok"] != url:
+        _proxy_logged["ok"] = url
+        logger.info("代理 %s 已恢復，繼續使用。", url)
+    return ok
+
+
 def proxy_url() -> str:
     """
     The proxy to send requests through, or "" for a direct connection.
@@ -403,8 +469,12 @@ def proxy_url() -> str:
                  "ALL_PROXY", "all_proxy"):
         value = (os.getenv(name) or "").strip()
         if value:
-            return value
-    return _registry_proxy()
+            # A configured proxy that is not listening is worse than no proxy.
+            return value if _proxy_is_listening(value) else ""
+    registry = _registry_proxy()
+    if registry and not _proxy_is_listening(registry):
+        return ""
+    return registry
 
 
 def _registry_proxy() -> str:

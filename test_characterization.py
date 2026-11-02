@@ -3094,6 +3094,66 @@ def _the_bot_waits_for_the_network_before_announcing_itself() -> bool:
     return True
 
 
+def _a_dead_local_proxy_is_skipped() -> bool:
+    """
+    A configured proxy whose port is closed must be treated as no proxy at all.
+
+    v2rayNG was switched to TUN mode: the tunnel carried everything, but BOT_PROXY still pointed at
+    127.0.0.1:10808 where nothing listened, and every download failed with "Connection refused" on a
+    network that worked fine without a proxy. A closed port fails every request; no proxy succeeds.
+
+    A remote proxy must NOT be probed - it is a deliberate choice, and being briefly slow is not the
+    same as being absent.
+    """
+    import os
+    import socket
+
+    saved = {k: os.environ.get(k) for k in
+             ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+              "ALL_PROXY", "all_proxy")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        ehentai._proxy_state.update({"url": "", "ok": True, "at": 0.0})
+
+        # A closed loopback port: skipped.
+        os.environ["HTTP_PROXY"] = "http://127.0.0.1:59999"
+        ehentai._proxy_state.update({"url": "", "ok": True, "at": 0.0})
+        if ehentai.proxy_url() != "":
+            note(f"a closed loopback proxy was still used: {ehentai.proxy_url()!r}")
+            return False
+
+        # An open loopback port: kept.
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        try:
+            os.environ["HTTP_PROXY"] = f"http://127.0.0.1:{port}"
+            ehentai._proxy_state.update({"url": "", "ok": True, "at": 0.0})
+            if not ehentai.proxy_url():
+                note(f"an open loopback proxy was skipped: port {port}")
+                return False
+        finally:
+            server.close()
+
+        # A remote proxy: kept whatever its state, because probing it would cost latency and could
+        # fail transiently for a reason that is not "the user switched modes".
+        os.environ["HTTP_PROXY"] = "http://192.0.2.1:3128"
+        ehentai._proxy_state.update({"url": "", "ok": True, "at": 0.0})
+        if not ehentai.proxy_url():
+            note("a remote proxy was skipped; only loopback should be probed")
+            return False
+        return True
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        ehentai._proxy_state.update({"url": "", "ok": True, "at": 0.0})
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -5169,6 +5229,10 @@ check("Pillow is restricted to safe image formats",
 check("the bot waits for the network before announcing itself",
       _the_bot_waits_for_the_network_before_announcing_itself(),
       "a rebooting phone starts the bot before the VPN, and the log said 已啟動 while it was dying")
+
+check("a dead local proxy is skipped, a live one and a remote one are kept",
+      _a_dead_local_proxy_is_skipped(),
+      "v2rayNG in TUN mode leaves BOT_PROXY pointing at a closed port")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),
