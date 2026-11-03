@@ -26,7 +26,12 @@ Hand-written entries the database does not have are kept, because they were adde
 from pathlib import Path
 import re
 
-DATA = Path(__file__).resolve().parent.parent.parent / "_ehtags"
+# **The database moved into a database/ subdirectory.** The clone used to put character.md and its
+# siblings at the repository root; it now keeps them under database/, so the old path raised
+# FileNotFoundError on a fresh clone. Both layouts are accepted rather than pinning to one, because
+# the layout is the upstream project's to change and a checkout from last month still works this way.
+_CHECKOUT = Path(__file__).resolve().parent.parent.parent / "_ehtags"
+DATA = _CHECKOUT / "database" if (_CHECKOUT / "database").is_dir() else _CHECKOUT
 PROJECT = Path(__file__).resolve().parent.parent / "bot" / "tag_translations.py"
 
 # Included; see the docstring for why artist and group are not.
