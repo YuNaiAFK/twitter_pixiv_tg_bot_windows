@@ -6905,20 +6905,34 @@ async def gallery_page_urls(gallery, status, original: bool,
                     gallery.page_url)
         return display_urls, original_urls
 
-    display_urls, original_urls = await run_with_progress(
-        lambda report: ehentai.fetch_gallery_images(
-            gallery.page_url,
-            cookies_path=resolve_ehentai_cookies(),
-            timeout=float(EHENTAI_TIMEOUT_SECONDS),
-            workers=EHENTAI_VIEWER_WORKERS,
-            progress=report,
-        ),
-        status,
-        prefix=f"正在取得圖片清單{'（' + label + '）' if label else ''}……",
-        gid=gallery.gid,
-        token=gallery.token,
-        total=pages or 0,
-    )
+    chat_id = getattr(status, "chat_id", 0) or 0
+    if stop_event is not None:
+        register_running_stop(chat_id, stop_event)
+    try:
+        display_urls, original_urls = await run_with_progress(
+            lambda report: ehentai.fetch_gallery_images(
+                gallery.page_url,
+                cookies_path=resolve_ehentai_cookies(),
+                timeout=float(EHENTAI_TIMEOUT_SECONDS),
+                workers=EHENTAI_VIEWER_WORKERS,
+                progress=report,
+                stop_event=stop_event,
+            ),
+            status,
+            prefix=f"正在取得圖片清單{'（' + label + '）' if label else ''}……",
+            gid=gallery.gid,
+            token=gallery.token,
+            total=pages or 0,
+        )
+    finally:
+        if stop_event is not None:
+            register_running_stop(chat_id, None)
+
+    # A stopped sweep is not cached: a short list written back would make the truncation permanent.
+    if stop_event is not None and stop_event.is_set():
+        logger.info("圖片清單掃描已被使用者停止：%s", gallery.page_url)
+        return display_urls, original_urls
+
     # Stored with the gallery, so a repeat of either action is free.
     await asyncio.to_thread(remember_gallery, gallery.page_url, gallery,
                             (display_urls, original_urls))
