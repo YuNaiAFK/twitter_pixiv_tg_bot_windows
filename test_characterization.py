@@ -3154,6 +3154,75 @@ def _a_dead_local_proxy_is_skipped() -> bool:
         ehentai._proxy_state.update({"url": "", "ok": True, "at": 0.0})
 
 
+def _the_long_phases_are_stoppable() -> bool:
+    """
+    The sweep and the R2 upload must register a stop flag, or the button answers and nothing stops.
+
+    Both draw the 停止 button (run_with_progress is given a gid and token), and neither used to
+    register anything, so pressing it ran stop_running_download() -> False and replied
+    "目前沒有進行中的下載" while the work carried on. From the user's side that is a broken button; from
+    the code's it was a missing register call, which no behavioural test would catch because the
+    mechanism itself works.
+
+    Checked in the source, because the fault is an absent call rather than a wrong result.
+    """
+    import inspect
+
+    sweep = inspect.getsource(bot.gallery_page_urls)
+    if "register_running_stop" not in sweep:
+        note("gallery_page_urls does not register a stop flag, so 停止 answers and the sweep runs on")
+        return False
+    if "stop_event=stop_event" not in sweep:
+        note("gallery_page_urls does not pass the flag to fetch_gallery_images")
+        return False
+    if "register_running_stop(chat_id, None)" not in sweep:
+        note("the sweep never unregisters, so a stale flag could claim a later stop")
+        return False
+
+    r2 = inspect.getsource(bot.host_on_r2)
+    if "stop_event=stop_event" not in r2:
+        note("host_on_r2 does not pass a stop_event to upload_many")
+        return False
+
+    sweep_impl = inspect.getsource(__import__("ehentai").fetch_gallery_images)
+    if "stop_event" not in sweep_impl:
+        note("fetch_gallery_images takes no stop_event at all")
+        return False
+    if sweep_impl.count("stop_event") < 3:
+        note("fetch_gallery_images accepts a stop_event but never checks it")
+        return False
+    return True
+
+
+def _stale_gallery_facts_are_refreshed() -> bool:
+    """
+    Tags, title and rating must be re-read after GALLERY_META_TTL_SECONDS, without re-sweeping.
+
+    The whole payload was cached for CACHE_STALE_SECONDS - 14 days - so a gallery whose tags were
+    edited on e-hentai kept showing the old ones for a fortnight. That number is right for the sweep
+    (fifty requests) and wrong for the facts (one).
+    """
+    import inspect
+
+    if not hasattr(bot, "GALLERY_META_TTL_SECONDS"):
+        note("GALLERY_META_TTL_SECONDS is not defined, so the facts never refresh")
+        return False
+    ttl = bot.GALLERY_META_TTL_SECONDS
+    if not (0 < ttl < bot.CACHE_STALE_SECONDS):
+        note(f"the metadata TTL ({ttl}) is not shorter than the payload TTL; nothing would refresh")
+        return False
+
+    handler = inspect.getsource(bot.handle_ehentai_gallery)
+    if "GALLERY_META_TTL_SECONDS" not in handler:
+        note("handle_ehentai_gallery never compares the age against it")
+        return False
+    # The refresh must keep the cached sweep, or it would cost a minute per press.
+    if 'cached.get("display_urls")' not in handler:
+        note("the refresh does not carry the cached image urls over, so it would re-sweep")
+        return False
+    return True
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -5233,6 +5302,13 @@ check("the bot waits for the network before announcing itself",
 check("a dead local proxy is skipped, a live one and a remote one are kept",
       _a_dead_local_proxy_is_skipped(),
       "v2rayNG in TUN mode leaves BOT_PROXY pointing at a closed port")
+
+check("the sweep and the R2 upload are stoppable",
+      _the_long_phases_are_stoppable(),
+      "the button answered while a minute of work continued")
+check("stale tags and title are re-read without re-sweeping",
+      _stale_gallery_facts_are_refreshed(),
+      "the whole payload was cached for 14 days, so edited tags never appeared")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),

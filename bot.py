@@ -917,6 +917,11 @@ ARCHIVE_CACHE_ENABLED = env_text("ARCHIVE_CACHE", "1").lower() not in {"0", "fal
 # failing.
 GALLERY_URL_TTL_SECONDS = env_number("GALLERY_URL_TTL_SECONDS", 2 * 3600)
 
+# How long a gallery's facts may be shown without asking e-hentai again. Separate from
+# CACHE_STALE_SECONDS, which governs the whole payload for 14 days - right for the sweep (fifty
+# requests) and wrong for the tags (one).
+GALLERY_META_TTL_SECONDS = env_number("GALLERY_META_TTL_SECONDS", 6 * 3600)
+
 
 # Hosts this bot fetches, and every alias that serves the same content. Verified against the
 # live sites rather than assumed:
@@ -5698,9 +5703,29 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
         # per-page sweep is not, and that is what the cache mostly saves.
         cached = gallery_cache_lookup(url)
         gallery = gallery_from_payload(cached) if cached else None
+        age = None
         if gallery is not None:
             age = gallery_cache_age(url)
             logger.info("命中畫廊快取（%.0f 秒前）：%s", age or 0, url)
+
+        # The facts go stale separately from the sweep: one request against fifty.
+        if (gallery is not None and age is not None
+                and age > GALLERY_META_TTL_SECONDS):
+            logger.info("畫廊資料已過期（%.0f 小時），重新取得：%s", age / 3600, url)
+            try:
+                fresh = await asyncio.to_thread(
+                    ehentai.fetch_gallery,
+                    url,
+                    cookies_path=resolve_ehentai_cookies(),
+                    timeout=float(EHENTAI_TIMEOUT_SECONDS),
+                )
+            except ehentai.EhentaiError as exc:
+                logger.warning("重新取得畫廊資料失敗，沿用快取：%s（%s）", url, exc)
+            else:
+                gallery = fresh
+                keep = (cached.get("display_urls"), cached.get("original_urls"))
+                await asyncio.to_thread(
+                    remember_gallery, url, gallery, keep if keep[0] else None)
 
         if gallery is None:
             gallery = await asyncio.to_thread(
@@ -6198,7 +6223,7 @@ async def notify_admins(bot, text: str, *, exclude: int = 0) -> int:
     return sent
 
 
-async def host_on_r2(embed: list, gallery, mode: str, status) -> list:
+async def host_on_r2(embed: list, gallery, mode: str, status, *, stop_event=None) -> list:
     """
     Copy the page's images into R2 and return the URLs to embed instead.
 
@@ -6279,6 +6304,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status) -> list:
             progress=progress,
             already_used=used_bytes,
             budget=allowance,
+            stop_event=stop_event,
         )
     except r2.R2Error as exc:
         logger.warning("R2 上傳無法進行：%s；改用原始網址", exc)
@@ -6451,7 +6477,10 @@ async def run_gallery_images(message, status, gallery, mode: str,
     if reuse_page is None:
         # The sweep alone. The "歸檔" modes download through the same helper afterwards,
         # so a gallery already looked at costs no sweep there either.
-        display_urls, original_urls = await gallery_page_urls(gallery, status, False)
+        # One flag for both slow phases of this parse; neither used to register anything.
+        parse_stop = threading.Event()
+        display_urls, original_urls = await gallery_page_urls(
+            gallery, status, False, stop_event=parse_stop)
 
         await status.edit_text(
             f"已取得 {len(display_urls)} 頁，正在建立 Telegraph 頁面……",
@@ -6467,7 +6496,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
         # What goes into Telegraph is then an R2 object rather than a signed e-hentai link, so the
         # page keeps working after the keystamp lapses - which is the failure the 重新生成 button
         # exists to repair. Degrades to the original URLs whenever R2 is unavailable.
-        embed = await host_on_r2(embed, gallery, mode, status)
+        embed = await host_on_r2(embed, gallery, mode, status, stop_event=parse_stop)
 
         try:
             if cached_entry is not None:
@@ -6846,7 +6875,8 @@ def download_gallery_for_archive(image_urls: list[str], output_dir: Path, *,
 
 async def gallery_page_urls(gallery, status, original: bool,
                             *, label: str = "",
-                            force: bool = False) -> tuple[list[str], list[str]]:
+                            force: bool = False,
+                            stop_event=None) -> tuple[list[str], list[str]]:
     """
     Return (display_urls, original_urls) for a gallery, from the cache when possible.
 
