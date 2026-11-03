@@ -3210,11 +3210,21 @@ def _the_long_phases_are_stoppable() -> bool:
 
 def _stale_gallery_facts_are_refreshed() -> bool:
     """
-    Tags, title and rating must be re-read after GALLERY_META_TTL_SECONDS, without re-sweeping.
+    A gallery sent again must show its current tags, not a cached set.
 
-    The whole payload was cached for CACHE_STALE_SECONDS - 14 days - so a gallery whose tags were
-    edited on e-hentai kept showing the old ones for a fortnight. That number is right for the sweep
-    (fifty requests) and wrong for the facts (one).
+    Two defaults were wrong in opposite directions. CACHE_STALE_SECONDS (14 days) governed the whole
+    payload including the title, tags and rating, so an edit on e-hentai took a fortnight to appear.
+    A six hour metadata TTL then looked like a compromise and reproduced the complaint: measured on
+    the device,
+
+        22:13:56  命中畫廊快取（2853 秒前）
+
+    47 minutes old, no refresh, previous tag list. The saving was one HTTP request against a sweep
+    that costs fifty, which is not worth a stale answer. The default is now 0 - always re-read - and
+    this asserts that a one-minute-old entry is already considered stale.
+
+    The expensive parts must still be reused: the sweep has its own GALLERY_URL_TTL_SECONDS, and a
+    refresh carries the cached image urls over rather than throwing them away.
     """
     import inspect
 
@@ -3222,20 +3232,21 @@ def _stale_gallery_facts_are_refreshed() -> bool:
         note("GALLERY_META_TTL_SECONDS is not defined, so the facts never refresh")
         return False
     ttl = bot.GALLERY_META_TTL_SECONDS
-    if not (0 < ttl < bot.CACHE_STALE_SECONDS):
+    if ttl >= bot.CACHE_STALE_SECONDS:
         note(f"the metadata TTL ({ttl}) is not shorter than the payload TTL; nothing would refresh")
+        return False
+    if ttl > 3600:
+        note(f"the metadata TTL ({ttl}s) leaves tags stale for over an hour")
         return False
 
     handler = inspect.getsource(bot.handle_ehentai_gallery)
     if "GALLERY_META_TTL_SECONDS" not in handler:
         note("handle_ehentai_gallery never compares the age against it")
         return False
-    # The refresh must keep the cached sweep, or it would cost a minute per press.
     if 'cached.get("display_urls")' not in handler:
         note("the refresh does not carry the cached image urls over, so it would re-sweep")
         return False
     return True
-
 
 def _gallery_cache_can_be_switched_off() -> bool:
     """

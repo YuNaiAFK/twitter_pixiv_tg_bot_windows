@@ -936,7 +936,14 @@ GALLERY_URL_TTL_SECONDS = env_number("GALLERY_URL_TTL_SECONDS", 2 * 3600)
 GALLERY_CACHE_ENABLED = os.getenv(
     "GALLERY_CACHE", "1").strip().lower() not in {"0", "false", "no", "off"}
 
-GALLERY_META_TTL_SECONDS = env_number("GALLERY_META_TTL_SECONDS", 6 * 3600)
+# How long a gallery's facts may be shown without asking e-hentai again.
+#
+# The default is 0: always re-read. A six hour default looked like a sensible compromise and
+# reproduced the complaint - measured on the device, "命中畫廊快取（2853 秒前）", 47 minutes old, no
+# refresh, previous tag list. The saving was one HTTP request against a sweep that costs fifty.
+# The expensive parts are still reused: the sweep has GALLERY_URL_TTL_SECONDS, and a refresh carries
+# the cached image urls over.
+GALLERY_META_TTL_SECONDS = env_number("GALLERY_META_TTL_SECONDS", 0)
 
 
 # Hosts this bot fetches, and every alias that serves the same content. Verified against the
