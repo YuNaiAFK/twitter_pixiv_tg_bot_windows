@@ -920,6 +920,22 @@ GALLERY_URL_TTL_SECONDS = env_number("GALLERY_URL_TTL_SECONDS", 2 * 3600)
 # How long a gallery's facts may be shown without asking e-hentai again. Separate from
 # CACHE_STALE_SECONDS, which governs the whole payload for 14 days - right for the sweep (fifty
 # requests) and wrong for the tags (one).
+# Whether an e-hentai gallery's facts, swept image list and Telegraph page record are kept.
+#
+# **Off is a real trade, not a saving.** The entry is about 9 KB - the 92 MB that used to sit on disk
+# was the archive cache, which ARCHIVE_CACHE=0 already handles. What the entry holds beyond the tags
+# is the Telegraph page URL, and that is what makes a re-parse *reuse* the page:
+#
+#     GALLERY_CACHE=1   send the same gallery twice -> one page, same URL
+#     GALLERY_CACHE=0   send it twice              -> two pages, the first orphaned
+#
+# so turning this off also costs the R2 URL reuse across parses: the images are still deduplicated by
+# content hash, but each has to be downloaded again to compute it.
+#
+# The Twitter/Pixiv media cache is unaffected either way - different store, different justification.
+GALLERY_CACHE_ENABLED = os.getenv(
+    "GALLERY_CACHE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
 GALLERY_META_TTL_SECONDS = env_number("GALLERY_META_TTL_SECONDS", 6 * 3600)
 
 
@@ -1768,7 +1784,9 @@ def gallery_cache_key(url: str, gallery=None) -> str:
 
 
 def gallery_cache_lookup(url: str, gallery=None) -> dict:
-    """The cached payload for a gallery under its canonical key, or an empty dict."""
+    """The cached payload for a gallery, or an empty dict when GALLERY_CACHE=0."""
+    if not GALLERY_CACHE_ENABLED:
+        return {}
     return PARSE_CACHE.lookup(gallery_cache_key(url, gallery), kind="gallery") or {}
 
 
@@ -1934,6 +1952,8 @@ def remember_gallery(url: str, gallery, image_urls=None) -> None:
     Written under :func:`gallery_cache_key`, not under ``url`` - see that function for why
     storing by the request URL produced two entries for one gallery.
     """
+    if not GALLERY_CACHE_ENABLED:
+        return
     PARSE_CACHE.store(gallery_cache_key(url, gallery), "gallery",
                       gallery_cache_payload(gallery, image_urls))
     if PARSE_CACHE.needs_pruning():

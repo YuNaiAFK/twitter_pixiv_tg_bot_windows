@@ -621,12 +621,26 @@ def _lock_waits_for_the_holder() -> bool:
             child = (
                 "import sys, time; sys.path.append('vendor'); import bot;"
                 f"bot.INSTANCE_LOCK_FILE = r'{lock_path}';"
+                # **The child announces itself before it touches the lock.** The parent used to
+                # sleep a fixed second assuming the child would reach acquire() within it. Starting
+                # an interpreter and importing bot can take longer on a busy machine, and then the
+                # parent released first and the child acquired immediately - failing "it never
+                # waited for the holder" for a reason unrelated to the lock. Measured flaky: two
+                # failures in eight runs before this handshake.
+                "print('READY', flush=True);"
                 "t=time.monotonic(); got=bot.acquire_instance_lock(8.0);"
                 "print(got, round(time.monotonic()-t, 2))"
             )
             try:
                 proc = _sp.Popen([_sys.executable, "-c", child], stdout=_sp.PIPE,
                                  stderr=_sp.DEVNULL, text=True, encoding="utf-8")
+                # Wait for the announcement rather than guessing import time. The readline blocks
+                # as long as that takes; the sleep after it is the window in which the child is
+                # genuinely blocked on the lock.
+                announced = proc.stdout.readline().strip()
+                if announced != "READY":
+                    proc.kill()
+                    return False
                 _tm.sleep(1.0)
                 bot.release_instance_lock()
                 out = (proc.communicate(timeout=30)[0] or "").strip()
@@ -3223,6 +3237,41 @@ def _stale_gallery_facts_are_refreshed() -> bool:
     return True
 
 
+def _gallery_cache_can_be_switched_off() -> bool:
+    """
+    GALLERY_CACHE=0 must stop both the read and the write, or it does nothing at all.
+
+    Off is a real trade rather than a saving: the entry is kilobytes, and what it holds besides the
+    tags is the Telegraph page URL - the thing that makes a re-parse reuse the page instead of
+    publishing a second one. So this checks that the switch works, not that off is better.
+
+    **The flag is patched, not reloaded.** The first version called importlib.reload(bot) to pick up
+    the environment variable, which re-executes the whole module - and every module-level object with
+    it, including the instance lock. Another test then failed on a lock it could no longer acquire,
+    which is a fair complaint: a test must not rewrite the state the rest of the suite depends on.
+    """
+    saved = bot.GALLERY_CACHE_ENABLED
+    try:
+        bot.GALLERY_CACHE_ENABLED = False
+        if bot.gallery_cache_lookup("https://e-hentai.org/g/1/abc"):
+            note("a lookup still returned a payload while the cache was off")
+            return False
+
+        class FakeGallery:
+            page_url = "https://e-hentai.org/g/1/abc"
+            gid = "1"
+            token = "abc"
+
+        before = len(bot.PARSE_CACHE.entries)
+        bot.remember_gallery("https://e-hentai.org/g/1/abc", FakeGallery())
+        if len(bot.PARSE_CACHE.entries) != before:
+            note("remember_gallery still wrote an entry while the cache was off")
+            return False
+        return True
+    finally:
+        bot.GALLERY_CACHE_ENABLED = saved
+
+
 def _result_message_helper_works() -> bool:
     """
     update_result_message must edit a caption on a photo and text on a text message.
@@ -5309,6 +5358,10 @@ check("the sweep and the R2 upload are stoppable",
 check("stale tags and title are re-read without re-sweeping",
       _stale_gallery_facts_are_refreshed(),
       "the whole payload was cached for 14 days, so edited tags never appeared")
+
+check("GALLERY_CACHE=0 stops both the read and the write",
+      _gallery_cache_can_be_switched_off(),
+      "a switch that only suppressed reads would be inert")
 
 check("the regenerate path can update a photo message",
       _result_message_helper_works(),
