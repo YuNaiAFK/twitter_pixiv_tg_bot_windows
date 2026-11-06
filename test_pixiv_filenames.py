@@ -30,7 +30,8 @@ class PixivFilenameTests(unittest.TestCase):
         tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
         selected = {"build_gallery_dl_command", "download_with_gallery_dl",
                     "media_cache_payload", "send_cached_media", "collect_media_files",
-                    "send_single_media", "send_original_files", "is_size_refusal"}
+                    "send_single_media", "send_media_album", "send_original_files", "is_size_refusal",
+                    "_strip_captions"}
         self.ns = {
             "Path": Path, "shutil": shutil, "logger": logging.getLogger("pixiv-test"),
             "PIXIV_DOWNLOAD_FILENAME": PIXIV_DOWNLOAD_FILENAME,
@@ -44,6 +45,7 @@ class PixivFilenameTests(unittest.TestCase):
             "TelegramError": RuntimeError, "source_link_options": lambda: None,
             "MAX_FILES": 50, "upload_limit_bytes": lambda: 2_000_000_000,
             "TimedOut": TimeoutError, "ALBUM_LIMIT": 10,
+            "PHOTO_LIMIT_BYTES": 10_000_000,
         }
         for node in tree.body:
             if (isinstance(node, ast.Assign) and any(
@@ -147,7 +149,7 @@ class PixivFilenameTests(unittest.TestCase):
         self.ns["download_with_gallery_dl"]("https://www.pixiv.net/artworks/12345", self.root, "pixiv")
         self.assertTrue((self.root / pixiv_filename(self.meta, ".jpg")).is_file())
 
-    def test_ugoira_zip_download_is_converted_named_and_sent_as_animation(self):
+    def test_ugoira_zip_download_is_converted_named_and_sent_as_document(self):
         from PIL import Image
 
         source = self.root / "12345_p0.zip"
@@ -174,16 +176,110 @@ class PixivFilenameTests(unittest.TestCase):
         self.assertFalse(source.exists())
         sent = []
 
-        async def animation(**kwargs):
-            sent.append((kwargs["filename"], kwargs["animation"].read()))
+        async def document(**kwargs):
+            self.assertTrue(kwargs["disable_content_type_detection"])
+            sent.append((kwargs["filename"], kwargs["document"].read()))
 
-        message = SimpleNamespace(reply_animation=AsyncMock(side_effect=animation))
+        message = SimpleNamespace(reply_document=AsyncMock(side_effect=document),
+                                  reply_animation=AsyncMock(), reply_video=AsyncMock())
         self.assertTrue(asyncio.run(self.ns["send_single_media"](
             message, files[0], "pixiv-url", self.root, prefer_original=True)))
         self.assertEqual(sent[0][0], pixiv_filename(self.meta, ".gif"))
         with Image.open(io.BytesIO(sent[0][1])) as gif:
             self.assertEqual(gif.n_frames, 2)
             self.assertEqual(gif.info["loop"], 0)
+        message.reply_animation.assert_not_called()
+        message.reply_video.assert_not_called()
+
+    def test_all_pixiv_media_types_are_sent_unchanged_as_documents(self):
+        for suffix in sorted(self.ns["MEDIA_EXTENSIONS"]):
+            with self.subTest(suffix=suffix):
+                source = self.source("original" + suffix, metadata=False)
+                original = source.read_bytes()
+
+                async def document(**kwargs):
+                    self.assertEqual(kwargs["document"].read(), original)
+                    self.assertEqual(kwargs["filename"], source.name)
+                    self.assertTrue(kwargs["disable_content_type_detection"])
+                    self.assertEqual(kwargs["caption"], "caption")
+
+                message = SimpleNamespace(reply_document=AsyncMock(side_effect=document),
+                                          reply_photo=AsyncMock(), reply_video=AsyncMock(),
+                                          reply_animation=AsyncMock())
+                self.assertTrue(asyncio.run(self.ns["send_single_media"](
+                    message, source, "pixiv-url", self.root,
+                    prefer_original=True, caption="caption")))
+                message.reply_document.assert_awaited_once()
+                message.reply_photo.assert_not_called()
+                message.reply_video.assert_not_called()
+                message.reply_animation.assert_not_called()
+
+    def test_other_platforms_keep_photo_video_and_animation_messages(self):
+        for suffix, method in [(".jpg", "reply_photo"), (".mp4", "reply_video"),
+                               (".gif", "reply_animation")]:
+            with self.subTest(suffix=suffix):
+                source = self.source("preview" + suffix, metadata=False)
+                message = SimpleNamespace(reply_document=AsyncMock(), reply_photo=AsyncMock(),
+                                          reply_video=AsyncMock(), reply_animation=AsyncMock())
+                self.assertTrue(asyncio.run(self.ns["send_single_media"](
+                    message, source, "twitter-url", self.root, prefer_original=False)))
+                getattr(message, method).assert_awaited_once()
+                message.reply_document.assert_not_called()
+
+    def test_pixiv_album_uses_document_items_without_type_detection(self):
+        from telegram import InputMediaDocument
+
+        files = [self.source(f"page{page}.png", metadata=False) for page in range(2)]
+
+        async def group(message, media, keyboard):
+            self.assertEqual(len(media), 2)
+            for item, source in zip(media, files):
+                self.assertIsInstance(item, InputMediaDocument)
+                self.assertTrue(item.disable_content_type_detection)
+                self.assertEqual(item.media.input_file_content, source.read_bytes())
+                self.assertEqual(item.to_dict()["filename"], source.name)
+
+        self.ns.update({"InputMediaDocument": InputMediaDocument,
+                        "_reply_media_group": AsyncMock(side_effect=group)})
+        self.assertTrue(asyncio.run(self.ns["send_media_album"](
+            None, files, "pixiv-url", as_document=True, with_caption=False)))
+
+    def test_cached_pixiv_gif_is_sent_as_document(self):
+        source = self.source("aabbccddeeff_001.gif", metadata=False)
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        name = pixiv_filename(self.meta, ".gif")
+        observed = []
+
+        async def document(**kwargs):
+            self.assertTrue(kwargs["disable_content_type_detection"])
+            observed.append((kwargs["filename"], kwargs["document"].read()))
+
+        message = SimpleNamespace(reply_document=AsyncMock(side_effect=document),
+                                  reply_animation=AsyncMock())
+        self.ns.update({"cached_media_files": lambda payload: [source],
+                        "make_work_dir": lambda: scratch})
+        payload = {"files": [source.name], "filenames": [name],
+                   "pixiv_filename_version": PIXIV_FILENAME_VERSION}
+        self.assertTrue(asyncio.run(self.ns["send_cached_media"](
+            message, SimpleNamespace(edit_text=AsyncMock()), "pixiv-url", payload, "pixiv", "")))
+        self.assertEqual(observed, [(name, source.read_bytes())])
+        message.reply_animation.assert_not_called()
+
+    def test_pixiv_album_retry_keeps_document_mode_and_filenames(self):
+        from telegram import InputMediaDocument
+
+        files = [self.source(f"page{page}.png", metadata=False) for page in range(2)]
+        sender = AsyncMock(side_effect=[RuntimeError("caption refused"), None])
+        self.ns.update({"InputMediaDocument": InputMediaDocument, "_reply_media_group": sender})
+        self.assertTrue(asyncio.run(self.ns["send_media_album"](
+            None, files, "pixiv-url", as_document=True, with_caption=False)))
+        self.assertEqual(sender.await_count, 2)
+        for item, source in zip(sender.await_args.args[1], files):
+            self.assertIsInstance(item, InputMediaDocument)
+            self.assertTrue(item.disable_content_type_detection)
+            self.assertEqual(item.to_dict()["filename"], source.name)
+            self.assertEqual(item.media.input_file_content, source.read_bytes())
 
     def test_legacy_ugoira_zip_cache_is_redownloaded_without_sending_zip(self):
         source = self.source("aabbccddeeff_001.zip", metadata=False)
@@ -212,6 +308,7 @@ class PixivFilenameTests(unittest.TestCase):
             message, [source], "pixiv-url", self.root, attach_link=False))
         self.assertEqual(result, (1, "", []))
         self.assertEqual(observed, [(source.name, original)])
+        message.reply_animation.assert_not_called()
 
     def test_gif_document_refusal_does_not_trigger_zip_or_resize(self):
         source = self.source("animation.gif", metadata=False)
@@ -224,6 +321,8 @@ class PixivFilenameTests(unittest.TestCase):
         self.assertEqual(result[0], 0)
         self.assertIn("未壓縮", result[1])
         self.assertEqual(result[2], [])
+        message.reply_animation.assert_not_called()
+        message.reply_document.assert_awaited_once()
 
     def test_cache_payload_records_display_names_and_version(self):
         files = [Path("作品_12345_p0_6789_畫師.jpg")]

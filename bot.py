@@ -5228,7 +5228,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
     a client renders the caption. An earlier version used the button alone, which put
     the link below the image.
 
-    With ``prefer_original`` an image is sent as a document, which is the only
+    With ``prefer_original`` every file is sent as a document, which is the only
     way Telegram passes the file through untouched. ``reply_photo`` re-encodes
     the image server-side (and renames it to a .jpg), so a photo upload is never
     the original even when it fits under the 10 MB photo limit. That is why this
@@ -5255,6 +5255,15 @@ async def send_single_media(message, file_path: Path, source_url: str,
     # the caller asked to show, and the note is only a compression remark.
     text = caption or note
 
+    if prefer_original:
+        # Pixiv 一律傳送文件，包含 GIF 與影片；關閉自動類型偵測，避免轉成動畫或影片訊息。
+        with file_path.open("rb") as media:
+            await message.reply_document(
+                document=media, filename=file_path.name, caption=text,
+                reply_markup=keyboard, disable_content_type_detection=True,
+            )
+        return True
+
     if suffix in VIDEO_EXTENSIONS:
         with file_path.open("rb") as media:
             await message.reply_video(
@@ -5279,15 +5288,6 @@ async def send_single_media(message, file_path: Path, source_url: str,
         return True
 
     if suffix in IMAGE_EXTENSIONS:
-        if prefer_original:
-            # Sent as a document on purpose: the bytes reach Telegram unchanged.
-            with file_path.open("rb") as media:
-                await message.reply_document(
-                    document=media, filename=file_path.name, caption=text,
-                    reply_markup=keyboard,
-                )
-            return True
-
         if size <= PHOTO_LIMIT_BYTES:
             with file_path.open("rb") as media:
                 await message.reply_photo(
@@ -5378,6 +5378,7 @@ async def send_media_album(message, files: list[Path], source_url: str,
             item_kwargs = {"media": handle,
                            "caption": caption if index == 0 else None}
             if as_document:
+                item_kwargs["disable_content_type_detection"] = True
                 # Send the real filename, so an original does not arrive as
                 # "file_0.dat". It MUST go through api_kwargs: PTB's `filename=`
                 # parameter is deprecated and is dropped by to_dict(), which was
@@ -5440,7 +5441,12 @@ def _strip_captions(media: list):
     stripped = []
     for item in media:
         builder = type(item)
-        stripped.append(builder(media=item.media))
+        kwargs = {"media": item.media}
+        if isinstance(item, InputMediaDocument):
+            # 移除說明重試時，仍保留文件模式與原始檔名。
+            kwargs["disable_content_type_detection"] = item.disable_content_type_detection
+            kwargs["api_kwargs"] = dict(item.api_kwargs) if item.api_kwargs else None
+        stripped.append(builder(**kwargs))
     return stripped
 
 
@@ -5543,7 +5549,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
     the cached replay path has to respect the same split, or a repeat of a cached Pixiv
     link would suddenly grow a link that a fresh download does not have.
 
-    ``as_document`` (the default) sends images as documents, which is the only
+    ``as_document`` (the default) sends every file as a document, which is the only
     way Telegram passes a file through untouched; the Pixiv path relies on that
     so recipients get the original artwork. With ``as_document=False`` images go
     as normal photos, which Telegram re-encodes - the right choice for
@@ -5651,22 +5657,9 @@ async def send_original_files(message, files: list[Path], source_url: str,
             notes.append(f"{file_path.name} 傳送逾時（可能已送達）")
         except TelegramError as exc:
             if as_document and file_path.suffix.lower() in ANIMATION_EXTENSIONS and is_size_refusal(exc):
-                # 動圖過大時傳送同一個 GIF 文件，保留尺寸與影格，不重新壓縮或包成 ZIP。
-                logger.warning("動圖超過動畫傳送限制，改傳原始 GIF 文件：%s", file_path.name)
-                try:
-                    with file_path.open("rb") as media:
-                        await message.reply_document(
-                            document=media, filename=file_path.name,
-                            caption=None if link_carried else caption, reply_markup=None,
-                        )
-                    sent += 1
-                    link_carried = True
-                except TimedOut:
-                    logger.warning("GIF 文件傳送逾時，不重試以免重複：%s", file_path.name)
-                    notes.append(f"{file_path.name} 傳送逾時（可能已送達）")
-                except TelegramError:
-                    logger.exception("GIF 文件傳送失敗：%s", file_path.name)
-                    notes.append(f"{file_path.name} 傳送失敗（保留原尺寸，未壓縮）")
+                # GIF 已是文件；過大時回報失敗，保留原尺寸，不重試、壓縮或包成 ZIP。
+                logger.warning("GIF 文件超過傳送限制，保留原尺寸：%s", file_path.name)
+                notes.append(f"{file_path.name} 傳送失敗（檔案過大，保留原尺寸，未壓縮）")
             elif is_size_refusal(exc):
                 too_large.append(file_path)
                 logger.warning("檔案過大被拒，將改用 ZIP：%s（%s）", file_path.name, exc)
@@ -8675,7 +8668,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 succeeded = True
                 return
 
-            summary = f"Pixiv 解析完成，已傳送原圖 {sent_count}/{len(media_files)} 個檔案。"
+            summary = f"Pixiv 解析完成，已傳送 {sent_count}/{len(media_files)} 個文件。"
             if album_note:
                 summary += f"（{album_note}）"
             # No source link here: send_original_files posts it as its own last
