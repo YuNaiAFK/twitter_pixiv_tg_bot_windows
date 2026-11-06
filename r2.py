@@ -20,7 +20,7 @@ That second point is the privacy mitigation for hosting something that has to be
 readable: Telegraph fetches these without credentials, so the URLs are public by necessity, and a
 hash is what keeps them from being *findable*.
 
-**Why two levels of prefix.** `galleries/ab/cd/<hash>.jpg` spreads objects over 65536 prefixes.
+**Why two levels of prefix.** `galleries/ab/cd/<hash>` spreads objects over 65536 prefixes.
 R2 does not care, but listing a single flat prefix of hundreds of thousands of keys is unpleasant
 to work with and every tool that touches it has to page.
 """
@@ -52,6 +52,9 @@ DEFAULT_TIMEOUT = 60.0
 
 # Images are small, and refusing a large one outright would lose a page rather than one image.
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
+
+# 固定數量的鎖讓不同畫廊工作共用防重複保護；條件式寫入也能處理跨程序的競爭。
+_CONTENT_UPLOAD_LOCKS = tuple(threading.Lock() for _ in range(64))
 
 
 # The free allowance Cloudflare documents, in bytes: 10 GB of storage per month.
@@ -331,6 +334,40 @@ def fetch_image(url: str, *, timeout: float = DEFAULT_TIMEOUT, referer: str = ""
             client.close()
 
 
+def _existing_content_key(client, bucket: str, key: str) -> str:
+    """查詢相同內容雜湊，並相容舊版帶副檔名的物件。
+
+    查詢失敗時交給上層重試，不能視為檔案不存在。前綴含完整雜湊，只會列出這張圖片的候選物件。
+    """
+    token = None
+    seen_tokens = set()
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": key, "MaxKeys": 100}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = client.list_objects_v2(**kwargs)
+        for item in page.get("Contents", []):
+            candidate = item.get("Key", "")
+            if candidate == key or (
+                    candidate.startswith(key + ".")
+                    and "/" not in candidate[len(key):]):
+                return candidate
+        if not page.get("IsTruncated"):
+            return ""
+        token = page.get("NextContinuationToken")
+        if not token or token in seen_tokens:
+            raise R2Error("無法完整檢查 R2 的重複檔案，請重試")
+        seen_tokens.add(token)
+
+
+def _object_already_created(exc: Exception) -> bool:
+    """條件式寫入時，另一個上傳工作已經建立了相同物件。"""
+    response = getattr(exc, "response", {}) or {}
+    code = str((response.get("Error") or {}).get("Code", ""))
+    status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+    return code in {"PreconditionFailed", "412"} or status == 412
+
+
 def upload_many(
     urls,
     *,
@@ -376,62 +413,73 @@ def upload_many(
     # read and added to under the lock; a per-image check against a stale total would let several
     # images through at once and overshoot by however many workers are running.
     committed = [already_used]
-    budget_hit = [False]
+    known_keys: dict[str, str] = {}
 
     def one(item):
         index, url = item
         if stop_event is not None and stop_event.is_set():
             return index, UploadResult(url, error="已取消")
-        if budget_hit[0]:
-            return index, UploadResult(url, error="已達 R2 免費額度上限")
         try:
             data, content_type = fetch_image(url, timeout=timeout, referer=referer,
                                              cookies=cookies)
         except Exception as exc:  # noqa: BLE001
             return index, UploadResult(url, error=f"{type(exc).__name__}: {exc}")
 
-        extension = extension_for(url, content_type)
-        key = content_key(data, extension=extension, prefix=key_prefix)
+        # 新物件僅以內容識別；檔名、副檔名與 MIME 標頭不同，也不能重複存放相同位元組。
+        key = content_key(data, prefix=key_prefix)
         result = UploadResult(source_url=url, key=key, size=len(data),
-                              content_type=content_type or "application/octet-stream",
-                              public_url=settings.public_url(key))
+                              content_type=content_type or "application/octet-stream")
 
-        # Cheap idempotency: the key is the content hash, so an existing object is by definition the
-        # same bytes. This is what makes a retry after a partial failure cost only the gaps.
-        try:
-            client.head_object(Bucket=settings.bucket, Key=key)
-            result.skipped = True
-            return index, result
-        except Exception:  # noqa: BLE001
-            pass
+        content_lock = _CONTENT_UPLOAD_LOCKS[
+            hash((settings.endpoint, settings.bucket, key)) % len(_CONTENT_UPLOAD_LOCKS)]
+        with content_lock:
+            if stop_event is not None and stop_event.is_set():
+                result.error = "已取消"
+                return index, result
+            try:
+                existing = known_keys.get(key) or _existing_content_key(
+                    client, settings.bucket, key)
+            except Exception as exc:  # noqa: BLE001
+                result.error = f"無法檢查重複檔案：{type(exc).__name__}: {exc}"
+                return index, result
+            if existing:
+                known_keys[key] = existing
+                result.key = existing
+                result.public_url = settings.public_url(existing)
+                result.skipped = True
+                return index, result
 
-        # **Refuse before the put, not after.** An upload that has happened is an upload that is
-        # billed for the month, so the ceiling has to be consulted before the bytes are written -
-        # which also means the check is `already stored + this image <= budget`, not `<`.
-        if budget:
-            with lock:
-                if committed[0] + len(data) > budget:
-                    budget_hit[0] = True
-                    result.error = "已達 R2 免費額度上限"
-                    return index, result
-                committed[0] += len(data)
-
-        try:
-            client.put_object(
-                Bucket=settings.bucket,
-                Key=key,
-                Body=data,
-                ContentType=result.content_type,
-                CacheControl=CACHE_CONTROL,
-            )
-            return index, result
-        except Exception as exc:  # noqa: BLE001
-            # The bytes were counted before the attempt, so a failure has to give them back or the
-            # remaining images are refused against a total that was never stored.
+            if stop_event is not None and stop_event.is_set():
+                result.error = "已取消"
+                return index, result
+            # 沿用既有檔案不占用本次上傳額度；確認需要新物件後，才在寫入前檢查上限。
             if budget:
                 with lock:
-                    committed[0] -= len(data)
-            result.error = f"{type(exc).__name__}: {exc}"
+                    if committed[0] + len(data) > budget:
+                        result.error = "已達 R2 免費額度上限"
+                        return index, result
+                    committed[0] += len(data)
+
+            try:
+                client.put_object(
+                    Bucket=settings.bucket,
+                    Key=key,
+                    Body=data,
+                    ContentType=result.content_type,
+                    CacheControl=CACHE_CONTROL,
+                    IfNoneMatch="*",
+                )
+            except Exception as exc:  # noqa: BLE001
+                if budget:
+                    with lock:
+                        committed[0] -= len(data)
+                if not _object_already_created(exc):
+                    result.error = f"{type(exc).__name__}: {exc}"
+                    return index, result
+                result.skipped = True
+
+            known_keys[key] = key
+            result.public_url = settings.public_url(key)
             return index, result
 
     results: list = [None] * len(items)

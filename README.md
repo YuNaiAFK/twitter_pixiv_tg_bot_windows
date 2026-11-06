@@ -626,10 +626,14 @@ e-hentai 內嵌的圖片是帶簽章、會過期的連結（`*.hath.network`）�
 把圖片複製一份到 **Cloudflare R2** 則根本沒有這個問題：物件存在多久，URL 就穩定多久 ——
 一個月前解析過的畫廊，也能在完全不碰 e-hentai 的情況下送出。
 
-- **物件鍵是內容雜湊**（`galleries/ab/cd/<sha256>.jpg`，兩層前綴把物件分散到 65536 個前綴）。
+- **物件鍵是內容雜湊**（新物件使用 `galleries/ab/cd/<sha256>`，圖片格式由 `Content-Type` 指定）。
   同張圖上傳兩次就是同一個物件，所以重新解析只補缺的；也因為 URL 不能從畫廊 id 猜到，
   知道一個路徑無法列舉桶裡還有什麼。Telegraph 是匿名抓圖的，URL 必須公開，
   雜湊是讓它「公開但不可搜尋」的手段
+- **上傳前先查詢重複檔案**：內容相同就沿用 R2 網址，即使檔名或副檔名不同也不重傳；
+  舊版帶副檔名的物件同樣會被辨識。同一批或不同畫廊同時出現相同圖片時，也會共用物件。
+  寫入使用 [R2 條件式上傳](https://developers.cloudflare.com/r2/api/s3/api/#conditional-operations)，
+  防止其他程序同時建立相同檔案；若查詢失敗，則交給自動重試流程處理。
 - **`Cache-Control: public, max-age=31536000, immutable`**：物件不可變，沒有理由給更短的快取
 - 單張圖片上限 **32 MiB**；平行上傳預設 **6** 個 worker（`R2_UPLOAD_WORKERS`）、
   單張逾時 **60 秒**（`R2_UPLOAD_TIMEOUT`）
