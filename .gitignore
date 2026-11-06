@@ -29,3 +29,6 @@ telegram-bot-api.exe
 # git add -A between those two steps stages them - which happened once and put commit message
 # text into the repository.
 _*.txt
+
+# MTProto bot 工作階段（含認證資訊）。
+.mtproto/

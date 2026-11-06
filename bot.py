@@ -5255,10 +5255,24 @@ async def send_single_media(message, file_path: Path, source_url: str,
     # the caller asked to show, and the note is only a compression remark.
     text = caption or note
 
-    # Pixiv 的格式有時會由呼叫端分類錯誤；來源網址才是可靠依據，無論副檔名或
+    # 依 Pixiv 來源網址固定文件模式，無論副檔名或
     # prefer_original 參數為何，都把 Pixiv 媒體交給 sendDocument。
     if prefer_original or detect_media_platform(source_url) == "pixiv":
-        # Pixiv 一律傳送文件，包含 GIF 與影片；關閉自動類型偵測，避免轉成動畫或影片訊息。
+        if suffix == ".gif" and detect_media_platform(source_url) == "pixiv":
+            from telegram_documents import send_gif_document
+            try:
+                await send_gif_document(
+                    file_path, chat_id=message.chat_id, reply_to=message.message_id,
+                    caption=text, session_dir=BASE_DIR / ".mtproto",
+                    proxy_url=system_proxy_url(),
+                )
+            except (TimeoutError, asyncio.TimeoutError) as exc:
+                raise TimedOut("GIF 文件傳送逾時，可能已送達，未再重送") from exc
+            except Exception as exc:
+                logger.error("MTProto GIF 文件傳送失敗：%s", redact_secrets(str(exc)))
+                raise TelegramError("GIF 文件傳送失敗，請查看日誌中的 MTProto 設定或連線資訊") from exc
+            return True
+        # 靜態圖片與影片沿用 Bot API 文件模式。
         with file_path.open("rb") as media:
             await message.reply_document(
                 document=media, filename=file_path.name, caption=text,

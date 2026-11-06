@@ -1224,3 +1224,7 @@ PTB 預設**一次只處理一個 update**，而按鈕按一下就是一個 upda
 成人內容的發佈 —— 尤其是 Telegraph 頁面 —— 可能違反平台政策而被移除。
 
 實作歷史、疑難雜症與安全稽核紀錄都在 [docs/NOTES.md](docs/NOTES.md)。
+
+### Pixiv GIF 的桌面文件顯示
+
+Telegram Desktop 會把 MIME 為 image/gif 的文件也顯示成動畫卡片。因此 Pixiv GIF 改用 MTProto，以 application/octet-stream 與強制文件旗標傳送，保留 .gif 檔名及原始 GIF 內容；新解析與快取重送皆適用。請安裝 Telethon 與 python-socks[asyncio]，並在 .env 設定既有的 TELEGRAM_API_ID、TELEGRAM_API_HASH、BOT_TOKEN。登入工作階段儲存在 .mtproto/，與解析快取分開且不納入 Git。缺少設定或連線失敗時會回報失敗，不會降回動畫卡片重送。

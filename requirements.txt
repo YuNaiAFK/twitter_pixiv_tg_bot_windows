@@ -1,5 +1,7 @@
 python-telegram-bot>=21.0,<23.0
 python-dotenv>=1.0,<2.0
+Telethon>=1.42,<2.0
+python-socks[asyncio]>=2.7,<3.0
 # Downscales oversized photos and tall screenshots so Telegram accepts them as
 # photos instead of documents.
 Pillow>=13.0.0  # 13.0.0 fixes 24 CVEs reachable from this code path

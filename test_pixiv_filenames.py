@@ -12,7 +12,8 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlparse
 
 from pixiv_filenames import (
     PIXIV_DOWNLOAD_FILENAME, PIXIV_FILENAME_VERSION, pixiv_filename,
@@ -31,7 +32,7 @@ class PixivFilenameTests(unittest.TestCase):
         selected = {"build_gallery_dl_command", "download_with_gallery_dl",
                     "media_cache_payload", "send_cached_media", "collect_media_files",
                     "send_single_media", "send_media_album", "send_original_files", "is_size_refusal",
-                    "_strip_captions"}
+                    "_strip_captions", "detect_media_platform", "get_host"}
         self.ns = {
             "Path": Path, "shutil": shutil, "logger": logging.getLogger("pixiv-test"),
             "PIXIV_DOWNLOAD_FILENAME": PIXIV_DOWNLOAD_FILENAME,
@@ -45,7 +46,7 @@ class PixivFilenameTests(unittest.TestCase):
             "TelegramError": RuntimeError, "source_link_options": lambda: None,
             "MAX_FILES": 50, "upload_limit_bytes": lambda: 2_000_000_000,
             "TimedOut": TimeoutError, "ALBUM_LIMIT": 10,
-            "PHOTO_LIMIT_BYTES": 10_000_000,
+            "PHOTO_LIMIT_BYTES": 10_000_000, "urlparse": urlparse,
         }
         for node in tree.body:
             if (isinstance(node, ast.Assign) and any(
@@ -225,6 +226,26 @@ class PixivFilenameTests(unittest.TestCase):
                     message, source, "twitter-url", self.root, prefer_original=False)))
                 getattr(message, method).assert_awaited_once()
                 message.reply_document.assert_not_called()
+
+    def test_pixiv_gif_routes_to_mtproto_and_does_not_fallback(self):
+        source = self.source("work.gif", metadata=False)
+        message = SimpleNamespace(chat_id=123, message_id=456, reply_document=AsyncMock(),
+                                  reply_animation=AsyncMock())
+        self.ns.update({"system_proxy_url": lambda: "", "redact_secrets": str, "asyncio": asyncio})
+        sender = AsyncMock(return_value=789)
+        with patch("telegram_documents.send_gif_document", sender):
+            self.assertTrue(asyncio.run(self.ns["send_single_media"](
+                message, source, "https://www.pixiv.net/artworks/12345", self.root)))
+        sender.assert_awaited_once()
+        self.assertEqual(sender.await_args.kwargs["chat_id"], 123)
+        self.assertEqual(sender.await_args.kwargs["reply_to"], 456)
+        message.reply_document.assert_not_called()
+        message.reply_animation.assert_not_called()
+        with patch("telegram_documents.send_gif_document", AsyncMock(side_effect=TimeoutError)):
+            with self.assertRaises(TimeoutError):
+                asyncio.run(self.ns["send_single_media"](
+                    message, source, "https://www.pixiv.net/artworks/12345", self.root))
+        message.reply_document.assert_not_called()
 
     def test_pixiv_album_uses_document_items_without_type_detection(self):
         from telegram import InputMediaDocument
