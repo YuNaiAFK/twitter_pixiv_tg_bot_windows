@@ -5255,7 +5255,9 @@ async def send_single_media(message, file_path: Path, source_url: str,
     # the caller asked to show, and the note is only a compression remark.
     text = caption or note
 
-    if prefer_original:
+    # Pixiv 的格式有時會由呼叫端分類錯誤；來源網址才是可靠依據，無論副檔名或
+    # prefer_original 參數為何，都把 Pixiv 媒體交給 sendDocument。
+    if prefer_original or detect_media_platform(source_url) == "pixiv":
         # Pixiv 一律傳送文件，包含 GIF 與影片；關閉自動類型偵測，避免轉成動畫或影片訊息。
         with file_path.open("rb") as media:
             await message.reply_document(
@@ -5563,6 +5565,8 @@ async def send_original_files(message, files: list[Path], source_url: str,
     Only the **first** message carries the link, so a 30-page work does not repeat it
     on all three of its albums.
     """
+    # 依來源網址再次鎖定 Pixiv 文件模式，避免任何呼叫端的預設值改變傳送方式。
+    as_document = as_document or detect_media_platform(source_url) == "pixiv"
     sent = 0
     notes = []
     # Files Telegram refused for being too large, so the caller can ZIP them.
