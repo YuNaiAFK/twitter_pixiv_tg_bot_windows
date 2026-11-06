@@ -4423,7 +4423,7 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("讀不到這個群組的 ID，無法移除授權。")
             return
         changed = AUTHORIZATION.revoke_group(chat_id)
-        if anonymous and not AUTHORIZATION.groups:
+        if anonymous and changed and not AUTHORIZATION.groups:
             AUTHORIZATION.group_locked = True
         saved = save_authorization()
         note = "已移除這個群組的授權。" if changed else "這個群組本來就不在授權名單中。"
