@@ -761,7 +761,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
 ANIMATION_EXTENSIONS = {".gif"}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | ANIMATION_EXTENSIONS
-# Pixiv Ugoira 的原始下載是動畫影格 ZIP，須以文件傳送，不能當成沒有媒體。
+# Pixiv Ugoira ZIP 是待合成的來源，只有完成的 GIF 會交給媒體傳送流程。
 PIXIV_MEDIA_EXTENSIONS = MEDIA_EXTENSIONS | {".zip"}
 
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -2125,6 +2125,9 @@ async def send_cached_media(message, status, url: str, payload: dict,
         return False
     files = cached_media_files(payload)
     if not files:
+        return False
+    if platform == "pixiv" and any(path.suffix.lower() == ".zip" for path in files):
+        logger.info("Pixiv 舊動圖 ZIP 快取將重新下載並合成 GIF")
         return False
 
     scratch = make_work_dir()
@@ -4893,12 +4896,11 @@ def download_with_gallery_dl(url: str, output_dir: Path, platform: str | None = 
             if path.is_file() and path.suffix.lower() in PIXIV_MEDIA_EXTENSIONS)
 
 
-def collect_media_files(temp_dir: Path, platform: str | None = None) -> list[Path]:
+def collect_media_files(temp_dir: Path) -> list[Path]:
     """Media files the download produced, capped at MAX_FILES."""
-    extensions = PIXIV_MEDIA_EXTENSIONS if platform == "pixiv" else MEDIA_EXTENSIONS
     files = sorted(
         path for path in temp_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in extensions
+        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
     )
     return files[:MAX_FILES]
 
@@ -5648,7 +5650,24 @@ async def send_original_files(message, files: list[Path], source_url: str,
             logger.warning("傳送逾時，不重試以免重複：%s", file_path.name)
             notes.append(f"{file_path.name} 傳送逾時（可能已送達）")
         except TelegramError as exc:
-            if is_size_refusal(exc):
+            if as_document and file_path.suffix.lower() in ANIMATION_EXTENSIONS and is_size_refusal(exc):
+                # 動圖過大時傳送同一個 GIF 文件，保留尺寸與影格，不重新壓縮或包成 ZIP。
+                logger.warning("動圖超過動畫傳送限制，改傳原始 GIF 文件：%s", file_path.name)
+                try:
+                    with file_path.open("rb") as media:
+                        await message.reply_document(
+                            document=media, filename=file_path.name,
+                            caption=None if link_carried else caption, reply_markup=None,
+                        )
+                    sent += 1
+                    link_carried = True
+                except TimedOut:
+                    logger.warning("GIF 文件傳送逾時，不重試以免重複：%s", file_path.name)
+                    notes.append(f"{file_path.name} 傳送逾時（可能已送達）")
+                except TelegramError:
+                    logger.exception("GIF 文件傳送失敗：%s", file_path.name)
+                    notes.append(f"{file_path.name} 傳送失敗（保留原尺寸，未壓縮）")
+            elif is_size_refusal(exc):
                 too_large.append(file_path)
                 logger.warning("檔案過大被拒，將改用 ZIP：%s（%s）", file_path.name, exc)
             else:
@@ -8608,7 +8627,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 download_with_gallery_dl, media_url, temp_dir, platform
             )
 
-        media_files = collect_media_files(temp_dir, platform=platform)
+        media_files = collect_media_files(temp_dir)
 
         if not media_files:
             # No operator detail in the chat. The credential diagnosis names local
@@ -8621,9 +8640,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if platform == "pixiv":
-            # Sending the artwork as-is: one message per album, original files.
-            # No image is downscaled, so the bytes the recipient gets match what
-            # gallery-dl downloaded.
+            # 靜態圖片傳送原檔；Ugoira 已合成原始尺寸、完整影格的 GIF，不縮圖。
             #
             # If a send is refused purely because a file is too large, the work is
             # re-sent as a ZIP - see send_original_files, which reports that back

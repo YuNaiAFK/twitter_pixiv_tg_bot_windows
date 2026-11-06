@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ class PixivFilenameTests(unittest.TestCase):
         tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
         selected = {"build_gallery_dl_command", "download_with_gallery_dl",
                     "media_cache_payload", "send_cached_media", "collect_media_files",
-                    "send_single_media"}
+                    "send_single_media", "send_original_files", "is_size_refusal"}
         self.ns = {
             "Path": Path, "shutil": shutil, "logger": logging.getLogger("pixiv-test"),
             "PIXIV_DOWNLOAD_FILENAME": PIXIV_DOWNLOAD_FILENAME,
@@ -42,6 +43,7 @@ class PixivFilenameTests(unittest.TestCase):
             "COOKIES_FILE": "", "BASE_DIR": self.root,
             "TelegramError": RuntimeError, "source_link_options": lambda: None,
             "MAX_FILES": 50, "upload_limit_bytes": lambda: 2_000_000_000,
+            "TimedOut": TimeoutError, "ALBUM_LIMIT": 10,
         }
         for node in tree.body:
             if (isinstance(node, ast.Assign) and any(
@@ -145,12 +147,19 @@ class PixivFilenameTests(unittest.TestCase):
         self.ns["download_with_gallery_dl"]("https://www.pixiv.net/artworks/12345", self.root, "pixiv")
         self.assertTrue((self.root / pixiv_filename(self.meta, ".jpg")).is_file())
 
-    def test_ugoira_zip_download_is_named_collected_and_sent_as_original(self):
+    def test_ugoira_zip_download_is_converted_named_and_sent_as_animation(self):
+        from PIL import Image
+
         source = self.root / "12345_p0.zip"
         with zipfile.ZipFile(source, "w") as archive:
-            archive.writestr("000000.jpg", b"original animation frame")
-        original = source.read_bytes()
+            for name, color in [("000000.png", "red"), ("000001.png", "blue")]:
+                buffer = io.BytesIO()
+                with Image.new("RGB", (8, 8), color) as frame:
+                    frame.save(buffer, format="PNG")
+                archive.writestr(name, buffer.getvalue())
         self.meta["type"] = "ugoira"
+        self.meta["frames"] = [{"file": "000000.png", "delay": 60},
+                               {"file": "000001.png", "delay": 140}]
         source.with_name(source.name + ".json").write_text(json.dumps(self.meta), encoding="utf-8")
         self.ns.update({
             "begin_download_diagnosis": lambda: None,
@@ -160,27 +169,61 @@ class PixivFilenameTests(unittest.TestCase):
             "gallery_dl_env": lambda platform: {}, "MAX_DOWNLOAD_SECONDS": 60,
         })
         self.ns["download_with_gallery_dl"]("pixiv-url", self.root, "pixiv")
-        files = self.ns["collect_media_files"](self.root, platform="pixiv")
-        self.assertEqual([path.name for path in files], [pixiv_filename(self.meta, ".zip")])
-        self.assertEqual(self.ns["collect_media_files"](self.root), [])
+        files = self.ns["collect_media_files"](self.root)
+        self.assertEqual([path.name for path in files], [pixiv_filename(self.meta, ".gif")])
+        self.assertFalse(source.exists())
         sent = []
 
-        async def document(**kwargs):
-            sent.append((kwargs["filename"], kwargs["document"].read()))
+        async def animation(**kwargs):
+            sent.append((kwargs["filename"], kwargs["animation"].read()))
 
-        message = SimpleNamespace(reply_document=AsyncMock(side_effect=document))
+        message = SimpleNamespace(reply_animation=AsyncMock(side_effect=animation))
         self.assertTrue(asyncio.run(self.ns["send_single_media"](
             message, files[0], "pixiv-url", self.root, prefer_original=True)))
-        self.assertEqual(sent, [(pixiv_filename(self.meta, ".zip"), original)])
+        self.assertEqual(sent[0][0], pixiv_filename(self.meta, ".gif"))
+        with Image.open(io.BytesIO(sent[0][1])) as gif:
+            self.assertEqual(gif.n_frames, 2)
+            self.assertEqual(gif.info["loop"], 0)
 
-    def test_ugoira_zip_cache_retains_name_and_bytes(self):
+    def test_legacy_ugoira_zip_cache_is_redownloaded_without_sending_zip(self):
         source = self.source("aabbccddeeff_001.zip", metadata=False)
-        name = pixiv_filename(self.meta, ".zip")
-        scratch = self.root / "scratch"
-        scratch.mkdir()
-        restored = restore_pixiv_cached_files([source], [name], scratch)
-        self.assertEqual(restored[0].name, name)
-        self.assertEqual(restored[0].read_bytes(), source.read_bytes())
+        sender = AsyncMock()
+        self.ns.update({"cached_media_files": lambda payload: [source],
+                        "send_original_files": sender})
+        payload = {"files": [source.name], "filenames": [pixiv_filename(self.meta, ".zip")],
+                   "pixiv_filename_version": PIXIV_FILENAME_VERSION}
+        self.assertFalse(asyncio.run(self.ns["send_cached_media"](
+            None, None, "url", payload, "pixiv", "")))
+        sender.assert_not_called()
+
+    def test_large_gif_is_sent_unchanged_as_document_without_zipping(self):
+        source = self.source("animation.gif", metadata=False)
+        original = source.read_bytes()
+        observed = []
+
+        async def document(**kwargs):
+            observed.append((kwargs["filename"], kwargs["document"].read()))
+
+        message = SimpleNamespace(
+            reply_animation=AsyncMock(side_effect=RuntimeError("file is too big")),
+            reply_document=AsyncMock(side_effect=document),
+        )
+        result = asyncio.run(self.ns["send_original_files"](
+            message, [source], "pixiv-url", self.root, attach_link=False))
+        self.assertEqual(result, (1, "", []))
+        self.assertEqual(observed, [(source.name, original)])
+
+    def test_gif_document_refusal_does_not_trigger_zip_or_resize(self):
+        source = self.source("animation.gif", metadata=False)
+        message = SimpleNamespace(
+            reply_animation=AsyncMock(side_effect=RuntimeError("file is too big")),
+            reply_document=AsyncMock(side_effect=RuntimeError("file is too big")),
+        )
+        result = asyncio.run(self.ns["send_original_files"](
+            message, [source], "pixiv-url", self.root, attach_link=False))
+        self.assertEqual(result[0], 0)
+        self.assertIn("未壓縮", result[1])
+        self.assertEqual(result[2], [])
 
     def test_cache_payload_records_display_names_and_version(self):
         files = [Path("作品_12345_p0_6789_畫師.jpg")]

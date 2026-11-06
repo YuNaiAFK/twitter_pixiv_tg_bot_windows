@@ -1,8 +1,9 @@
-"""Pixiv 原檔命名與快取重送；只變更檔名，不修改檔案內容。"""
+"""Pixiv 檔案命名、Ugoira 動圖合成與快取重送。"""
 import json
 import re
 import shutil
 from pathlib import Path
+from pixiv_ugoira import convert_ugoira_zip
 
 
 PIXIV_FILENAME_VERSION = 1
@@ -55,15 +56,19 @@ def rename_pixiv_media(files) -> None:
     for source in files:
         metadata_path = source.with_name(source.name + ".json")
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        target = source.with_name(pixiv_filename(metadata, source.suffix))
+        suffix = ".gif" if source.suffix.lower() == ".zip" else source.suffix
+        target = source.with_name(pixiv_filename(metadata, suffix))
         identity = str(target).casefold()
         if identity in targets or (target != source and target.exists()):
             raise ValueError("Pixiv 檔名重複，已停止以避免覆寫圖片")
         targets.add(identity)
-        plan.append((source, target))
+        plan.append((source, target, metadata))
     # 所有命名都確認有效後才開始變更，避免中途資料缺漏造成部分檔案改名。
-    for source, target in plan:
-        if source != target:
+    for source, target, metadata in plan:
+        if source.suffix.lower() == ".zip":
+            convert_ugoira_zip(source, metadata, target)
+            source.unlink()
+        elif source != target:
             source.rename(target)
 
 
