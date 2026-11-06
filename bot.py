@@ -4339,6 +4339,15 @@ async def authorized_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def authorization_reply(message, text: str, *, saved: bool = True):
+    """成功提示顯示五秒後僅刪除 bot 回覆；寫入失敗時保留警告。"""
+    reply = await message.reply_text(text)
+    if saved and DELETE_STATUS_MESSAGE:
+        await asyncio.sleep(5)
+        await cleanup_request_messages(reply)
+    return reply
+
+
 async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Unblock a user, or authorize the current group chat.
@@ -4372,8 +4381,8 @@ async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         note = "已授權這個群組，群組內所有人都可以解析。" if changed \
             else "這個群組本來就已授權。"
         warning = "" if saved else "\n⚠ 無法寫入授權檔，這個變更在重新啟動後會消失。"
-        await message.reply_text(
-            f"{note}{warning}" + ("" if anonymous else f"\n\n{authorization_report()}"))
+        await authorization_reply(message,
+            f"{note}{warning}" + ("" if anonymous else f"\n\n{authorization_report()}"), saved=saved)
         return
 
     target = parse_target_user(context)
@@ -4389,14 +4398,14 @@ async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = user.id
 
     if user_is_admin(target):
-        await message.reply_text(f"{target} 是管理員，本來就沒有被封鎖。")
+        await authorization_reply(message, f"{target} 是管理員，本來就沒有被封鎖。")
         return
 
     changed = AUTHORIZATION.unblock(target)
     saved = save_authorization()
     note = "已解除封鎖。" if changed else "本來就沒有被封鎖。"
     warning = "" if saved else "\n⚠ 無法寫入授權檔，這個變更在重新啟動後會消失。"
-    await message.reply_text(f"{target}：{note}{warning}\n\n{authorization_report()}")
+    await authorization_reply(message, f"{target}：{note}{warning}\n\n{authorization_report()}", saved=saved)
 
 
 async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

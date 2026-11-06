@@ -63,7 +63,7 @@ class AnonymousAdminTests(unittest.TestCase):
                   grant_group=lambda group: False,
                   revoke_group=lambda group: auth.groups.remove(group) or True)
         self.ns.update(AUTHORIZATION=auth, authorization_report=report,
-                       save_authorization=lambda: True)
+                       save_authorization=lambda: True, authorization_reply=AsyncMock())
         for node in tree.body:
             if isinstance(node, ast.AsyncFunctionDef) and node.name in {"grant_command", "revoke_command"}:
                 exec(compile(ast.Module(body=[node], type_ignores=[]), "<group-handler>", "exec"), self.ns)
