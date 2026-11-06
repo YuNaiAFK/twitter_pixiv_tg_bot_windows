@@ -1228,3 +1228,7 @@ PTB 預設**一次只處理一個 update**，而按鈕按一下就是一個 upda
 ### Pixiv GIF 的桌面文件顯示
 
 Telegram Desktop 會把 MIME 為 image/gif 的文件也顯示成動畫卡片。因此 Pixiv GIF 改用 MTProto，以 application/octet-stream 與強制文件旗標傳送，保留 .gif 檔名及原始 GIF 內容；新解析與快取重送皆適用。請安裝 Telethon 與 python-socks[asyncio]，並在 .env 設定既有的 TELEGRAM_API_ID、TELEGRAM_API_HASH、BOT_TOKEN。登入工作階段儲存在 .mtproto/，與解析快取分開且不納入 Git。缺少設定或連線失敗時會回報失敗，不會降回動畫卡片重送。
+
+### 匿名群組管理員
+
+支援以本群組身分發言的匿名管理員：在群內使用不帶參數的 /grant 授權本群，或 /revoke 移除本群授權。Telegram 不公開匿名管理員真實使用者 ID，因此不能透過匿名身分操作其他群組、指定使用者 ID 或執行 bot 全域管理命令；請改用設定中的管理員帳號以個人身分執行。其他頻道代發與自動轉發不會被視為本群匿名管理員。

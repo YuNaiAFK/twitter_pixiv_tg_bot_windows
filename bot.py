@@ -3614,7 +3614,25 @@ def admin_only(handler):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         message = update.effective_message
-        if not user or not message:
+        if not message:
+            return
+        chat = update.effective_chat
+        sender_chat = getattr(message, "sender_chat", None)
+        anonymous_admin = (
+            chat is not None and chat.type in {"group", "supergroup"}
+            and sender_chat is not None and sender_chat.id == chat.id
+            and not getattr(message, "is_automatic_forward", False)
+        )
+        if anonymous_admin:
+            # Telegram 不公開匿名管理員的真實 ID；只允許操作目前群組，不能擴張為全域管理員。
+            if handler.__name__ in {"grant_command", "revoke_command"} and not (context.args or []):
+                return await handler(update, context)
+            await message.reply_text(
+                "已辨識為本群組的匿名管理員。可使用不帶參數的 /grant 或 /revoke 管理本群授權。\n"
+                "其他管理命令請改用 bot 設定中的管理員帳號，以個人身分執行。"
+            )
+            return
+        if not user:
             return
 
         if user_is_admin(user.id):
