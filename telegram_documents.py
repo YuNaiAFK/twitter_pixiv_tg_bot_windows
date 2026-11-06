@@ -156,8 +156,11 @@ async def send_gif_document(path: Path, *, chat_id: int, reply_to: int | None,
             if result is None:
                 uploaded = await client.upload_file(str(path), file_name=path.name)
                 result = await send(upload_media(uploaded, path.name))
-            for update in getattr(result, "updates", ()):
-                message = getattr(update, "message", None)
+            # sendMedia 可能直接回傳簡短的已送出訊息，而不是 Updates 容器。
+            messages = [getattr(update, "message", None) for update in getattr(result, "updates", ())]
+            if getattr(result, "id", None) is not None:
+                messages.append(result)
+            for message in messages:
                 document = getattr(getattr(message, "media", None), "document", None)
                 if document is not None:
                     if document.mime_type != "application/octet-stream" or any(

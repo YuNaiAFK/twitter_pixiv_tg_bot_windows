@@ -23,13 +23,15 @@ class FakeClient:
         self.get_messages = AsyncMock(return_value=NS(media=NS(document=self.doc)))
         self.requests = []
         self.errors = []
+        self.short = False
 
     async def __call__(self, request):
         self.requests.append(request)
         error = self.errors.pop(0) if self.errors else None
         if error:
             raise error
-        return NS(updates=[NS(message=NS(id=123, media=NS(document=self.doc)))])
+        message = NS(id=123, media=NS(document=self.doc))
+        return message if self.short else NS(updates=[NS(message=message)])
 
 
 class CacheTests(unittest.TestCase):
@@ -61,6 +63,12 @@ class CacheTests(unittest.TestCase):
         self.file.write_bytes(b"different content")
         self.send()
         self.assertEqual(self.client.upload_file.await_count, 2)
+
+    def test_short_sent_response_is_cached_and_reused(self):
+        self.client.short = True
+        self.assertEqual(self.send(), 123)
+        self.assertEqual(self.send(), 123)
+        self.client.upload_file.assert_awaited_once()
 
     def test_filename_change_does_not_reuse_wrong_filename(self):
         self.send()
