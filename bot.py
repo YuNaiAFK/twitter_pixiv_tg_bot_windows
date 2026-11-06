@@ -4358,6 +4358,7 @@ async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = getattr(chat, "type", None)
     in_group = chat_type in {"group", "supergroup"}
     args = getattr(context, "args", None) or []
+    anonymous = getattr(message, "sender_chat", None) is not None
 
     # No argument inside a group means the group itself, which is the common case
     # and cannot be expressed by typing an ID the operator does not know.
@@ -4372,7 +4373,7 @@ async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else "這個群組本來就已授權。"
         warning = "" if saved else "\n⚠ 無法寫入授權檔，這個變更在重新啟動後會消失。"
         await message.reply_text(
-            f"{note}{warning}\n\n{authorization_report()}")
+            f"{note}{warning}" + ("" if anonymous else f"\n\n{authorization_report()}"))
         return
 
     target = parse_target_user(context)
@@ -4414,6 +4415,7 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = getattr(chat, "type", None)
     in_group = chat_type in {"group", "supergroup"}
     args = getattr(context, "args", None) or []
+    anonymous = getattr(message, "sender_chat", None) is not None
 
     if not args and in_group:
         chat_id = getattr(message, "chat_id", None) or getattr(chat, "id", None)
@@ -4421,13 +4423,15 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("讀不到這個群組的 ID，無法移除授權。")
             return
         changed = AUTHORIZATION.revoke_group(chat_id)
+        if anonymous and not AUTHORIZATION.groups:
+            AUTHORIZATION.group_locked = True
         saved = save_authorization()
         note = "已移除這個群組的授權。" if changed else "這個群組本來就不在授權名單中。"
         warning = "" if saved else "\n⚠ 無法寫入授權檔，這個變更在重新啟動後會消失。"
-        if not AUTHORIZATION.groups:
+        if not AUTHORIZATION.groups and not AUTHORIZATION.group_locked:
             note += "\n（已授權群組變成空的，現在所有群組都可以解析）"
         await message.reply_text(
-            f"{note}{warning}\n\n{authorization_report()}")
+            f"{note}{warning}" + ("" if anonymous else f"\n\n{authorization_report()}"))
         return
 
     target = parse_target_user(context)

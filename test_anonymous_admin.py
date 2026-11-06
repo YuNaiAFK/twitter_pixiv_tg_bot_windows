@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 
 class AnonymousAdminTests(unittest.TestCase):
@@ -55,6 +55,23 @@ class AnonymousAdminTests(unittest.TestCase):
         self.message.sender_chat = None
         self.update.effective_user.id = 42
         self.run_command("restart_command").assert_awaited_once()
+
+    def test_anonymous_group_responses_do_not_expose_global_lists(self):
+        tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
+        report = Mock(side_effect=AssertionError("global report must stay private"))
+        auth = NS(admins={42}, groups={-1001}, group_locked=False,
+                  grant_group=lambda group: False,
+                  revoke_group=lambda group: auth.groups.remove(group) or True)
+        self.ns.update(AUTHORIZATION=auth, authorization_report=report,
+                       save_authorization=lambda: True)
+        for node in tree.body:
+            if isinstance(node, ast.AsyncFunctionDef) and node.name in {"grant_command", "revoke_command"}:
+                exec(compile(ast.Module(body=[node], type_ignores=[]), "<group-handler>", "exec"), self.ns)
+        for name in ("grant_command", "revoke_command"):
+            asyncio.run(self.ns["admin_only"](self.ns[name])(self.update, NS(args=[])))
+        report.assert_not_called()
+        self.assertTrue(auth.group_locked)
+        self.assertEqual(auth.groups, set())
 
 
 if __name__ == "__main__":
