@@ -241,22 +241,13 @@ CHECK_COOKIES = os.getenv("CHECK_COOKIES", "1").strip().lower() not in {
 # re-exported before downloads start failing.
 EXPIRY_WARN_DAYS = env_number("EXPIRY_WARN_DAYS", 14)
 
-# Remove the clutter a request creates once it succeeds: the "parsing..." notice,
-# and the original message that carried the link.
-#
-# Deleting the bot's own status message works in a private chat and in a group.
-# Deleting the *sender's* message in a group needs the bot to be an administrator
-# with the "delete messages" right; without it Telegram refuses, which is logged
-# once and otherwise ignored rather than treated as a failed request.
+# Remove the bot's temporary "parsing..." notice after a successful request.
+# The user's original message is always kept in the chat.
 DELETE_STATUS_MESSAGE = os.getenv("DELETE_STATUS_MESSAGE", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
-DELETE_SOURCE_MESSAGE = os.getenv("DELETE_SOURCE_MESSAGE", "1").strip().lower() not in {
-    "0", "false", "no", "off",
-}
 
-# Set once, so a group without delete rights logs one warning instead of one per
-# request.
+# Set once, so a repeated refusal to delete status messages logs one warning.
 _warned_cannot_delete = False
 
 # -------------------- e-hentai / exhentai --------------------
@@ -2007,9 +1998,8 @@ async def report_empty_download(status, message, media_url: str, platform: str |
             logger.info("Pixiv 作品狀態：%s（%s）", state, illust_id)
 
     if not unavailable:
-        # Take the bot's own messages back, so the chat is left as though the link was never
-        # sent. Failure is the only path where these are not already cleaned up.
-        await cleanup_request_messages(status, message)
+        # Remove the bot's temporary status and keep the user's original link visible.
+        await cleanup_request_messages(status)
         return
 
     notice = ("這個 Pixiv 作品目前無法瀏覽：可能已被作者刪除，或設為非公開。\n"
@@ -5034,14 +5024,11 @@ async def send_status(message, text: str):
 
 async def delete_message_quietly(message, purpose: str) -> bool:
     """
-    Delete a chat message, treating "not allowed" as a normal outcome.
+    Delete a bot-authored status message, treating refusal as a normal outcome.
 
-    Removing the bot's own status notice works nearly everywhere. Removing the
-    sender's link message in a group requires the bot to be an administrator with
-    the delete-messages right, which a public bot often is not. That refusal must
-    not turn a successful parse into an error, so failures are logged - once per
-    run for the permission case, which is a configuration issue rather than a
-    per-request problem - and reported as False.
+    A temporary status message can already be gone or too old to delete. That must
+    not turn a successful parse into an error, so failures are logged once and
+    reported as False.
 
     Telegram also refuses to delete anything older than 48 hours, and any message
     that is already gone, so MessageIdInvalid is expected and ignored.
@@ -5059,13 +5046,11 @@ async def delete_message_quietly(message, purpose: str) -> bool:
             # Already removed, or far older than the 48 hours a bot may delete.
             logger.debug("訊息無法刪除（%s）：%s", purpose, exc)
         elif not _warned_cannot_delete:
-            # Telegram words both "no right to delete" and "too old" as
-            # "message can't be deleted", and only the first is actionable, so the
-            # hint covers both rather than asserting which one it was.
+            # Deletion is best-effort; do not let a status-message cleanup failure
+            # turn a successful media request into a failed one.
             _warned_cannot_delete = True
             logger.warning(
-                "無法刪除%s：%s。若是在群組刪除他人訊息，需要把機器人設為管理員"
-                "並勾選「刪除訊息」權限；否則只會刪除機器人自己的訊息。",
+                "無法刪除機器人發出的%s：%s。",
                 purpose,
                 exc,
             )
@@ -5075,15 +5060,14 @@ async def delete_message_quietly(message, purpose: str) -> bool:
         return False
 
 
-async def cleanup_request_messages(status_message, source_message) -> None:
+async def cleanup_request_messages(status_message) -> None:
     """
-    Clear away what a request added to the chat after it has succeeded.
+    Remove the bot's temporary status message after a successful request.
 
-    Called only on success: on failure the status message *is* the result and
-    must stay, otherwise the user is left with nothing explaining what happened.
+    The user's original link message is never deleted. On failure the status
+    message contains the result and must stay, otherwise the user is left without
+    an explanation.
     """
-    if DELETE_SOURCE_MESSAGE:
-        await delete_message_quietly(source_message, "原始訊息")
     if DELETE_STATUS_MESSAGE:
         await delete_message_quietly(status_message, "解析提示訊息")
 
@@ -8319,11 +8303,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                        platform, source_note):
                 logger.info("命中解析快取：%s", media_url)
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                # The same cleanup a fresh download performs. Without this the cache
-                # path left both the progress/summary notice and the link message in
-                # the chat, so serving from the cache produced *more* clutter than
-                # downloading did - the opposite of the point.
-                await cleanup_request_messages(status, message)
+                # Remove the bot's progress notice just as after a fresh download;
+                # the user's original link message is intentionally retained.
+                await cleanup_request_messages(status)
                 return
         except TimedOut:
             # NOT re-downloaded and NOT re-sent. This is the second duplication path:
@@ -8393,7 +8375,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     prefer_original=True,      # a document: the ZIP is the payload
                     caption=build_caption(media_url),
                 )
-                await cleanup_request_messages(status, message)
+                await cleanup_request_messages(status)
                 await asyncio.to_thread(remember_media_parse, media_url, media_files)
                 succeeded = True
                 return
@@ -8444,12 +8426,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # work itself decides which it is; see report_empty_download.
         await report_empty_download(status, message, media_url, platform, source_note)
     finally:
-        # After success, and after a silent failure - report_empty_download already took the
-        # messages back in that case, and calling it twice is harmless because each delete is
-        # guarded. A REPORTED failure keeps its messages: the status carries the reason and
-        # the source link is the only reference the user has left.
+        # After success, and after a silent failure, remove only the bot's status notice.
+        # A REPORTED failure keeps that notice because it carries the reason; the user's
+        # original source message remains in the chat on every path.
         if succeeded:
-            await cleanup_request_messages(status, message)
+            await cleanup_request_messages(status)
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 

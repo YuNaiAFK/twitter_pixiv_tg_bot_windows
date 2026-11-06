@@ -85,7 +85,7 @@ Telegraph 頁面，圖片可以託管在 Cloudflare R2，所以那些簽章網�
 - **解析快取**：同一個連結不重新下載
 - 選用的使用者封鎖名單、各站登入 cookie
 - 只有管理員能用的 `/cookies`、`/status`、`/cache`、`/restart`
-- 成功後自動清掉「正在解析…」提示與帶連結的原始訊息
+- 成功後自動清掉機器人送出的「正在解析…」提示；保留使用者的原始連結訊息
 - **Telegram 邀請連結**（`t.me/+...`、`t.me/joinchat/...`）會被單獨識別；公開的 `t.me` 連結會辨識但不會被誤標成群組
 
 ### 為什麼 Pixiv 是以「檔案」而不是「照片」送出
@@ -101,17 +101,14 @@ Telegram 的照片路徑沒有辦法原樣送出一張圖：`sendPhoto` 會在�
 
 ### 清理聊天室
 
-請求成功後，機器人會刪掉它自己製造的雜訊：「正在解析…」提示，以及帶著連結的**原始訊息**。
-兩者都由 `.env` 控制，設成 `0` 就保留：
+請求成功後，機器人只會刪除自己送出的「正在解析…」提示，使用者貼出的原始連結訊息會保留。
+用 `.env` 的 `DELETE_STATUS_MESSAGE` 控制是否刪除這則提示；設成 `0` 就保留提示：
 
 ```ini
 DELETE_STATUS_MESSAGE=1
-DELETE_SOURCE_MESSAGE=1
 ```
 
-**在群組裡刪掉別人的訊息，需要機器人是管理員並擁有「刪除訊息」權限。** 沒有這個權限時 Telegram
-會拒絕刪除，機器人只記一筆警告，然後只刪掉自己的提示 —— 請求本身仍然成功。
-私人聊天不需要任何特殊權限。
+刪除的是機器人自己的訊息，不需要在群組取得刪除他人訊息的管理員權限。
 
 請求**失敗**時什麼都不刪：那時狀態訊息是使用者唯一的解釋，來源連結是他唯一的線索。
 
@@ -170,7 +167,6 @@ REQUEST_STALE_SECONDS=1800 # 請求卡死時回收名額
 ATTACH_SOURCE_LINK=1
 SOURCE_LABEL=原始連結
 DELETE_STATUS_MESSAGE=1
-DELETE_SOURCE_MESSAGE=1
 SUPPORTED_SITES_NOTICE=目前只支援 X/Twitter、Pixiv 與 e-hentai 連結。
 REPLY_UNSUPPORTED_LINKS=0  # 0 = 沉默
 # 憑證
@@ -566,7 +562,6 @@ RESTART_LOG_MAX_MB=2         # restart.log 超過這個大小就輪替
 | `ATTACH_SOURCE_LINK` | `1` | 附上原始連結 |
 | `SOURCE_LABEL` | `原始連結` | 那個前綴的文字 |
 | `DELETE_STATUS_MESSAGE` | `1` | 完成後刪掉「正在解析……」那則 |
-| `DELETE_SOURCE_MESSAGE` | `1` | 刪掉原始的連結訊息 |
 | `REPLY_UNSUPPORTED_LINKS` | `0` | `0` = 不支援的連結完全靜默 |
 | `AUTH_GROUP_LOCKED` | `0` | `1` = 只允許授權過的群組 |
 | `EXPIRY_WARN_DAYS` | `14` | 憑證還剩幾天開始警告 |
