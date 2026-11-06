@@ -5851,12 +5851,23 @@ async def handle_regenerate(update: Update, query, user, gid: str, token: str) -
         if not guard.ok:
             await query.answer(busy_message(user.id), show_alert=True)
             return
-        await run_regenerate(query, user, entry)
+        if gallery_semaphore.locked():
+            await query.answer(
+                f"目前同時有其他畫廊處理中（最多 {MAX_CONCURRENT_GALLERY_JOBS} 個），請稍後再按。",
+                show_alert=True,
+            )
+            return
+        await gallery_semaphore.acquire()
+        try:
+            await run_regenerate(query, user, entry)
+        finally:
+            gallery_semaphore.release()
 
 
 async def run_regenerate(query, user, entry: dict) -> None:
     """Rebuild the page and swap it into the message. See handle_regenerate."""
     await query.answer("正在重新生成頁面……")
+    progress_status = await send_status(query.message, "正在重新生成 Telegraph 頁面……")
     gallery = entry["gallery"]
     mode = entry["mode"]
     # Set when the page could not be edited and a new one had to be published. Only possible for
@@ -5886,7 +5897,9 @@ async def run_regenerate(query, user, entry: dict) -> None:
         #
         # Without it the page was rebuilt with freshly swept hath.network links: they work and they
         # expire, so the page broke again hours later and the button only ever bought time.
-        embed = await host_on_r2(embed, gallery, mode, query.message)
+        embed = await host_on_r2(
+            embed, gallery, mode, progress_status,
+            user_id=user.id, stop_event=threading.Event())
 
         # **Edit the existing page, so the URL does not change.**
         #
@@ -5916,12 +5929,19 @@ async def run_regenerate(query, user, entry: dict) -> None:
             )
             regenerated_link_changed = True
         telegraph_url = page.url
+    except R2UploadStopped:
+        return
     except (ehentai.EhentaiError, ehentai.TelegraphError) as exc:
         logger.warning("重新生成失敗：%s（%s）", gallery.page_url, exc)
+        await progress_status.edit_text(
+            f"重新生成失敗：{exc}", link_preview_options=source_link_options())
         await query.answer(f"重新生成失敗：{exc}", show_alert=True)
         return
     except Exception:
         logger.exception("重新生成發生未預期錯誤：%s", gallery.page_url)
+        await progress_status.edit_text(
+            "重新生成時發生錯誤，請稍後再試。",
+            link_preview_options=source_link_options())
         await query.answer("重新生成時發生錯誤，請稍後再試。", show_alert=True)
         return
 
@@ -5945,10 +5965,12 @@ async def run_regenerate(query, user, entry: dict) -> None:
     if await update_result_message(
             query.message, new_text, parse_mode="HTML",
             reply_markup=regenerate_keyboard(gallery.gid, gallery.token)):
+        await delete_message_quietly(progress_status, "Telegraph 重新生成進度")
         return
     # Nothing editable - a photo with no caption, or a refusal. A second message is worse
     # than an edit but better than silence, and the old text stays as the record.
     await send_status(query.message, new_text)
+    await delete_message_quietly(progress_status, "Telegraph 重新生成進度")
     return
 
 
@@ -6052,6 +6074,10 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
     message = update.effective_message
     user = update.effective_user
     if query is None or message is None or user is None:
+        return
+
+    if (query.data or "").startswith("eh|r2|"):
+        await handle_r2_retry_decision(update)
         return
 
     parsed = parse_gallery_callback(query.data or "")
@@ -6188,6 +6214,8 @@ async def run_gallery_action(query, message, user, mode: str,
                 await run_gallery_archive(
                     message, status, gallery, mode, temp_dir, source_note
                 )
+        except R2UploadStopped:
+            logger.info("已停止 e-hentai 解析：R2 上傳失敗或使用者取消")
         except ehentai.EhentaiError as exc:
             logger.warning("畫廊按鈕處理失敗：%s（%s）| %s", gallery_url, exc,
                            admin_hint(None))
@@ -6234,14 +6262,113 @@ async def notify_admins(bot, text: str, *, exclude: int = 0) -> int:
     return sent
 
 
-async def host_on_r2(embed: list, gallery, mode: str, status, *, stop_event=None) -> list:
+class R2UploadStopped(Exception):
+    """This e-hentai parse must stop after an R2 failure or cancellation."""
+
+
+R2_FAILURES_BEFORE_PROMPT = 3
+R2_DECISION_TIMEOUT_SECONDS = 15 * 60
+_pending_r2_decisions: dict[str, dict] = {}
+
+
+def r2_decision_keyboard(request_id: str) -> InlineKeyboardMarkup:
+    """Ask the initiating user whether to stop parsing or retry R2 again."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("停止解析", callback_data=f"eh|r2|{request_id}|stop"),
+        InlineKeyboardButton("繼續重試", callback_data=f"eh|r2|{request_id}|retry"),
+    ]])
+
+
+async def request_r2_retry_decision(status, user_id: int, failed_count: int,
+                                    failure_reason: str = "上傳") -> str:
+    """Wait for the request owner to stop this parse or allow another retry cycle."""
+    loop = asyncio.get_running_loop()
+    request_id = secrets.token_hex(5)
+    while request_id in _pending_r2_decisions:
+        request_id = secrets.token_hex(5)
+    future = loop.create_future()
+    _pending_r2_decisions[request_id] = {
+        "chat_id": status.chat_id,
+        "user_id": user_id,
+        "future": future,
+    }
+    prompt = (
+        f"⚠️ R2 {failure_reason}連續失敗 {R2_FAILURES_BEFORE_PROMPT} 次，"
+        f"目前有 {failed_count} 張圖片尚未完成。\n\n"
+        "要停止這次 e-hentai 解析，還是再自動重試 3 次？"
+    )
+    try:
+        try:
+            await status.edit_text(
+                prompt,
+                link_preview_options=source_link_options(),
+                reply_markup=r2_decision_keyboard(request_id),
+            )
+        except TelegramError as exc:
+            logger.warning("無法顯示 R2 重試選項：%s", exc)
+            raise R2UploadStopped("無法顯示 R2 重試選項，已停止解析") from exc
+
+        try:
+            return await asyncio.wait_for(
+                future, timeout=R2_DECISION_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await status.edit_text(
+                "⌛ 等待選擇逾時，已停止這次 e-hentai 解析。",
+                link_preview_options=source_link_options(),
+            )
+            return "stop"
+    finally:
+        _pending_r2_decisions.pop(request_id, None)
+
+
+async def handle_r2_retry_decision(update: Update) -> None:
+    """Resolve an R2 retry prompt, only for its initiating user in the same chat."""
+    query = update.callback_query
+    message = update.effective_message
+    user = update.effective_user
+    if query is None or message is None or user is None:
+        return
+
+    parts = (query.data or "").split("|")
+    if len(parts) != 4 or parts[:2] != ["eh", "r2"] or parts[3] not in {"stop", "retry"}:
+        await query.answer("這個選項已失效。", show_alert=True)
+        return
+
+    if not user_is_allowed(
+            user.id,
+            getattr(message, "chat_id", None),
+            getattr(getattr(message, "chat", None), "type", None)):
+        await query.answer("此機器人目前不允許你的帳號使用。", show_alert=True)
+        return
+
+    pending = _pending_r2_decisions.get(parts[2])
+    if pending is None or pending["chat_id"] != message.chat_id:
+        await query.answer("這個選項已逾時。", show_alert=True)
+        return
+    if pending["user_id"] != user.id:
+        await query.answer("只有發起這次解析的使用者可以選擇。", show_alert=True)
+        return
+
+    future = pending["future"]
+    if future.done():
+        await query.answer("這個選項已經處理。", show_alert=False)
+        return
+    future.set_result(parts[3])
+    await query.answer("已記錄你的選擇。")
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
+
+async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | None = None,
+                     stop_event=None) -> list:
     """
     Copy the page's images into R2 and return the URLs to embed instead.
 
-    **Returns the input unchanged whenever R2 cannot be used**, which covers three cases that all
-    have to degrade rather than fail: R2 is not configured, the upload produced nothing, or every
-    upload failed. A gallery that cannot reach R2 is still readable through e-hentai's own links,
-    with the expiry problem it always had - which is much better than not being delivered.
+    Returns the input unchanged when R2 is not configured or the free allowance is full. Transient
+    lookup or upload failures are retried; after three failed attempts the initiating user can stop
+    this e-hentai parse or request another retry cycle.
 
     Progress is reported into the status message from the worker thread through
     ``run_coroutine_threadsafe``, throttled to one edit every few seconds. A gallery is about two
@@ -6251,19 +6378,54 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, stop_event=None
     if settings is None or not embed:
         return embed
 
-    # Already done? The cache is on disk, so this survives a restart, and a gallery parsed twice
-    # uploads once. The length has to match: a gallery that gained pages since would otherwise be
-    # served a short list and lose them.
     cached = cached_r2_urls(gallery.page_url, gallery, mode)
-    if cached and len(cached) == len(embed):
+    public_prefix = settings.public_base.rstrip("/") + "/"
+    if (cached and len(cached) == len(embed)
+            and all(isinstance(url, str) and url.startswith(public_prefix) for url in cached)):
         logger.info("沿用已上傳到 R2 的 %d 張圖片", len(cached))
         return cached
 
-    try:
-        used_bytes, used_count = await asyncio.to_thread(r2.bucket_usage, settings)
-    except r2.R2Error as exc:
-        logger.warning("無法讀取 R2 使用量，本次不改用 R2：%s", exc)
-        return embed
+    async def ask_or_stop(failed_count: int, reason: str) -> None:
+        if user_id is None:
+            await status.edit_text(
+                "⚠️ R2 連續失敗，無法取得發起者的選擇，已停止這次 e-hentai 解析。",
+                link_preview_options=source_link_options(),
+            )
+            raise R2UploadStopped("沒有發起者資訊，停止 e-hentai 解析")
+        choice = await request_r2_retry_decision(
+            status, user_id, failed_count, failure_reason=reason)
+        if choice == "stop":
+            logger.info("使用者選擇停止 e-hentai 解析：R2 %s連續失敗", reason)
+            await status.edit_text(
+                "🛑 已停止這次 e-hentai 解析，沒有繼續建立頁面。",
+                link_preview_options=source_link_options(),
+            )
+            raise R2UploadStopped("使用者選擇停止 e-hentai 解析")
+
+    # A failed usage lookup also prevents a safe upload. Retry it and give the user
+    # the same stop/continue choice instead of silently falling back to expiring URLs.
+    lookup_failures = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            await status.edit_text("已停止這次 e-hentai 解析。",
+                                   link_preview_options=source_link_options())
+            raise R2UploadStopped("使用者停止了解析")
+        try:
+            used_bytes, used_count = await asyncio.to_thread(r2.bucket_usage, settings)
+            break
+        except r2.R2Error as exc:
+            lookup_failures += 1
+            logger.warning("讀取 R2 使用量失敗（第 %d 次）：%s", lookup_failures, exc)
+            await status.edit_text(
+                f"⚠️ 無法讀取 R2 使用量（第 {lookup_failures}/{R2_FAILURES_BEFORE_PROMPT} 次），"
+                "正在自動重試……",
+                link_preview_options=source_link_options(),
+            )
+            if lookup_failures >= R2_FAILURES_BEFORE_PROMPT:
+                await ask_or_stop(len(embed), "讀取 R2 用量")
+                lookup_failures = 0
+            else:
+                await asyncio.sleep(2 ** lookup_failures)
 
     allowance = r2.limit_bytes()
     if used_bytes >= allowance:
@@ -6279,80 +6441,163 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, stop_event=None
             link_preview_options=source_link_options())
         return embed
 
-    await status.edit_text(
-        f"正在上傳 {len(embed)} 張圖片到 R2……",
-        link_preview_options=source_link_options(),
-    )
-
+    output_urls = list(embed)
+    pending_indices = list(range(len(embed)))
+    failure_round = 0
+    committed_bytes = used_bytes
+    quota_blocked = 0
+    budget_stopped = False
+    uploaded_count = 0
     loop = asyncio.get_running_loop()
     last = [0.0]
+    chat_id = getattr(status, "chat_id", None)
+    registered_stop = stop_event is not None and chat_id is not None
+    if registered_stop:
+        register_running_stop(chat_id, stop_event)
 
-    def progress(done_count, total):
-        now = time.monotonic()
-        if now - last[0] < 4:
-            return
-        last[0] = now
+    def remember_urls(urls):
         try:
-            asyncio.run_coroutine_threadsafe(
-                status.edit_text(
-                    f"正在上傳到 R2…… {done_count}/{total}",
-                    link_preview_options=source_link_options(),
-                ),
-                loop,
+            remember_r2_urls(gallery.page_url, gallery, mode, urls)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("R2 網址寫入快取失敗：%s", exc)
+
+    try:
+        while pending_indices:
+            if stop_event is not None and stop_event.is_set():
+                await status.edit_text("已停止這次 e-hentai 解析。",
+                                       link_preview_options=source_link_options())
+                raise R2UploadStopped("使用者停止了解析")
+
+            pending_urls = [embed[index] for index in pending_indices]
+            progress_update = [None]
+            await status.edit_text(
+                f"正在上傳 {len(pending_urls)} 張圖片到 R2……",
+                link_preview_options=source_link_options(),
+                reply_markup=stop_keyboard(gallery.gid, gallery.token),
             )
-        except Exception:  # noqa: BLE001
-            # A status edit that cannot be scheduled must not stop the upload.
-            pass
 
-    try:
-        report = await asyncio.to_thread(
-            r2.upload_many,
-            embed,
-            settings=settings,
-            workers=int(R2_UPLOAD_WORKERS),
-            timeout=float(R2_UPLOAD_TIMEOUT),
-            referer="https://e-hentai.org/",
-            progress=progress,
-            already_used=used_bytes,
-            budget=allowance,
-            stop_event=stop_event,
-        )
-    except r2.R2Error as exc:
-        logger.warning("R2 上傳無法進行：%s；改用原始網址", exc)
-        return embed
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("R2 上傳失敗：%s；改用原始網址", exc)
-        return embed
+            def progress(done_count, total):
+                now = time.monotonic()
+                if now - last[0] < 4:
+                    return
+                if progress_update[0] is not None and not progress_update[0].done():
+                    return
+                last[0] = now
+                try:
+                    scheduled = asyncio.run_coroutine_threadsafe(
+                        status.edit_text(
+                            f"正在上傳到 R2…… {done_count}/{total}",
+                            link_preview_options=source_link_options(),
+                            reply_markup=stop_keyboard(gallery.gid, gallery.token),
+                        ),
+                        loop,
+                    )
+                    progress_update[0] = scheduled
+                except Exception:  # noqa: BLE001
+                    pass
 
-    logger.info("R2：%s", report.summary())
+            report = None
+            try:
+                report = await asyncio.to_thread(
+                    r2.upload_many,
+                    pending_urls,
+                    settings=settings,
+                    workers=int(R2_UPLOAD_WORKERS),
+                    timeout=float(R2_UPLOAD_TIMEOUT),
+                    referer="https://e-hentai.org/",
+                    progress=progress,
+                    already_used=committed_bytes,
+                    budget=allowance,
+                    stop_event=stop_event,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("R2 上傳失敗：%s", exc)
 
-    if report.budget_stopped:
-        try:
-            after, after_count = await asyncio.to_thread(r2.bucket_usage, settings)
-        except r2.R2Error:
-            after, after_count = used_bytes, 0
-        logger.warning("R2 免費額度上限已達，停止上傳：%s", r2.budget_line(after, after_count))
-        await notify_admins(status.get_bot(),
-            "⚠️ R2 免費額度上限已達，已停止上傳\n\n"
-            f"{r2.budget_line(after, after_count)}\n\n"
-            f"畫廊：{gallery.title[:80]}\n{gallery.page_url}\n\n"
-            f"本次上傳 {report.uploaded} 張後停止，其餘 {report.failed} 張使用原始網址。")
+            if progress_update[0] is not None:
+                await asyncio.gather(
+                    asyncio.wrap_future(progress_update[0]),
+                    return_exceptions=True,
+                )
 
-    if not report.uploaded and not report.reused:
-        # Nothing succeeded. Handing back the original URLs keeps the gallery readable; handing back
-        # a report full of failures would produce a page of broken images.
-        return embed
+            if stop_event is not None and stop_event.is_set():
+                await status.edit_text("已停止這次 e-hentai 解析。",
+                                       link_preview_options=source_link_options())
+                raise R2UploadStopped("使用者停止了解析")
 
-    urls = report.urls()
-    try:
-        remember_r2_urls(gallery.page_url, gallery, mode, urls)
-    except Exception as exc:  # noqa: BLE001
-        # Losing the record costs a re-upload next time, not this delivery.
-        logger.warning("R2 網址寫入快取失敗：%s", exc)
+            failed_indices = []
+            if report is None:
+                failed_indices = pending_indices
+            else:
+                logger.info("R2：%s", report.summary())
+                committed_bytes += report.bytes_sent
+                uploaded_count += report.uploaded
+                for index, result in zip(pending_indices, report.results):
+                    if result.error == "已達 R2 免費額度上限":
+                        quota_blocked += 1
+                    elif result.error:
+                        failed_indices.append(index)
+                    else:
+                        output_urls[index] = result.public_url or result.source_url
 
-    if report.failed:
-        logger.warning("R2：%d 張上傳失敗，這些仍使用原始網址", report.failed)
-    return urls
+                if report.budget_stopped:
+                    budget_stopped = True
+
+            pending_indices = failed_indices
+            if not pending_indices:
+                break
+
+            failure_round += 1
+            logger.warning("R2 尚有 %d 張圖片上傳失敗（第 %d 次）",
+                           len(pending_indices), failure_round)
+            if failure_round < R2_FAILURES_BEFORE_PROMPT:
+                await status.edit_text(
+                    f"⚠️ R2 上傳失敗 {len(pending_indices)} 張（第 "
+                    f"{failure_round}/{R2_FAILURES_BEFORE_PROMPT} 次），正在自動重試……",
+                    link_preview_options=source_link_options(),
+                    reply_markup=stop_keyboard(gallery.gid, gallery.token),
+                )
+                await asyncio.sleep(2 ** failure_round)
+                continue
+
+            await ask_or_stop(len(pending_indices), "上傳")
+            failure_round = 0
+            await status.edit_text(
+                f"已選擇繼續重試 R2，剩餘 {len(pending_indices)} 張，開始新一輪重試……",
+                link_preview_options=source_link_options(),
+                reply_markup=stop_keyboard(gallery.gid, gallery.token),
+            )
+
+        if budget_stopped:
+            try:
+                after, after_count = await asyncio.to_thread(r2.bucket_usage, settings)
+            except r2.R2Error:
+                after, after_count = committed_bytes, 0
+            logger.warning("R2 免費額度上限已達，停止上傳：%s",
+                           r2.budget_line(after, after_count))
+            await notify_admins(status.get_bot(),
+                "⚠️ R2 免費額度上限已達，已停止上傳\n\n"
+                f"{r2.budget_line(after, after_count)}\n\n"
+                f"畫廊：{gallery.title[:80]}\n{gallery.page_url}\n\n"
+                f"本次上傳 {uploaded_count} 張後停止，其餘 {quota_blocked} 張使用原始網址。")
+            await status.edit_text(
+                f"⚠️ R2 免費額度已滿，{quota_blocked} 張圖片改用 e-hentai 原始網址。",
+                link_preview_options=source_link_options(),
+            )
+        else:
+            logger.info("R2 上傳完成：處理 %d 張圖片", len(output_urls))
+
+        if not budget_stopped:
+            remember_urls(output_urls)
+        return output_urls
+    finally:
+        if registered_stop:
+            entry = _running_downloads.get(chat_id)
+            if entry is not None and entry[1] is stop_event:
+                _running_downloads.pop(chat_id, None)
+            try:
+                await status.edit_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
 
 
 async def public_embed_urls(embed: list[str], gallery, status,
@@ -6507,7 +6752,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
         # What goes into Telegraph is then an R2 object rather than a signed e-hentai link, so the
         # page keeps working after the keystamp lapses - which is the failure the 重新生成 button
         # exists to repair. Degrades to the original URLs whenever R2 is unavailable.
-        embed = await host_on_r2(embed, gallery, mode, status, stop_event=parse_stop)
+        embed = await host_on_r2(
+            embed, gallery, mode, status, user_id=user.id, stop_event=parse_stop)
 
         try:
             if cached_entry is not None:
@@ -8833,7 +9079,10 @@ def build_application() -> Application:
     # other user, not just the stop button. The resource cost is bounded separately by
     # ``gallery_semaphore``, because the per-request worker pools were sized against
     # serial execution and would otherwise multiply.
-    builder = builder.concurrent_updates(MAX_CONCURRENT_UPDATES)
+    # R2 retry prompts await a callback while a gallery slot remains occupied. Keep at
+    # least one extra update slot available so the initiating user's choice is dispatched.
+    builder = builder.concurrent_updates(
+        max(MAX_CONCURRENT_UPDATES, MAX_CONCURRENT_GALLERY_JOBS + 2))
 
     # Timeouts are raised well above PTB's defaults, which are 5.0s for read, write and
     # connect, 1.0s for pool, and 20.0s for a media write.
