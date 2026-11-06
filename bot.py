@@ -761,6 +761,8 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
 ANIMATION_EXTENSIONS = {".gif"}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | ANIMATION_EXTENSIONS
+# Pixiv Ugoira 的原始下載是動畫影格 ZIP，須以文件傳送，不能當成沒有媒體。
+PIXIV_MEDIA_EXTENSIONS = MEDIA_EXTENSIONS | {".zip"}
 
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 last_request_time = {}
@@ -4888,14 +4890,15 @@ def download_with_gallery_dl(url: str, output_dir: Path, platform: str | None = 
     if platform == "pixiv":
         rename_pixiv_media(
             path for path in output_dir.rglob("*")
-            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS)
+            if path.is_file() and path.suffix.lower() in PIXIV_MEDIA_EXTENSIONS)
 
 
-def collect_media_files(temp_dir: Path) -> list[Path]:
+def collect_media_files(temp_dir: Path, platform: str | None = None) -> list[Path]:
     """Media files the download produced, capped at MAX_FILES."""
+    extensions = PIXIV_MEDIA_EXTENSIONS if platform == "pixiv" else MEDIA_EXTENSIONS
     files = sorted(
         path for path in temp_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
+        if path.is_file() and path.suffix.lower() in extensions
     )
     return files[:MAX_FILES]
 
@@ -8605,7 +8608,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 download_with_gallery_dl, media_url, temp_dir, platform
             )
 
-        media_files = collect_media_files(temp_dir)
+        media_files = collect_media_files(temp_dir, platform=platform)
 
         if not media_files:
             # No operator detail in the chat. The credential diagnosis names local

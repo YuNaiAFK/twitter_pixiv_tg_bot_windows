@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -27,7 +28,8 @@ class PixivFilenameTests(unittest.TestCase):
                      "count": 20, "user": {"id": 6789, "name": "畫師暱稱"}}
         tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
         selected = {"build_gallery_dl_command", "download_with_gallery_dl",
-                    "media_cache_payload", "send_cached_media"}
+                    "media_cache_payload", "send_cached_media", "collect_media_files",
+                    "send_single_media"}
         self.ns = {
             "Path": Path, "shutil": shutil, "logger": logging.getLogger("pixiv-test"),
             "PIXIV_DOWNLOAD_FILENAME": PIXIV_DOWNLOAD_FILENAME,
@@ -39,8 +41,14 @@ class PixivFilenameTests(unittest.TestCase):
             "resolve_cookie_file": lambda platform: None,
             "COOKIES_FILE": "", "BASE_DIR": self.root,
             "TelegramError": RuntimeError, "source_link_options": lambda: None,
+            "MAX_FILES": 50, "upload_limit_bytes": lambda: 2_000_000_000,
         }
         for node in tree.body:
+            if (isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id in {
+                        "IMAGE_EXTENSIONS", "VIDEO_EXTENSIONS", "ANIMATION_EXTENSIONS",
+                        "MEDIA_EXTENSIONS", "PIXIV_MEDIA_EXTENSIONS"} for target in node.targets)):
+                exec(compile(ast.Module(body=[node], type_ignores=[]), "<bot-media-extensions>", "exec"), self.ns)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in selected:
                 exec(compile(ast.Module(body=[node], type_ignores=[]), "<bot-filename-flow>", "exec"), self.ns)
 
@@ -133,10 +141,46 @@ class PixivFilenameTests(unittest.TestCase):
             "subprocess": SimpleNamespace(run=Mock(return_value=SimpleNamespace(
                 returncode=0, stdout="", stderr=""))),
             "gallery_dl_env": lambda platform: {}, "MAX_DOWNLOAD_SECONDS": 60,
-            "MEDIA_EXTENSIONS": {".jpg", ".png"},
         })
         self.ns["download_with_gallery_dl"]("https://www.pixiv.net/artworks/12345", self.root, "pixiv")
         self.assertTrue((self.root / pixiv_filename(self.meta, ".jpg")).is_file())
+
+    def test_ugoira_zip_download_is_named_collected_and_sent_as_original(self):
+        source = self.root / "12345_p0.zip"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("000000.jpg", b"original animation frame")
+        original = source.read_bytes()
+        self.meta["type"] = "ugoira"
+        source.with_name(source.name + ".json").write_text(json.dumps(self.meta), encoding="utf-8")
+        self.ns.update({
+            "begin_download_diagnosis": lambda: None,
+            "record_download_output": lambda output: None,
+            "subprocess": SimpleNamespace(run=Mock(return_value=SimpleNamespace(
+                returncode=0, stdout="", stderr=""))),
+            "gallery_dl_env": lambda platform: {}, "MAX_DOWNLOAD_SECONDS": 60,
+        })
+        self.ns["download_with_gallery_dl"]("pixiv-url", self.root, "pixiv")
+        files = self.ns["collect_media_files"](self.root, platform="pixiv")
+        self.assertEqual([path.name for path in files], [pixiv_filename(self.meta, ".zip")])
+        self.assertEqual(self.ns["collect_media_files"](self.root), [])
+        sent = []
+
+        async def document(**kwargs):
+            sent.append((kwargs["filename"], kwargs["document"].read()))
+
+        message = SimpleNamespace(reply_document=AsyncMock(side_effect=document))
+        self.assertTrue(asyncio.run(self.ns["send_single_media"](
+            message, files[0], "pixiv-url", self.root, prefer_original=True)))
+        self.assertEqual(sent, [(pixiv_filename(self.meta, ".zip"), original)])
+
+    def test_ugoira_zip_cache_retains_name_and_bytes(self):
+        source = self.source("aabbccddeeff_001.zip", metadata=False)
+        name = pixiv_filename(self.meta, ".zip")
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+        restored = restore_pixiv_cached_files([source], [name], scratch)
+        self.assertEqual(restored[0].name, name)
+        self.assertEqual(restored[0].read_bytes(), source.read_bytes())
 
     def test_cache_payload_records_display_names_and_version(self):
         files = [Path("作品_12345_p0_6789_畫師.jpg")]
