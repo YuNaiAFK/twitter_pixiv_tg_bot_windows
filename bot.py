@@ -27,6 +27,10 @@ if _VENDOR_DIR.is_dir() and importlib.util.find_spec("PIL") is None:
 
 from dotenv import load_dotenv
 import r2
+from pixiv_filenames import (
+    PIXIV_DOWNLOAD_FILENAME, PIXIV_FILENAME_VERSION,
+    rename_pixiv_media, restore_pixiv_cached_files,
+)
 from telegram import (
     BotCommand,
     BotCommandScopeChat,
@@ -1406,6 +1410,12 @@ def cached_media_files(payload: dict) -> list[Path]:
 def media_cache_payload(files: list[Path], url: str) -> dict:
     """Build the cached payload for a media parse."""
     names = cache_media_files(files, url)
+    if detect_media_platform(url) == "pixiv":
+        # 檔名與快取必須一一對應；部分複製失敗時，交由下次重新下載完整作品。
+        if len(names) != len(files):
+            return {"files": []}
+        return {"files": names, "filenames": [path.name for path in files],
+                "pixiv_filename_version": PIXIV_FILENAME_VERSION}
     return {"files": names}
 
 
@@ -2107,12 +2117,22 @@ async def send_cached_media(message, status, url: str, payload: dict,
     missing set is refused rather than sent, because half an artwork presented as
     the whole thing is worse than a re-download.
     """
+    if (platform == "pixiv"
+            and payload.get("pixiv_filename_version") != PIXIV_FILENAME_VERSION):
+        # 舊快取沒有作品名稱與畫師資料，重新下載一次以取得正確檔名。
+        return False
     files = cached_media_files(payload)
     if not files:
         return False
 
     scratch = make_work_dir()
     try:
+        if platform == "pixiv":
+            try:
+                files = restore_pixiv_cached_files(files, payload.get("filenames"), scratch)
+            except (ValueError, OSError) as exc:
+                logger.warning("Pixiv 快取檔名無法還原，重新下載：%s", exc)
+                return False
         sent, note, _too_large = await send_original_files(
             message, files, url, scratch,
             as_document=(platform == "pixiv"),
@@ -4651,6 +4671,10 @@ def build_gallery_dl_command(url: str, output_dir: Path, platform: str | None) -
     if config_path is not None:
         command.extend(["--config", str(config_path)])
 
+    if platform == "pixiv":
+        # 先用短檔名下載，避免長標題超過 Android 限制；中繼資料供送出前命名使用。
+        command.extend(["--filename", PIXIV_DOWNLOAD_FILENAME, "--write-metadata"])
+
     # NO --download-archive here, deliberately, and this was a real bug.
     #
     # The archive records that a file has been downloaded, so gallery-dl skips it.
@@ -4860,6 +4884,11 @@ def download_with_gallery_dl(url: str, output_dir: Path, platform: str | None = 
     if result.returncode != 0:
         details = (result.stderr or result.stdout or "没有详细错误信息").strip()
         raise RuntimeError(details[-1200:])
+
+    if platform == "pixiv":
+        rename_pixiv_media(
+            path for path in output_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS)
 
 
 def collect_media_files(temp_dir: Path) -> list[Path]:
@@ -8615,7 +8644,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     link_preview_options=source_link_options(),
                 )
                 archive = await asyncio.to_thread(
-                    zip_files, oversize, temp_dir, f"{Path(media_url).name}.zip")
+                    zip_files, oversize, temp_dir, f"{oversize[0].stem}.zip")
                 await send_single_media(
                     message, archive, media_url, temp_dir,
                     prefer_original=True,      # a document: the ZIP is the payload
