@@ -1,0 +1,308 @@
+"""本機檔案製作的離線測試；Telegram、R2 與 Telegraph 不連線。"""
+import asyncio
+import io
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+from types import SimpleNamespace as NS
+import unittest
+from unittest.mock import AsyncMock, patch
+import zipfile
+
+from PIL import Image
+import local_uploads as uploads
+import r2
+from test_r2_dedup import MemoryBucket
+
+
+def picture(size=(20, 10), color="red", mode="RGB"):
+    with Image.new(mode, size, color) as image, io.BytesIO() as buffer:
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+class PreparationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def archive(self, members):
+        path = self.root / "input"
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, data in members:
+                archive.writestr(name, data)
+        return path
+
+    def test_resize_preserves_original_and_aspect_ratio(self):
+        data = picture((2000, 1000))
+        source = self.root / "original.png"
+        source.write_bytes(data)
+        entries = uploads.prepare_inputs([("作品.png", source)], self.root / "out")
+        with Image.open(entries[0][1]) as result:
+            self.assertEqual(result.size, (1280, 640))
+            self.assertEqual(result.format, "JPEG")
+        self.assertEqual(source.read_bytes(), data)
+
+    def test_small_transparent_image_not_upscaled_white_background(self):
+        destination = self.root / "out.jpg"
+        uploads.prepare_image(picture((20, 10), (0, 0, 0, 0), "RGBA"), destination)
+        with Image.open(destination) as result:
+            self.assertEqual(result.size, (20, 10))
+            self.assertEqual(result.getpixel((0, 0)), (255, 255, 255))
+
+    def test_exif_orientation_is_applied(self):
+        with Image.new("RGB", (40, 20), "red") as image, io.BytesIO() as buffer:
+            exif = image.getexif()
+            exif[274] = 6
+            image.save(buffer, format="JPEG", exif=exif)
+            uploads.prepare_image(buffer.getvalue(), self.root / "out.jpg")
+        with Image.open(self.root / "out.jpg") as result:
+            self.assertEqual(result.size, (20, 40))
+
+    def test_archive_natural_order_and_metadata_ignored(self):
+        source = self.archive([("10.png", picture(color="blue")),
+                               ("__MACOSX/._1.png", b"metadata"),
+                               ("2.png", picture()), ("notes.txt", b"notes")])
+        entries = uploads.prepare_inputs([("作品.cbz", source)], self.root / "out")
+        self.assertEqual([name for name, _ in entries], ["2.png", "10.png"])
+        with Image.open(entries[0][1]) as result:
+            self.assertGreater(result.getpixel((0, 0))[0], 240)
+
+    def test_archive_bad_paths_rejected(self):
+        for name in ("../outside.png", "/absolute.png", "a\\bad.png"):
+            with self.subTest(name=name):
+                source = self.archive([(name, picture())])
+                if "\\" in name:
+                    source.write_bytes(source.read_bytes().replace(b"a/bad.png", b"a\\bad.png"))
+                with self.assertRaisesRegex(ValueError, "路徑"):
+                    uploads.prepare_inputs([("work.zip", source)], self.root / "out")
+        self.assertFalse((self.root.parent / "outside.png").exists())
+
+    def test_archive_symlink_rejected(self):
+        member = zipfile.ZipInfo("link.png")
+        member.create_system = 3
+        member.external_attr = (stat.S_IFLNK | 0o777) << 16
+        source = self.archive([(member, b"/etc/passwd")])
+        with self.assertRaisesRegex(ValueError, "符號連結"):
+            uploads.prepare_inputs([("work.zip", source)], self.root / "out")
+
+    def test_limits_and_empty_archive_rejected(self):
+        source = self.archive([("1.png", picture()), ("2.png", picture())])
+        with patch.object(uploads, "MAX_FILES", 1), self.assertRaises(ValueError):
+            uploads.prepare_inputs([("work.zip", source)], self.root / "out")
+        with patch.object(uploads, "MAX_FRAME_BYTES", 1), self.assertRaises(ValueError):
+            uploads.prepare_inputs([("work.zip", source)], self.root / "out")
+        source = self.archive([("notes.txt", b"empty")])
+        with self.assertRaisesRegex(ValueError, "沒有找到"):
+            uploads.prepare_inputs([("work.zip", source)], self.root / "out")
+
+    def test_page_title_first_and_no_silent_truncation(self):
+        urls = ["https://img.example/2", "https://img.example/10"]
+        nodes = json.loads(uploads.page_content("作品", urls))
+        self.assertEqual(nodes[0], {"tag": "h3", "children": ["作品"]})
+        self.assertEqual([node["attrs"]["src"] for node in nodes[1:]], urls)
+        with self.assertRaisesRegex(ValueError, "上限"):
+            uploads.page_content("作品", ["https://img.example/" + "x" * 64000])
+
+    def test_reply_escapes_filename_only_preview_hyperlinked(self):
+        text = uploads.result_text('<作品 & "作者">', "https://telegra.ph/test")
+        self.assertIn("&lt;作品 &amp;", text)
+        self.assertEqual(text.count("<a "), 1)
+        self.assertIn('>即時預覽</a> ] / [ 作者 ] / [ E站 ]', text)
+
+    def test_local_r2_injection_reuses_duplicate_content(self):
+        bucket = MemoryBucket()
+        settings = r2.R2Settings("account", "key", "secret", "bucket", "https://img.example")
+        data = picture()
+        with patch.object(r2, "_make_client", return_value=bucket), patch.object(r2, "fetch_image") as remote:
+            report = r2.upload_many([0, 1], settings=settings, workers=2,
+                                   image_fetcher=lambda index: (data, "image/png"))
+        self.assertEqual((report.uploaded, report.reused, report.failed), (1, 1, 0))
+        self.assertEqual(len(bucket.puts), 1)
+        self.assertEqual(report.urls()[0], report.urls()[1])
+        remote.assert_not_called()
+
+
+class HandlerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.handlers = []
+        self.app = NS(add_handler=self.handlers.append, post_shutdown=None)
+        self.sequence = 0
+
+        def work_dir():
+            path = self.root / f"batch{self.sequence}"
+            self.sequence += 1
+            path.mkdir()
+            return path
+
+        class Guard:
+            ok = True
+            def __init__(self, user): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+
+        self.runtime = dict(user_is_allowed=lambda *args: True, make_work_dir=work_dir,
+            extract_urls=lambda text: [], detect_media_platform=lambda url: None,
+            ehentai=NS(is_gallery_url=lambda url: False), handle_message=AsyncMock(),
+            RequestGuard=Guard, busy_message=lambda user: "忙碌中", gallery_semaphore=asyncio.Semaphore(1),
+            R2_UPLOAD_WORKERS=2, R2_UPLOAD_TIMEOUT=5, redact_secrets=str,
+            request_r2_retry_decision=AsyncMock(return_value="stop"), _pending_r2_decisions={},
+            cleanup_request_messages=AsyncMock(), source_link_options=lambda: None)
+        uploads.register(self.app, self.runtime)
+        self.publish = next(handler.callback for handler in self.handlers if "publish" in getattr(handler, "commands", []))
+        self.cancel = next(handler.callback for handler in self.handlers if "cancel_upload" in getattr(handler, "commands", []))
+        self.collect = self.handlers[-1].callback
+        self.settings = r2.R2Settings("account", "key", "secret", "bucket", "https://img.example")
+        self.page = patch.object(uploads, "create_page", return_value=NS(url="https://telegra.ph/work"))
+        self.create_page = self.page.start()
+        self.addCleanup(self.page.stop)
+        for name, value in (("r2_settings", self.settings), ("bucket_usage", (0, 0)), ("limit_bytes", 0)):
+            patcher = patch.object(r2, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def update(self, name=None, user=1, chat=2, data=None):
+        status = NS(edit_text=AsyncMock())
+        message = NS(document=None, photo=[], caption=None, message_id=10,
+                     reply_text=AsyncMock(return_value=status))
+        if name:
+            source = self.root / f"source{os.urandom(4).hex()}"
+            source.write_bytes(data if data is not None else picture())
+            message.document = NS(file_name=name, file_size=source.stat().st_size,
+                get_file=AsyncMock(return_value=NS(file_path=str(source))))
+        return NS(effective_message=message, effective_user=NS(id=user),
+                  effective_chat=NS(id=chat, type="private"))
+
+    def upload_ok(self, indexes, **kwargs):
+        for index in indexes:
+            data, mime = kwargs["image_fetcher"](index)
+            self.assertEqual(mime, "image/jpeg")
+            with Image.open(io.BytesIO(data)) as image:
+                self.assertLessEqual(max(image.size), 1280)
+        return r2.UploadReport(total=len(indexes), results=[
+            r2.UploadResult(index, public_url=f"https://img.example/{index}") for index in indexes])
+
+    async def test_direct_images_publish_in_filename_order_and_cleanup(self):
+        await self.collect(self.update("10.png", data=picture(color="blue")), None)
+        await self.collect(self.update("2.png"), None)
+        self.create_page.assert_not_called()
+        seen = []
+
+        def upload(indexes, **kwargs):
+            for index in indexes:
+                with Image.open(io.BytesIO(kwargs["image_fetcher"](index)[0])) as image:
+                    seen.append(image.getpixel((0, 0)))
+            return self.upload_ok(indexes, **kwargs)
+
+        update = self.update()
+        with patch.object(r2, "upload_many", side_effect=upload):
+            await self.publish(update, None)
+        self.assertGreater(seen[0][0], 240)
+        self.assertGreater(seen[1][2], 240)
+        self.create_page.assert_called_once_with("10", ["https://img.example/0", "https://img.example/1"])
+        self.assertIn("即時預覽", update.effective_message.reply_text.call_args.args[0])
+        self.assertFalse((self.root / "batch0").exists())
+
+    async def test_archive_publish_uses_archive_filename(self):
+        with io.BytesIO() as buffer:
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("1.png", picture())
+            update = self.update("我的作品.cbz", data=buffer.getvalue())
+        await self.collect(update, None)
+        with patch.object(r2, "upload_many", side_effect=self.upload_ok):
+            await self.publish(self.update(), None)
+        self.create_page.assert_called_once_with("我的作品", ["https://img.example/0"])
+
+    async def test_three_failures_stop_before_telegraph(self):
+        await self.collect(self.update("work.png"), None)
+        def fail(indexes, **kwargs):
+            return r2.UploadReport(total=len(indexes), failed=len(indexes), results=[
+                r2.UploadResult(index, error="測試失敗") for index in indexes])
+        with patch.object(r2, "upload_many", side_effect=fail) as upload, patch.object(uploads.asyncio, "sleep", new=AsyncMock()):
+            await self.publish(self.update(), None)
+        self.assertEqual(upload.call_count, 3)
+        self.runtime["request_r2_retry_decision"].assert_awaited_once()
+        self.create_page.assert_not_called()
+
+    async def test_partial_failure_retries_only_failed_image(self):
+        await self.collect(self.update("1.png"), None)
+        await self.collect(self.update("2.png"), None)
+        calls = []
+        def upload(indexes, **kwargs):
+            calls.append(list(indexes))
+            if len(calls) == 1:
+                return r2.UploadReport(total=2, results=[r2.UploadResult(0, public_url="https://img.example/0"),
+                                                        r2.UploadResult(1, error="暫時失敗")])
+            return self.upload_ok(indexes, **kwargs)
+        with patch.object(r2, "upload_many", side_effect=upload), patch.object(uploads.asyncio, "sleep", new=AsyncMock()):
+            await self.publish(self.update(), None)
+        self.assertEqual(calls, [[0, 1], [1]])
+        self.create_page.assert_called_once()
+
+    async def test_permission_and_owner_isolation_cancel(self):
+        self.runtime["user_is_allowed"] = lambda *args: False
+        update = self.update("blocked.png")
+        await self.collect(update, None)
+        update.effective_message.reply_text.assert_not_called()
+        self.assertEqual(self.sequence, 0)
+        self.runtime["user_is_allowed"] = lambda *args: True
+        await self.collect(self.update("one.png", user=1), None)
+        await self.collect(self.update("two.png", user=2), None)
+        await self.cancel(self.update(user=1), None)
+        self.assertFalse((self.root / "batch0").exists())
+        self.assertTrue((self.root / "batch1").exists())
+        await self.app.post_shutdown(self.app)
+        self.assertFalse((self.root / "batch1").exists())
+
+    async def test_budget_stop_prevents_page(self):
+        await self.collect(self.update("work.png"), None)
+        report = r2.UploadReport(total=1, budget_stopped=True, results=[r2.UploadResult(0, error="額度")])
+        with patch.object(r2, "upload_many", return_value=report):
+            await self.publish(self.update(), None)
+        self.create_page.assert_not_called()
+
+    async def test_failed_result_reply_reuses_already_created_page(self):
+        await self.collect(self.update("work.png"), None)
+        update = self.update()
+        update.effective_message.reply_text.side_effect = [NS(edit_text=AsyncMock()), RuntimeError("reply failed")]
+        with patch.object(r2, "upload_many", side_effect=self.upload_ok) as upload:
+            await self.publish(update, None)
+            await self.publish(self.update(), None)
+        self.assertEqual(upload.call_count, 1)
+        self.create_page.assert_called_once()
+
+    async def test_termux_proot_download_mapping(self):
+        prefix = self.root / "usr"
+        source = prefix / "var/lib/proot-distro/containers/botapi/rootfs/root/telegram-bot-api/token/photos/file.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(picture())
+        remote = NS(file_path="https://api.telegram.org/file/botdummy//root/telegram-bot-api/token/photos/file.jpg", download_to_drive=AsyncMock())
+        target = self.root / "download"
+        with patch.dict(os.environ, {"PREFIX": str(prefix), "CHROOT_NAME": "botapi"}):
+            await uploads.download_file(NS(get_file=AsyncMock(return_value=remote)), target, self.runtime)
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        remote.download_to_drive.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Docker 檔案橋接")
+    async def test_windows_docker_local_path_bridge(self):
+        raw = "/var/lib/telegram-bot-api/dummy/documents/file.zip"
+        remote = NS(file_path=f"https://api.telegram.org/file/botdummy/{raw}", download_to_drive=AsyncMock())
+        target = self.root / "download"
+        def copy(args, **kwargs):
+            self.assertEqual(args[:3], ["docker", "cp", "telegram-bot-api:" + raw])
+            target.write_bytes(b"archive")
+            return NS(returncode=0)
+        with patch.object(uploads.subprocess, "run", side_effect=copy):
+            await uploads.download_file(NS(get_file=AsyncMock(return_value=remote)), target, self.runtime)
+        self.assertEqual(target.read_bytes(), b"archive")
+        remote.download_to_drive.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -381,6 +381,7 @@ def upload_many(
     stop_event=None,
     already_used: int = 0,
     budget: int = 0,
+    image_fetcher=None,
 ) -> UploadReport:
     """
     Download each URL and put it in R2, in parallel, keeping the original order.
@@ -420,8 +421,11 @@ def upload_many(
         if stop_event is not None and stop_event.is_set():
             return index, UploadResult(url, error="已取消")
         try:
-            data, content_type = fetch_image(url, timeout=timeout, referer=referer,
-                                             cookies=cookies)
+            if image_fetcher is not None:
+                data, content_type = image_fetcher(url)
+            else:
+                data, content_type = fetch_image(url, timeout=timeout, referer=referer,
+                                                 cookies=cookies)
         except Exception as exc:  # noqa: BLE001
             return index, UploadResult(url, error=f"{type(exc).__name__}: {exc}")
 

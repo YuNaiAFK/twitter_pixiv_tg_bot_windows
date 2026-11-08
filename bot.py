@@ -3439,6 +3439,8 @@ def commands_hint() -> str:
         "• X/Twitter 連結：圖片傳回聊天\n"
         f"• Pixiv 連結：傳送原圖檔案（單個作品最多 {MAX_FILES} 張）\n"
         "• e-hentai 連結：整理成 Telegraph 頁面，附標籤分類\n"
+        "• 本機圖片／ZIP／CBZ：傳完後輸入 /publish，縮圖上傳 R2 並製作 Telegraph\n"
+        "  /cancel_upload 可取消待製作的檔案。\n"
         "\n每則結果都會附上原始連結。\n"
         "連結可以寫在文字裡，也可以寫在圖片的說明文字裡。\n"
         f"{SUPPORTED_SITES_NOTICE}"
@@ -6373,7 +6375,7 @@ def r2_decision_keyboard(request_id: str) -> InlineKeyboardMarkup:
 
 
 async def request_r2_retry_decision(status, user_id: int, failed_count: int,
-                                    failure_reason: str = "上傳") -> str:
+                                    failure_reason: str = "上傳", task_name: str = "e-hentai 解析") -> str:
     """Wait for the request owner to stop this parse or allow another retry cycle."""
     loop = asyncio.get_running_loop()
     request_id = secrets.token_hex(5)
@@ -6388,7 +6390,7 @@ async def request_r2_retry_decision(status, user_id: int, failed_count: int,
     prompt = (
         f"⚠️ R2 {failure_reason}連續失敗 {R2_FAILURES_BEFORE_PROMPT} 次，"
         f"目前有 {failed_count} 張圖片尚未完成。\n\n"
-        "要停止這次 e-hentai 解析，還是再自動重試 3 次？"
+        f"要停止這次{task_name}，還是再自動重試 3 次？"
     )
     try:
         try:
@@ -6406,7 +6408,7 @@ async def request_r2_retry_decision(status, user_id: int, failed_count: int,
                 future, timeout=R2_DECISION_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             await status.edit_text(
-                "⌛ 等待選擇逾時，已停止這次 e-hentai 解析。",
+                f"⌛ 等待選擇逾時，已停止這次{task_name}。",
                 link_preview_options=source_link_options(),
             )
             return "stop"
@@ -8839,6 +8841,8 @@ async def post_init(application: Application):
         BotCommand("start", "開始使用"),
         BotCommand("help", "使用說明"),
         BotCommand("id", "顯示你的 ID"),
+        BotCommand("publish", "將上傳的圖片或壓縮檔製作成 Telegraph"),
+        BotCommand("cancel_upload", "取消待製作的本機檔案"),
     ])
 
     # The admin menu. There is no longer a separate "operator" tier: the list commands became
@@ -8848,6 +8852,8 @@ async def post_init(application: Application):
         BotCommand("start", "開始使用"),
         BotCommand("help", "使用說明"),
         BotCommand("id", "顯示你的 ID"),
+        BotCommand("publish", "將上傳的圖片或壓縮檔製作成 Telegraph"),
+        BotCommand("cancel_upload", "取消待製作的本機檔案"),
         BotCommand("authorized", "查看授權狀態"),
         BotCommand("blocked", "列出被封鎖的使用者"),
         BotCommand("grant", "解除封鎖／授權群組（/grant <ID>）"),
@@ -9437,6 +9443,9 @@ def main():
     application.add_handler(
         CallbackQueryHandler(handle_gallery_callback, pattern=r"^eh\|")
     )
+
+    from local_uploads import register as register_local_uploads
+    register_local_uploads(application, globals())
 
     # Captions matter: in a group the link is often attached to a photo.
     application.add_handler(
