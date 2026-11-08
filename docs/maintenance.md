@@ -432,4 +432,3 @@ PTB 預設**一次只處理一個 update**，而按鈕按一下就是一個 upda
 成人內容的發佈 —— 尤其是 Telegraph 頁面 —— 可能違反平台政策而被移除。
 
 實作歷史、疑難雜症與安全稽核紀錄都在 [docs/NOTES.md](../docs/NOTES.md)。
-
