@@ -170,7 +170,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     def update(self, name=None, user=1, chat=2, data=None):
         status = NS(edit_text=AsyncMock())
         message = NS(document=None, photo=[], caption=None, message_id=10,
-                     reply_text=AsyncMock(return_value=status))
+                     reply_text=AsyncMock(return_value=status), reply_photo=AsyncMock())
         if name:
             source = self.root / f"source{os.urandom(4).hex()}"
             source.write_bytes(data if data is not None else picture())
@@ -206,7 +206,10 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(seen[0][0], 240)
         self.assertGreater(seen[1][2], 240)
         self.create_page.assert_called_once_with("10", ["https://img.example/0", "https://img.example/1"])
-        self.assertIn("即時預覽", update.effective_message.reply_text.call_args.args[0])
+        sent = update.effective_message.reply_photo.call_args.kwargs
+        self.assertIn("即時預覽", sent["caption"])
+        self.assertEqual(sent["parse_mode"], "HTML")
+        self.assertTrue(str(sent["photo"].name).endswith("00001.jpg"))
         self.assertFalse((self.root / "batch0").exists())
 
     async def test_archive_publish_uses_archive_filename(self):
@@ -270,7 +273,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_result_reply_reuses_already_created_page(self):
         await self.collect(self.update("work.png"), None)
         update = self.update()
-        update.effective_message.reply_text.side_effect = [NS(edit_text=AsyncMock()), RuntimeError("reply failed")]
+        update.effective_message.reply_photo.side_effect = RuntimeError("reply failed")
         with patch.object(r2, "upload_many", side_effect=self.upload_ok) as upload:
             await self.publish(update, None)
             await self.publish(self.update(), None)

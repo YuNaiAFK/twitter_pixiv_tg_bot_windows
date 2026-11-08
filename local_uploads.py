@@ -126,6 +126,7 @@ class Batch:
     busy: bool = False
     creating_page: bool = False
     page_url: str = ""
+    cover: Path | None = None
     total_bytes: int = 0
     reserved_bytes: int = 0
     touched: float = field(default_factory=time.monotonic)
@@ -135,6 +136,13 @@ class Batch:
 def cleanup_batch(batch):
     # root 僅由 make_work_dir 建立，不使用上傳檔名或 ZIP 路徑。
     shutil.rmtree(batch.root, ignore_errors=True)
+
+
+async def send_result(message, batch):
+    # 使用壓縮後的第一張圖片；以檔案內容上傳，兼容 Docker／proot Bot API。
+    with batch.cover.open("rb") as photo:
+        await message.reply_photo(photo=photo, caption=result_text(batch.title, batch.page_url),
+                                  parse_mode="HTML")
 
 
 async def download_file(media, target, runtime):
@@ -294,8 +302,7 @@ def register(application, runtime):
                 if batch.stop.is_set():
                     raise ValueError("已停止製作")
                 if batch.page_url:
-                    await message.reply_text(result_text(batch.title, batch.page_url), parse_mode="HTML",
-                                             link_preview_options=runtime["source_link_options"]())
+                    await send_result(message, batch)
                     batches.pop(key, None)
                     cleanup_batch(batch)
                     await runtime["cleanup_request_messages"](status)
@@ -305,6 +312,7 @@ def register(application, runtime):
                 if settings is None:
                     raise ValueError("尚未設定 R2，無法製作本機檔案預覽")
                 entries = await asyncio.to_thread(prepare_inputs, batch.records, batch.root / "prepared")
+                batch.cover = entries[0][1]
                 lookup_failures = 0
                 while True:
                     if batch.stop.is_set():
@@ -369,8 +377,7 @@ def register(application, runtime):
                 batch.creating_page = True
                 page = await asyncio.to_thread(create_page, batch.title, urls)
                 batch.page_url = page.url
-                await message.reply_text(result_text(batch.title, page.url), parse_mode="HTML",
-                                         link_preview_options=runtime["source_link_options"]())
+                await send_result(message, batch)
                 batches.pop(key, None)
                 cleanup_batch(batch)
                 await runtime["cleanup_request_messages"](status)
