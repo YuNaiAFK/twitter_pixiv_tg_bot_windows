@@ -8618,6 +8618,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     platform = detect_media_platform(media_url)
+    from channel_publish import capture_message, offer_publish
+    message = capture_message(message, user.id, platform, globals().get("CHANNEL_PUBLISHER"))
 
     # A link that has been parsed before is served from the cache: the files were
     # copied aside, so this costs no download at all.
@@ -8643,6 +8645,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if await send_cached_media(message, status, media_url, cached_media,
                                        platform, source_note):
+                await offer_publish(message)
                 logger.info("命中解析快取：%s", media_url)
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 # Remove the bot's progress notice just as after a fresh download;
@@ -8748,6 +8751,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(summary, link_preview_options=source_link_options())
         succeeded = True
         await asyncio.to_thread(remember_media_parse, media_url, media_files)
+        await offer_publish(message)
 
     except subprocess.TimeoutExpired:
         await status.edit_text(
@@ -8871,6 +8875,7 @@ async def post_init(application: Application):
         BotCommand("status", "執行狀態"),
         BotCommand("cache", "解析快取狀態／清除"),
         BotCommand("restart", "重新啟動機器人"),
+        BotCommand("channels", "查詢或登記解析結果的目標頻道"),
     ]
 
     # **Scoped menus go to administrators only.** This used to include `AUTHORIZATION.allowed`
@@ -9452,6 +9457,8 @@ def main():
 
     from local_uploads import register as register_local_uploads
     register_local_uploads(application, globals())
+    from channel_publish import register as register_channel_publish
+    register_channel_publish(application, globals())
 
     # Captions matter: in a group the link is often attached to a photo.
     application.add_handler(
