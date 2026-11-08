@@ -200,6 +200,8 @@ class Batch:
     awaiting_link: str = ""
     input_prompt_id: int = 0
     source_message_ids: set = field(default_factory=set)
+    panel: object = None
+    panel_lock: object = field(default_factory=asyncio.Lock)
     total_bytes: int = 0
     reserved_bytes: int = 0
     touched: float = field(default_factory=time.monotonic)
@@ -212,11 +214,28 @@ def cleanup_batch(batch):
 
 
 async def send_result(message, batch):
+    from telegram import InputMediaPhoto
     # 使用壓縮後的第一張圖片；以檔案內容上傳，兼容 Docker／proot Bot API。
     with batch.cover.open("rb") as photo:
-        await message.reply_photo(photo=photo, caption=result_text(batch.title, batch.page_url,
-                                  batch.author_url, batch.source_url),
-                                  parse_mode="HTML")
+        await batch.panel.edit_media(media=InputMediaPhoto(photo,
+            caption=result_text(batch.title, batch.page_url, batch.author_url, batch.source_url),
+            parse_mode="HTML"), reply_markup=None)
+
+
+async def set_panel(batch, message, text, reply_markup=None, **kwargs):
+    from telegram import LinkPreviewOptions
+    from telegram.error import BadRequest
+    kwargs.setdefault("link_preview_options", LinkPreviewOptions(is_disabled=True))
+    async with batch.panel_lock:
+        if batch.panel is None:
+            batch.panel = await message.reply_text(text, reply_markup=reply_markup, **kwargs)
+        else:
+            try:
+                await batch.panel.edit_text(text, reply_markup=reply_markup, parse_mode=kwargs.pop("parse_mode", None), **kwargs)
+            except BadRequest as exc:
+                if "message is not modified" not in str(exc).lower():
+                    raise
+        return batch.panel
 
 
 async def download_file(media, target, runtime):
@@ -263,7 +282,7 @@ async def download_file(media, target, runtime):
 
 
 def register(application, runtime):
-    from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
     batches = {}
     profiles = PageProfiles(runtime["BASE_DIR"] / "local_upload_profiles.json")
@@ -283,6 +302,12 @@ def register(application, runtime):
             [button("作者連結", "author"), button("E站連結", "source")],
             [button("頁面文字（記憶）", "page_text"), button("文字連結（記憶）", "page_link")],
         ])
+
+    def input_keyboard(batch):
+        label = "清除記憶設定" if batch.awaiting_link.startswith("page_") else "略過／移除連結"
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(label, callback_data=f"lu|{batch.token}|clear_{batch.awaiting_link}")],
+            [InlineKeyboardButton("返回選單", callback_data=f"lu|{batch.token}|menu")]])
 
     def summary(batch):
         author = "已設定" if batch.author_url else "未提供（普通文字）"
@@ -313,7 +338,7 @@ def register(application, runtime):
         sweep()
         batch = batches.get(key)
         if batch and batch.busy:
-            await message.reply_text("這份作品正在製作，請完成後再傳送新檔案。")
+            await set_panel(batch, message, "這份作品正在製作，請完成後再傳送新檔案。")
             return
         if not batch:
             if len(batches) >= 32:
@@ -328,17 +353,18 @@ def register(application, runtime):
             batch.title = Path(name).stem or "未命名作品"
         size = getattr(media, "file_size", 0) or 0
         if batch.total_bytes + batch.reserved_bytes + size > MAX_INPUT_BYTES or len(batch.records) + batch.pending >= MAX_FILES:
-            await message.reply_text("檔案超過 512 MB 或已達 500 個檔案上限，請分批製作。")
+            await set_panel(batch, message, "檔案超過 512 MB 或已達 500 個檔案上限，請分批製作。")
             return
         if shutil.disk_usage(batch.root).free < size + 128 * 1024 * 1024:
-            await message.reply_text("暫存空間不足，請清理空間後再傳送。")
+            await set_panel(batch, message, "暫存空間不足，請清理空間後再傳送。")
             return
+        batch.awaiting_link = ""
         batch.pending += 1
         batch.reserved_bytes += size
         target = batch.root / f"input_{os.urandom(8).hex()}"
         status = None
         try:
-            status = await message.reply_text(f"正在接收：{name}")
+            status = await set_panel(batch, message, f"正在接收：{name}")
             await download_file(media, target, runtime)
             actual_size = target.stat().st_size
             if batch.total_bytes + actual_size > MAX_INPUT_BYTES:
@@ -378,6 +404,9 @@ def register(application, runtime):
             await query.answer("頁面已建立，請先完成傳送，再於下一份作品修改。", show_alert=True)
             return
         await query.answer()
+        if action == "menu":
+            batch.awaiting_link = ""
+            return await set_panel(batch, update.effective_message, summary(batch), reply_markup=keyboard(batch))
         if action == "cancel":
             await query.edit_message_reply_markup(reply_markup=None)
             return await cancel(update, context)
@@ -396,13 +425,9 @@ def register(application, runtime):
                 label = "作者" if action == "author" else "E站"
                 prompt = f"請傳送{label}連結；不提供可按下方略過，保留普通文字。"
             if update.effective_chat.type != "private":
-                sent = await update.effective_message.reply_text(html.escape(prompt) +
-                    f'\n<a href="tg://user?id={key[1]}">請回覆這則提示輸入內容。</a>',
-                    parse_mode="HTML", reply_markup=ForceReply(selective=True))
-                batch.input_prompt_id = sent.message_id
-            await update.effective_message.reply_text(prompt if update.effective_chat.type == "private" else "不提供時可按下方清除／略過。",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("清除記憶設定" if action.startswith("page_") else "略過／移除連結",
-                    callback_data=f"lu|{batch.token}|clear_{action}")]]))
+                prompt += "\n請回覆這則操作訊息輸入內容。"
+            sent = await set_panel(batch, update.effective_message, prompt, reply_markup=input_keyboard(batch))
+            batch.input_prompt_id = sent.message_id
         elif action in {"clear_author", "clear_source", "clear_page_text", "clear_page_link"}:
             field_name = action.removeprefix("clear_")
             field_name = field_name if field_name.startswith("page_") else field_name + "_url"
@@ -410,12 +435,11 @@ def register(application, runtime):
                 try:
                     profiles.save(key[1], field_name, "")
                 except OSError:
-                    await update.effective_message.reply_text("設定無法儲存，請稍後再試；尚未清除。")
+                    await set_panel(batch, update.effective_message, "設定無法儲存，請稍後再試；尚未清除。", reply_markup=input_keyboard(batch))
                     return
             setattr(batch, field_name, "")
             batch.awaiting_link = ""
-            await query.edit_message_reply_markup(reply_markup=None)
-            await update.effective_message.reply_text(summary(batch), reply_markup=keyboard(batch))
+            await set_panel(batch, update.effective_message, summary(batch), reply_markup=keyboard(batch))
 
     class LinkReplyFilter(filters.MessageFilter):
         def filter(self, message):
@@ -447,19 +471,19 @@ def register(application, runtime):
             else:
                 value = optional_link(text)
         except ValueError as exc:
-            await update.effective_message.reply_text(str(exc))
+            await set_panel(batch, update.effective_message, str(exc), reply_markup=input_keyboard(batch))
             return
         field_name = batch.awaiting_link if batch.awaiting_link.startswith("page_") else batch.awaiting_link + "_url"
         if field_name.startswith("page_"):
             try:
                 profiles.save(key[1], field_name, value)
             except OSError:
-                await update.effective_message.reply_text("設定無法儲存，請稍後重新傳送；尚未套用。")
+                await set_panel(batch, update.effective_message, "設定無法儲存，請稍後重新傳送；尚未套用。", reply_markup=input_keyboard(batch))
                 return
         setattr(batch, field_name, value)
         batch.awaiting_link = ""
         batch.touched = time.monotonic()
-        await update.effective_message.reply_text(summary(batch), reply_markup=keyboard(batch))
+        await set_panel(batch, update.effective_message, summary(batch), reply_markup=keyboard(batch))
 
     async def cancel(update, context):
         key = owner(update)
@@ -469,9 +493,9 @@ def register(application, runtime):
         if not batch:
             return await update.effective_message.reply_text("沒有待製作的本機檔案。")
         if batch.pending:
-            return await update.effective_message.reply_text("檔案仍在接收，請接收完成後再取消。")
+            return await set_panel(batch, update.effective_message, "檔案仍在接收，請接收完成後再取消。")
         if batch.creating_page:
-            return await update.effective_message.reply_text("Telegraph 頁面正在完成，請稍候。")
+            return await set_panel(batch, update.effective_message, "Telegraph 頁面正在完成，請稍候。")
         batch.stop.set()
         if batch.busy:
             for entry in runtime["_pending_r2_decisions"].values():
@@ -479,7 +503,7 @@ def register(application, runtime):
                     entry["future"].set_result("stop")
         else:
             cleanup_batch(batches.pop(key))
-        await update.effective_message.reply_text("已取消本機檔案製作。")
+        await set_panel(batch, update.effective_message, "已取消本機檔案製作。")
 
     async def publish(update, context):
         key = owner(update)
@@ -490,17 +514,17 @@ def register(application, runtime):
         if not batch or not batch.records:
             return await message.reply_text("請先傳送 ZIP／CBZ、圖片或圖片文件，再輸入 /publish。")
         if batch.pending or batch.busy:
-            return await message.reply_text("檔案仍在接收或製作中，請稍候。")
+            return await set_panel(batch, message, "檔案仍在接收或製作中，請稍候。")
         batch.awaiting_link = ""
         with runtime["RequestGuard"](key[1]) as guard:
             if not guard.ok:
-                return await message.reply_text(runtime["busy_message"](key[1]))
+                return await set_panel(batch, message, runtime["busy_message"](key[1]))
             batch.busy = True
             batch.stop.clear()
             acquired = False
             status = None
             try:
-                status = await message.reply_text("正在等待製作並整理圖片……")
+                status = await set_panel(batch, message, "正在等待製作並整理圖片……")
                 await runtime["gallery_semaphore"].acquire()
                 acquired = True
                 if batch.stop.is_set():
@@ -509,7 +533,6 @@ def register(application, runtime):
                     await send_result(message, batch)
                     batches.pop(key, None)
                     cleanup_batch(batch)
-                    await runtime["cleanup_request_messages"](status)
                     return
                 import r2
                 settings = r2.r2_settings()
@@ -584,11 +607,12 @@ def register(application, runtime):
                 await send_result(message, batch)
                 batches.pop(key, None)
                 cleanup_batch(batch)
-                await runtime["cleanup_request_messages"](status)
             except Exception as exc:
                 logger.warning("本機檔案製作失敗：%s", runtime["redact_secrets"](str(exc)))
                 if status is not None:
-                    await status.edit_text(f"製作未完成：{runtime['redact_secrets'](str(exc))}\n可輸入 /publish 重試，或 /cancel_upload 取消。", reply_markup=None)
+                    failure_text = ("已取消本機檔案製作。" if batch.stop.is_set() else
+                        f"製作未完成：{runtime['redact_secrets'](str(exc))}\n可輸入 /publish 重試，或 /cancel_upload 取消。")
+                    await status.edit_text(failure_text, reply_markup=None)
                 if batch.stop.is_set():
                     batches.pop(key, None)
                     cleanup_batch(batch)
@@ -612,7 +636,7 @@ def register(application, runtime):
                     return await message.reply_text("群組僅支援回覆 ZIP／CBZ 壓縮檔製作；圖片請傳到 bot 私聊。")
                 batch = batches.get(key)
                 if batch and source.message_id in batch.source_message_ids:
-                    return await message.reply_text(summary(batch), reply_markup=keyboard(batch))
+                    return await set_panel(batch, message, summary(batch), reply_markup=keyboard(batch))
                 return await collect(update, context, source=source)
             if key not in batches:
                 return await message.reply_text("請回覆群組內的 ZIP／CBZ 訊息，輸入 /publish@機器人名稱 開始製作。")

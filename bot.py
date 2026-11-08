@@ -5288,6 +5288,12 @@ async def send_single_media(message, file_path: Path, source_url: str,
     # The source link wins over a per-file note when both are present: the link is what
     # the caller asked to show, and the note is only a compression remark.
     text = caption or note
+    caption_options = {}
+    if detect_media_platform(source_url) == "twitter":
+        from twitter_captions import linked_caption
+        text, entities = linked_caption(text, source_url)
+        if entities:
+            caption_options = {"caption_entities": entities, "parse_mode": None}
 
     # 依 Pixiv 來源網址固定文件模式，無論副檔名或
     # prefer_original 參數為何，都把 Pixiv 媒體交給 sendDocument。
@@ -5310,7 +5316,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
         with file_path.open("rb") as media:
             await message.reply_document(
                 document=media, filename=file_path.name, caption=text,
-                reply_markup=keyboard, disable_content_type_detection=True,
+                reply_markup=keyboard, **caption_options, disable_content_type_detection=True,
             )
         return True
 
@@ -5321,7 +5327,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
                 filename=file_path.name,
                 caption=text,
                 supports_streaming=True,
-                reply_markup=keyboard,
+                reply_markup=keyboard, **caption_options,
                 
             )
         return True
@@ -5332,7 +5338,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
                 animation=media,
                 filename=file_path.name,
                 caption=text,
-                reply_markup=keyboard,
+                reply_markup=keyboard, **caption_options,
                 
             )
         return True
@@ -5342,7 +5348,7 @@ async def send_single_media(message, file_path: Path, source_url: str,
             with file_path.open("rb") as media:
                 await message.reply_photo(
                     photo=media, filename=file_path.name, caption=text,
-                    reply_markup=keyboard,
+                    reply_markup=keyboard, **caption_options,
                 )
             return True
 
@@ -5357,21 +5363,21 @@ async def send_single_media(message, file_path: Path, source_url: str,
                     # The link still leads when the image had to be shrunk, so the
                     # compression remark is appended rather than replacing it.
                     caption=(f"{text}\n{compress_note}" if text else compress_note),
-                    reply_markup=keyboard,
+                    reply_markup=keyboard, **caption_options,
                 )
             return True
 
         with file_path.open("rb") as media:
             await message.reply_document(
                 document=media, filename=file_path.name, caption=text,
-                reply_markup=keyboard,
+                reply_markup=keyboard, **caption_options,
             )
         return True
 
     with file_path.open("rb") as media:
         await message.reply_document(
             document=media, filename=file_path.name, caption=text,
-            reply_markup=keyboard,
+            reply_markup=keyboard, **caption_options,
         )
     return True
 
@@ -5427,6 +5433,10 @@ async def send_media_album(message, files: list[Path], source_url: str,
             # items all have captions, and one link is what is wanted anyway.
             item_kwargs = {"media": handle,
                            "caption": caption if index == 0 else None}
+            if index == 0 and caption and detect_media_platform(source_url) == "twitter":
+                from twitter_captions import linked_caption
+                linked, entities = linked_caption(caption, source_url)
+                item_kwargs.update(caption=linked, caption_entities=entities, parse_mode=None)
             if as_document:
                 item_kwargs["disable_content_type_detection"] = True
                 # Send the real filename, so an original does not arrive as
@@ -5549,7 +5559,7 @@ def build_source_keyboard(source_url: str):
     )
 
 
-async def send_source_link(message, source_note: str):
+async def send_source_link(message, source_note: str, source_url: str = ""):
     """
     Post the source link on its own, after the files.
 
@@ -5563,9 +5573,14 @@ async def send_source_link(message, source_note: str):
     """
     if not source_note:
         return None
+    text_options = {}
+    if source_url and detect_media_platform(source_url) == "twitter":
+        from twitter_captions import linked_caption
+        source_note, entities = linked_caption(source_note, source_url)
+        text_options = {"entities": entities, "parse_mode": None}
     try:
         return await message.reply_text(
-            source_note, link_preview_options=source_link_options()
+            source_note, link_preview_options=source_link_options(), **text_options
         )
     except TelegramError as exc:
         logger.warning("原始連結傳送失敗：%s", exc)
@@ -5723,7 +5738,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
     # The text message is still the honest fallback in that case, rather than leaving
     # the user with images and no way back to the source.
     if attach_link and not link_carried and sent == 0:
-        await send_source_link(message, caption or build_caption(source_url))
+        await send_source_link(message, caption or build_caption(source_url), source_url=source_url)
 
     return sent, ("；".join(dict.fromkeys(notes)) if notes else ""), too_large
 

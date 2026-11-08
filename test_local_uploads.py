@@ -169,6 +169,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.handlers = []
+        self.panels = {}
         self.app = NS(add_handler=self.handlers.append, post_shutdown=None)
         self.sequence = 0
 
@@ -208,7 +209,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
 
     def update(self, name=None, user=1, chat=2, data=None):
-        status = NS(message_id=900, edit_text=AsyncMock())
+        status = self.panels.setdefault((chat, user), NS(message_id=900, edit_text=AsyncMock(), edit_media=AsyncMock()))
         message = NS(document=None, photo=[], caption=None, message_id=10,
                      reply_text=AsyncMock(return_value=status), reply_photo=AsyncMock(), reply_to_message=None)
         if name:
@@ -247,6 +248,27 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.choose(cancellation, None)
         self.assertFalse((self.root / "batch0").exists())
 
+    async def test_entire_workflow_edits_one_message_including_final_cover(self):
+        first, second = self.update("1.png"), self.update("2.png")
+        await self.collect(first, None)
+        await self.collect(second, None)
+        panel = first.effective_message.reply_text.return_value
+        menu = panel.edit_text.call_args.kwargs["reply_markup"]
+        await self.choose(self.callback(first, menu.inline_keyboard[1][0].callback_data), None)
+        reply = self.update()
+        reply.effective_message.text = "https://artist.example"
+        await self.receive_link(reply, None)
+        command = self.update()
+        with patch.object(r2, "upload_many", side_effect=self.upload_ok):
+            await self.publish(command, None)
+        first.effective_message.reply_text.assert_awaited_once()
+        for update in (second, reply, command):
+            update.effective_message.reply_text.assert_not_called()
+            update.effective_message.reply_photo.assert_not_called()
+        panel.edit_media.assert_awaited_once()
+        self.assertGreater(panel.edit_text.await_count, 5)
+        self.runtime["cleanup_request_messages"].assert_not_called()
+
     async def test_links_are_optional_and_used_by_upload_button(self):
         update = self.update("work.png")
         await self.collect(update, None)
@@ -260,7 +282,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         published = self.callback(update, markup.inline_keyboard[0][0].callback_data)
         with patch.object(r2, "upload_many", side_effect=self.upload_ok):
             await self.choose(published, None)
-        caption = published.effective_message.reply_photo.call_args.kwargs["caption"]
+        caption = published.effective_message.reply_text.return_value.edit_media.call_args.kwargs["media"].caption
         self.assertIn('href="https://artist.example/profile?a=1&amp;b=2">作者</a>', caption)
         self.assertIn('href="https://e-hentai.org/g/123/test/">E站</a>', caption)
 
@@ -270,16 +292,16 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
         callback = self.callback(update, markup.inline_keyboard[1][0].callback_data)
         await self.choose(callback, None)
-        prompt_markup = callback.effective_message.reply_text.call_args.kwargs["reply_markup"]
+        prompt_markup = callback.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
         reply = self.update()
         reply.effective_message.text = "javascript:alert(1)"
         await self.receive_link(reply, None)
-        self.assertIn("http://", reply.effective_message.reply_text.call_args.args[0])
+        self.assertIn("http://", reply.effective_message.reply_text.return_value.edit_text.call_args.args[0])
         await self.choose(self.callback(update, prompt_markup.inline_keyboard[0][0].callback_data), None)
         published = self.update()
         with patch.object(r2, "upload_many", side_effect=self.upload_ok):
             await self.publish(published, None)
-        caption = published.effective_message.reply_photo.call_args.kwargs["caption"]
+        caption = published.effective_message.reply_text.return_value.edit_media.call_args.kwargs["media"].caption
         self.assertEqual(caption.count("<a "), 1)
         self.assertIn("[ 作者 ] / [ E站 ]", caption)
 
@@ -311,7 +333,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         menu = third.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
         callback = self.callback(third, menu.inline_keyboard[2][1].callback_data)
         await choose(callback, None)
-        clear_menu = callback.effective_message.reply_text.call_args.kwargs["reply_markup"]
+        clear_menu = callback.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
         await choose(self.callback(third, clear_menu.inline_keyboard[0][0].callback_data), None)
         stored = uploads.PageProfiles(self.root / "local_upload_profiles.json").get(1)
         self.assertEqual(stored, {"page_text": "我的書庫", "page_link": ""})
@@ -358,7 +380,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(r2, "upload_many", side_effect=self.upload_ok):
             await self.choose(callback, None)
         self.create_page.assert_called_once_with("群組作品", ["https://img.example/0"], "", "")
-        callback.effective_message.reply_photo.assert_awaited_once()
+        callback.effective_message.reply_text.return_value.edit_media.assert_awaited_once()
 
     async def test_group_rejects_image_reply_and_unauthorized_group(self):
         update = self.update(chat=-100)
@@ -411,10 +433,10 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(seen[0][0], 240)
         self.assertGreater(seen[1][2], 240)
         self.create_page.assert_called_once_with("10", ["https://img.example/0", "https://img.example/1"], "", "")
-        sent = update.effective_message.reply_photo.call_args.kwargs
-        self.assertIn("即時預覽", sent["caption"])
-        self.assertEqual(sent["parse_mode"], "HTML")
-        self.assertTrue(str(sent["photo"].name).endswith("00001.jpg"))
+        sent = update.effective_message.reply_text.return_value.edit_media.call_args.kwargs["media"]
+        self.assertIn("即時預覽", sent.caption)
+        self.assertEqual(sent.parse_mode, "HTML")
+        self.assertEqual(sent.media.filename, "00001.jpg")
         self.assertFalse((self.root / "batch0").exists())
 
     async def test_archive_publish_uses_archive_filename(self):
@@ -478,9 +500,10 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_result_reply_reuses_already_created_page(self):
         await self.collect(self.update("work.png"), None)
         update = self.update()
-        update.effective_message.reply_photo.side_effect = RuntimeError("reply failed")
+        update.effective_message.reply_text.return_value.edit_media.side_effect = RuntimeError("reply failed")
         with patch.object(r2, "upload_many", side_effect=self.upload_ok) as upload:
             await self.publish(update, None)
+            update.effective_message.reply_text.return_value.edit_media.side_effect = None
             await self.publish(self.update(), None)
         self.assertEqual(upload.call_count, 1)
         self.create_page.assert_called_once()
