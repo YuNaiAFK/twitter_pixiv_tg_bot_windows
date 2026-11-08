@@ -34,6 +34,7 @@ from pixiv_filenames import (
 from telegram import (
     BotCommand,
     BotCommandScopeChat,
+    BotCommandScopeAllPrivateChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
@@ -3439,7 +3440,7 @@ def commands_hint() -> str:
         "• X/Twitter 連結：圖片傳回聊天\n"
         f"• Pixiv 連結：傳送原圖檔案（單個作品最多 {MAX_FILES} 張）\n"
         "• e-hentai 連結：整理成 Telegraph 頁面，附標籤分類\n"
-        "• 本機圖片／ZIP／CBZ：傳完後輸入 /publish，縮圖上傳 R2 並製作 Telegraph\n"
+        "• 本機圖片／ZIP／CBZ（僅私聊）：設定可選連結後，按上傳或輸入 /publish 製作\n"
         "  /cancel_upload 可取消待製作的檔案。\n"
         "\n每則結果都會附上原始連結。\n"
         "連結可以寫在文字裡，也可以寫在圖片的說明文字裡。\n"
@@ -8841,9 +8842,14 @@ async def post_init(application: Application):
         BotCommand("start", "開始使用"),
         BotCommand("help", "使用說明"),
         BotCommand("id", "顯示你的 ID"),
+    ])
+    await application.bot.set_my_commands([
+        BotCommand("start", "開始使用"),
+        BotCommand("help", "使用說明"),
+        BotCommand("id", "顯示你的 ID"),
         BotCommand("publish", "將上傳的圖片或壓縮檔製作成 Telegraph"),
         BotCommand("cancel_upload", "取消待製作的本機檔案"),
-    ])
+    ], scope=BotCommandScopeAllPrivateChats())
 
     # The admin menu. There is no longer a separate "operator" tier: the list commands became
     # admin-only when the private list turned into a blocklist, so everything past /id is for

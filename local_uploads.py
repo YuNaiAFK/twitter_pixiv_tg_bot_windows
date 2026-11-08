@@ -113,8 +113,20 @@ def create_page(title, urls):
             http_client=client)
 
 
-def result_text(title, url):
-    return f'<b>{html.escape(title)}</b>\n\n[ <a href="{html.escape(url, quote=True)}">即時預覽</a> ] / [ 作者 ] / [ E站 ]'
+def optional_link(value):
+    value = value.strip()
+    parsed = urlsplit(value)
+    if (len(value) > 2048 or parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username or parsed.password or any(char.isspace() for char in value)):
+        raise ValueError("請提供完整的 http:// 或 https:// 連結，或按略過。")
+    return value
+
+
+def result_text(title, url, author_url="", source_url=""):
+    def label(text, link):
+        return f'<a href="{html.escape(link, quote=True)}">{text}</a>' if link else text
+    return (f'<b>{html.escape(title)}</b>\n\n[ {label("即時預覽", url)} ] / '
+            f'[ {label("作者", author_url)} ] / [ {label("E站", source_url)} ]')
 
 
 @dataclass
@@ -127,6 +139,10 @@ class Batch:
     creating_page: bool = False
     page_url: str = ""
     cover: Path | None = None
+    token: str = field(default_factory=lambda: os.urandom(6).hex())
+    author_url: str = ""
+    source_url: str = ""
+    awaiting_link: str = ""
     total_bytes: int = 0
     reserved_bytes: int = 0
     touched: float = field(default_factory=time.monotonic)
@@ -141,7 +157,8 @@ def cleanup_batch(batch):
 async def send_result(message, batch):
     # 使用壓縮後的第一張圖片；以檔案內容上傳，兼容 Docker／proot Bot API。
     with batch.cover.open("rb") as photo:
-        await message.reply_photo(photo=photo, caption=result_text(batch.title, batch.page_url),
+        await message.reply_photo(photo=photo, caption=result_text(batch.title, batch.page_url,
+                                  batch.author_url, batch.source_url),
                                   parse_mode="HTML")
 
 
@@ -189,14 +206,31 @@ async def download_file(media, target, runtime):
 
 
 def register(application, runtime):
-    from telegram.ext import CommandHandler, MessageHandler, filters
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
     batches = {}
 
     def owner(update):
         message, user, chat = update.effective_message, update.effective_user, update.effective_chat
-        if not message or not user or not chat or not runtime["user_is_allowed"](user.id, chat.id, chat.type):
+        if (not message or not user or not chat or chat.type != "private"
+                or not runtime["user_is_allowed"](user.id, chat.id, chat.type)):
             return None
         return (chat.id, user.id)
+
+    def keyboard(batch):
+        def button(text, action):
+            return InlineKeyboardButton(text, callback_data=f"lu|{batch.token}|{action}")
+        return InlineKeyboardMarkup([
+            [button("上傳並製作", "publish"), button("取消", "cancel")],
+            [button("作者連結", "author"), button("E站連結", "source")],
+        ])
+
+    def summary(batch):
+        author = "已設定" if batch.author_url else "未提供（普通文字）"
+        source = "已設定" if batch.source_url else "未提供（普通文字）"
+        return (f"已接收 {len(batch.records)} 個檔案，尚未上傳 R2。\n"
+                f"作者連結：{author}\nE站連結：{source}\n\n"
+                "可先設定連結，或直接選擇上傳；也可繼續傳送圖片，傳完輸入 /publish。")
 
     def sweep():
         for key, batch in list(batches.items()):
@@ -256,7 +290,67 @@ def register(application, runtime):
             batch.pending -= 1
             batch.reserved_bytes -= size
         if any(path == target for _, path in batch.records) and status is not None:
-            await status.edit_text(f"已接收 {len(batch.records)} 個檔案。傳完後輸入 /publish 製作，或 /cancel_upload 取消。")
+            await status.edit_text(summary(batch), reply_markup=keyboard(batch))
+
+    async def choose(update, context):
+        key = owner(update)
+        query = update.callback_query
+        if key is None:
+            await query.answer("此功能僅供可使用 bot 的私聊使用者操作。", show_alert=True)
+            return
+        parts = (query.data or "").split("|")
+        batch = batches.get(key)
+        if len(parts) != 3 or batch is None or parts[1] != batch.token:
+            await query.answer("這份作品的選項已失效，請重新傳送檔案。", show_alert=True)
+            return
+        action = parts[2]
+        if batch.busy or batch.pending:
+            await query.answer("檔案仍在接收或製作中，請稍候。", show_alert=True)
+            return
+        await query.answer()
+        if action == "cancel":
+            await query.edit_message_reply_markup(reply_markup=None)
+            return await cancel(update, context)
+        if action == "publish":
+            batch.awaiting_link = ""
+            await query.edit_message_reply_markup(reply_markup=None)
+            return await publish(update, context)
+        if action in {"author", "source"}:
+            batch.awaiting_link = action
+            batch.touched = time.monotonic()
+            label = "作者" if action == "author" else "E站"
+            await update.effective_message.reply_text(f"請傳送{label}連結；不提供可按下方略過，保留普通文字。",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("略過／移除連結",
+                    callback_data=f"lu|{batch.token}|clear_{action}")]]))
+        elif action in {"clear_author", "clear_source"}:
+            setattr(batch, action.removeprefix("clear_") + "_url", "")
+            batch.awaiting_link = ""
+            await query.edit_message_reply_markup(reply_markup=None)
+            await update.effective_message.reply_text(summary(batch), reply_markup=keyboard(batch))
+
+    class LinkReplyFilter(filters.MessageFilter):
+        def filter(self, message):
+            if message.chat.type != "private" or not message.from_user:
+                return False
+            batch = batches.get((message.chat.id, message.from_user.id))
+            return bool(batch and batch.awaiting_link and not batch.busy)
+
+    async def receive_link(update, context):
+        key = owner(update)
+        if key is None:
+            return
+        batch = batches.get(key)
+        if batch is None or not batch.awaiting_link or batch.busy:
+            return
+        try:
+            value = optional_link(update.effective_message.text or "")
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        setattr(batch, batch.awaiting_link + "_url", value)
+        batch.awaiting_link = ""
+        batch.touched = time.monotonic()
+        await update.effective_message.reply_text(summary(batch), reply_markup=keyboard(batch))
 
     async def cancel(update, context):
         key = owner(update)
@@ -288,6 +382,7 @@ def register(application, runtime):
             return await message.reply_text("請先傳送 ZIP／CBZ、圖片或圖片文件，再輸入 /publish。")
         if batch.pending or batch.busy:
             return await message.reply_text("檔案仍在接收或製作中，請稍候。")
+        batch.awaiting_link = ""
         with runtime["RequestGuard"](key[1]) as guard:
             if not guard.ok:
                 return await message.reply_text(runtime["busy_message"](key[1]))
@@ -398,9 +493,11 @@ def register(application, runtime):
     image_filter = filters.PHOTO | filters.Document.IMAGE
     for extension in sorted(IMAGE_SUFFIXES | {".zip", ".cbz"}):
         image_filter |= filters.Document.FileExtension(extension.lstrip("."))
-    application.add_handler(CommandHandler("publish", publish))
-    application.add_handler(CommandHandler("cancel_upload", cancel))
-    application.add_handler(MessageHandler(image_filter, collect))
+    application.add_handler(CallbackQueryHandler(choose, pattern=r"^lu\|"))
+    application.add_handler(CommandHandler("publish", publish, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("cancel_upload", cancel, filters=filters.ChatType.PRIVATE))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & LinkReplyFilter(), receive_link))
+    application.add_handler(MessageHandler(image_filter & filters.ChatType.PRIVATE, collect))
     previous_shutdown = application.post_shutdown
 
     async def shutdown(app):

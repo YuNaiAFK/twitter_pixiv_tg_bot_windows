@@ -158,6 +158,8 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.publish = next(handler.callback for handler in self.handlers if "publish" in getattr(handler, "commands", []))
         self.cancel = next(handler.callback for handler in self.handlers if "cancel_upload" in getattr(handler, "commands", []))
         self.collect = self.handlers[-1].callback
+        self.choose = self.handlers[0].callback
+        self.receive_link = self.handlers[-2].callback
         self.settings = r2.R2Settings("account", "key", "secret", "bucket", "https://img.example")
         self.page = patch.object(uploads, "create_page", return_value=NS(url="https://telegra.ph/work"))
         self.create_page = self.page.start()
@@ -187,6 +189,85 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLessEqual(max(image.size), 1280)
         return r2.UploadReport(total=len(indexes), results=[
             r2.UploadResult(index, public_url=f"https://img.example/{index}") for index in indexes])
+
+    def callback(self, message_update, data, user=1):
+        update = self.update(user=user)
+        update.effective_message = message_update.effective_message
+        update.callback_query = NS(data=data, answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
+        return update
+
+    async def test_receiving_archive_waits_for_upload_choice(self):
+        update = self.update("work.zip")
+        with patch.object(r2, "upload_many", side_effect=self.upload_ok) as upload:
+            await self.collect(update, None)
+            upload.assert_not_called()
+            self.create_page.assert_not_called()
+        markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].text, "上傳並製作")
+        cancellation = self.callback(update, markup.inline_keyboard[0][1].callback_data)
+        await self.choose(cancellation, None)
+        self.assertFalse((self.root / "batch0").exists())
+
+    async def test_links_are_optional_and_used_by_upload_button(self):
+        update = self.update("work.png")
+        await self.collect(update, None)
+        markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
+        for position, url in ((0, "https://artist.example/profile?a=1&b=2"),
+                              (1, "https://e-hentai.org/g/123/test/")):
+            await self.choose(self.callback(update, markup.inline_keyboard[1][position].callback_data), None)
+            reply = self.update()
+            reply.effective_message.text = url
+            await self.receive_link(reply, None)
+        published = self.callback(update, markup.inline_keyboard[0][0].callback_data)
+        with patch.object(r2, "upload_many", side_effect=self.upload_ok):
+            await self.choose(published, None)
+        caption = published.effective_message.reply_photo.call_args.kwargs["caption"]
+        self.assertIn('href="https://artist.example/profile?a=1&amp;b=2">作者</a>', caption)
+        self.assertIn('href="https://e-hentai.org/g/123/test/">E站</a>', caption)
+
+    async def test_invalid_link_and_skip_leave_plain_text(self):
+        update = self.update("work.png")
+        await self.collect(update, None)
+        markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
+        callback = self.callback(update, markup.inline_keyboard[1][0].callback_data)
+        await self.choose(callback, None)
+        prompt_markup = callback.effective_message.reply_text.call_args.kwargs["reply_markup"]
+        reply = self.update()
+        reply.effective_message.text = "javascript:alert(1)"
+        await self.receive_link(reply, None)
+        self.assertIn("http://", reply.effective_message.reply_text.call_args.args[0])
+        await self.choose(self.callback(update, prompt_markup.inline_keyboard[0][0].callback_data), None)
+        published = self.update()
+        with patch.object(r2, "upload_many", side_effect=self.upload_ok):
+            await self.publish(published, None)
+        caption = published.effective_message.reply_photo.call_args.kwargs["caption"]
+        self.assertEqual(caption.count("<a "), 1)
+        self.assertIn("[ 作者 ] / [ E站 ]", caption)
+
+    async def test_old_or_other_user_buttons_cannot_publish(self):
+        update = self.update("work.png")
+        await self.collect(update, None)
+        markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
+        data = markup.inline_keyboard[0][0].callback_data
+        await self.choose(self.callback(update, data, user=99), None)
+        await self.cancel(self.update(), None)
+        await self.collect(self.update("new.png"), None)
+        await self.choose(self.callback(update, data), None)
+        self.create_page.assert_not_called()
+
+    async def test_group_uploads_and_commands_are_not_handled(self):
+        from datetime import datetime, timezone
+        from telegram import Chat, Document, Message, Update, User
+        update = self.update("work.png")
+        update.effective_chat.type = "supergroup"
+        await self.collect(update, None)
+        await self.publish(update, None)
+        await self.cancel(update, None)
+        self.assertEqual(self.sequence, 0)
+        update.effective_message.reply_text.assert_not_called()
+        message = Message(message_id=1, date=datetime.now(timezone.utc), chat=Chat(-1, "supergroup"),
+                          from_user=User(1, "User", False), document=Document("a", "b", file_name="work.zip"))
+        self.assertFalse(self.handlers[-1].check_update(Update(1, message=message)))
 
     async def test_direct_images_publish_in_filename_order_and_cleanup(self):
         await self.collect(self.update("10.png", data=picture(color="blue")), None)
