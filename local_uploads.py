@@ -1,4 +1,4 @@
-"""將使用者上傳的圖片或 ZIP／CBZ 製作為 R2 圖片與 Telegraph。"""
+"""將使用者上傳的圖片或 ZIP／CBZ／7z／RAR 製作為 R2 圖片與 Telegraph。"""
 import asyncio
 import html
 import io
@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+ARCHIVE_SUFFIXES = {".zip", ".cbz", ".7z", ".rar"}
 MAX_FILES = 500
 MAX_INPUT_BYTES = 512 * 1024 * 1024
 MAX_FRAME_BYTES = 64 * 1024 * 1024
@@ -47,7 +48,7 @@ def prepare_image(data, destination):
 
 
 def prepare_inputs(records, output_dir):
-    """回傳（排序用原始檔名，壓縮副本）；ZIP 路徑完全不寫入檔案系統。"""
+    """回傳（排序用原始檔名，壓縮副本）；壓縮檔路徑完全不寫入檔案系統。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     entries = []
     expanded = 0
@@ -79,6 +80,15 @@ def prepare_inputs(records, output_dir):
                         raise ValueError("單張圖片超過大小上限")
                     prepare_image(data, target)
                     entries.append((info.filename, target))
+        elif Path(name).suffix.lower() in {".7z", ".rar"}:
+            from archive_images import read_images
+            for member_name, data in read_images(source, IMAGE_SUFFIXES,
+                    max_files=MAX_FILES - len(entries), max_image_bytes=MAX_FRAME_BYTES,
+                    max_total_bytes=MAX_EXPANDED_BYTES - expanded):
+                expanded += len(data)
+                target = output_dir / f"{len(entries):05}.jpg"
+                prepare_image(data, target)
+                entries.append((member_name, target))
         else:
             if source.stat().st_size > MAX_FRAME_BYTES:
                 raise ValueError("單張圖片超過 64 MB，請縮小後再傳送")
@@ -514,7 +524,7 @@ def register(application, runtime):
         batch = batches.get(key)
         message = update.effective_message
         if not batch or not batch.records:
-            return await message.reply_text("請先傳送 ZIP／CBZ、圖片或圖片文件，再輸入 /publish。")
+            return await message.reply_text("請先傳送 ZIP／CBZ／7z／RAR、圖片或圖片文件，再輸入 /publish。")
         if batch.pending or batch.busy:
             return await set_panel(batch, message, "檔案仍在接收或製作中，請稍候。")
         batch.awaiting_link = ""
@@ -634,18 +644,18 @@ def register(application, runtime):
             source = getattr(message, "reply_to_message", None)
             if source is not None:
                 document = getattr(source, "document", None)
-                if document is None or Path(document.file_name or "").suffix.lower() not in {".zip", ".cbz"}:
-                    return await message.reply_text("群組僅支援回覆 ZIP／CBZ 壓縮檔製作；圖片請傳到 bot 私聊。")
+                if document is None or Path(document.file_name or "").suffix.lower() not in ARCHIVE_SUFFIXES:
+                    return await message.reply_text("群組僅支援回覆 ZIP／CBZ／7z／RAR 壓縮檔製作；圖片請傳到 bot 私聊。")
                 batch = batches.get(key)
                 if batch and source.message_id in batch.source_message_ids:
                     return await set_panel(batch, message, summary(batch), reply_markup=keyboard(batch))
                 return await collect(update, context, source=source)
             if key not in batches:
-                return await message.reply_text("請回覆群組內的 ZIP／CBZ 訊息，輸入 /publish@機器人名稱 開始製作。")
+                return await message.reply_text("請回覆群組內的 ZIP／CBZ／7z／RAR 訊息，輸入 /publish@機器人名稱 開始製作。")
         return await publish(update, context)
 
     image_filter = filters.PHOTO | filters.Document.IMAGE
-    for extension in sorted(IMAGE_SUFFIXES | {".zip", ".cbz"}):
+    for extension in sorted(IMAGE_SUFFIXES | ARCHIVE_SUFFIXES):
         image_filter |= filters.Document.FileExtension(extension.lstrip("."))
     application.add_handler(CallbackQueryHandler(choose, pattern=r"^lu\|"))
     application.add_handler(CommandHandler("publish", start_or_publish))

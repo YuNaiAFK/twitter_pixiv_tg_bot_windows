@@ -487,3 +487,9 @@ TELEGRAM_LOCAL=                 # 只有伺服器以 --local 執行時才設 1
 `run_local_api.py` 是一層薄而可讀的包裝：有 Docker 時優先用容器（不需要編譯器），會讀 `.env`、
 檢查憑證、探測 8081 是否已有東西在回應、印出指令列時遮蔽 `api_hash`，並回報缺什麼。
 它**不**負責編譯伺服器。
+
+## 7z 與 RAR 解壓元件
+
+安裝 Python 依賴後即可使用：`python -m pip install "libarchive-c>=5.3,<6"`。程式會使用 Windows 系統 `System32/archiveint.dll`；若系統未提供，請安裝 libarchive 並以 `LIBARCHIVE` 指定其 DLL 完整路徑。ZIP／CBZ 仍使用 Python 內建解壓。
+
+以串流逐張讀取圖片，不會直接還原壓縮檔內路徑；沿用原有張數、單張與解壓大小上限。加密、不完整分卷或無法解碼的壓縮檔會在原操作訊息顯示錯誤，請先提供完整且未加密的單一檔案。

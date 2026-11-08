@@ -263,6 +263,15 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         callback.callback_query.answer.assert_awaited_once_with()
         callback.effective_message.reply_text.assert_not_called()
 
+    async def test_private_attachment_filter_accepts_rar_and_7z(self):
+        from datetime import datetime, timezone
+        from telegram import Chat, Document, Message, Update, User
+        for filename in ("作品.7z", "作品.rar", "作品.RAR"):
+            with self.subTest(filename=filename):
+                message = Message(message_id=1, date=datetime.now(timezone.utc), chat=Chat(1, "private"),
+                    from_user=User(1, "Admin", False), document=Document("file", "unique", file_name=filename))
+                self.assertTrue(self.handlers[-1].check_update(Update(1, message=message)))
+
     async def test_revoked_admin_cannot_continue_existing_batch(self):
         update = self.update("work.png")
         await self.collect(update, None)

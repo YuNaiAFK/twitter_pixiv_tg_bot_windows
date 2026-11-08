@@ -3436,7 +3436,7 @@ def commands_hint(user_id: int | None = None) -> str:
     README, not in a reply every stranger can read.
     """
     upload_hint = (
-        "• 本機檔案（僅管理員）：私聊傳圖片／壓縮檔；群組回覆 ZIP／CBZ 並輸入 /publish@機器人名稱\n"
+        "• 本機檔案（僅管理員）：私聊傳圖片／壓縮檔；群組回覆 ZIP／CBZ／7z／RAR 並輸入 /publish@機器人名稱\n"
         "  /cancel_upload 可取消待製作的檔案。\n"
     ) if user_id is not None and user_is_admin(user_id) else ""
     return (

@@ -13,3 +13,6 @@ websockets>=12.0
 # Pinned for its CA bundle: versions before 2026.10.19 shipped a root whose
 # intermediate keys were compromised and revoked.
 certifi>=2026.10.19
+
+# 7z / RAR streaming decoder (uses the system libarchive library).
+libarchive-c>=5.3,<6
