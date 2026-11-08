@@ -186,6 +186,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             def __exit__(self, *args): pass
 
         self.runtime = dict(user_is_allowed=lambda *args: True, make_work_dir=work_dir,
+            user_is_admin=lambda user: True,
             BASE_DIR=self.root,
             extract_urls=lambda text: [], detect_media_platform=lambda url: None,
             ehentai=NS(is_gallery_url=lambda url: False), handle_message=AsyncMock(),
@@ -247,6 +248,68 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         cancellation = self.callback(update, markup.inline_keyboard[0][1].callback_data)
         await self.choose(cancellation, None)
         self.assertFalse((self.root / "batch0").exists())
+
+    async def test_non_admin_files_commands_and_buttons_are_silent(self):
+        self.runtime["user_is_admin"] = lambda user: user == 1
+        update = self.update("work.zip", user=2)
+        await self.collect(update, None)
+        await self.publish(update, None)
+        await self.cancel(update, None)
+        self.assertEqual(self.sequence, 0)
+        update.effective_message.reply_text.assert_not_called()
+        update.effective_message.document.get_file.assert_not_called()
+        callback = self.callback(update, "lu|stale|publish", user=2)
+        await self.choose(callback, None)
+        callback.callback_query.answer.assert_awaited_once_with()
+        callback.effective_message.reply_text.assert_not_called()
+
+    async def test_revoked_admin_cannot_continue_existing_batch(self):
+        update = self.update("work.png")
+        await self.collect(update, None)
+        panel = update.effective_message.reply_text.return_value
+        menu = panel.edit_text.call_args.kwargs["reply_markup"]
+        count = panel.edit_text.await_count
+        self.runtime["user_is_admin"] = lambda user: False
+        await self.choose(self.callback(update, menu.inline_keyboard[0][0].callback_data), None)
+        await self.publish(self.update(), None)
+        self.assertEqual(panel.edit_text.await_count, count)
+        self.create_page.assert_not_called()
+
+    async def test_non_admin_media_caption_still_uses_normal_link_parser(self):
+        self.runtime["user_is_admin"] = lambda user: False
+        self.runtime["extract_urls"] = lambda text: ["https://x.com/user/status/1"]
+        self.runtime["detect_media_platform"] = lambda url: "twitter"
+        update = self.update("image.png", user=2)
+        update.effective_message.caption = "https://x.com/user/status/1"
+        await self.collect(update, None)
+        self.runtime["handle_message"].assert_awaited_once_with(update, None)
+        self.assertEqual(self.sequence, 0)
+
+    async def test_public_menus_and_help_hide_upload_commands(self):
+        import ast
+        import logging
+        from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+        from telegram.error import TelegramError
+        tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
+        ns = dict(Application=object, BotCommand=BotCommand, BotCommandScopeAllPrivateChats=BotCommandScopeAllPrivateChats,
+            BotCommandScopeChat=BotCommandScopeChat, TelegramError=TelegramError,
+            BOT_DESCRIPTION="test", BOT_SHORT_DESCRIPTION="test", AUTHORIZATION=NS(admins={1}),
+            logger=logging.getLogger("menu-test"), user_is_admin=lambda user: user == 1,
+            MAX_FILES=20, SUPPORTED_SITES_NOTICE="支援的連結")
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"commands_hint", "post_init"}:
+                exec(compile(ast.Module(body=[node], type_ignores=[]), "<actual-command-menu>", "exec"), ns)
+        bot = NS(set_my_description=AsyncMock(), set_my_short_description=AsyncMock(), set_my_commands=AsyncMock())
+        await ns["post_init"](NS(bot=bot))
+        for call in bot.set_my_commands.call_args_list:
+            commands = {command.command for command in call.args[0]}
+            if isinstance(call.kwargs.get("scope"), BotCommandScopeChat):
+                self.assertTrue({"publish", "cancel_upload"} <= commands)
+            else:
+                self.assertFalse({"publish", "cancel_upload"} & commands)
+        self.assertNotIn("/publish", ns["commands_hint"](2))
+        self.assertNotIn("/cancel_upload", ns["commands_hint"]())
+        self.assertIn("/publish", ns["commands_hint"](1))
 
     async def test_entire_workflow_edits_one_message_including_final_cover(self):
         first, second = self.update("1.png"), self.update("2.png")

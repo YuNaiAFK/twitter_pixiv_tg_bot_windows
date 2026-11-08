@@ -290,6 +290,7 @@ def register(application, runtime):
     def owner(update):
         message, user, chat = update.effective_message, update.effective_user, update.effective_chat
         if (not message or not user or not chat or chat.type not in {"private", "group", "supergroup"}
+                or not runtime["user_is_admin"](user.id)
                 or not runtime["user_is_allowed"](user.id, chat.id, chat.type)):
             return None
         return (chat.id, user.id)
@@ -389,7 +390,7 @@ def register(application, runtime):
         key = owner(update)
         query = update.callback_query
         if key is None:
-            await query.answer("目前無法在這個聊天使用此功能。", show_alert=True)
+            await query.answer()
             return
         parts = (query.data or "").split("|")
         batch = batches.get(key)
@@ -443,7 +444,8 @@ def register(application, runtime):
 
     class LinkReplyFilter(filters.MessageFilter):
         def filter(self, message):
-            if message.chat.type not in {"private", "group", "supergroup"} or not message.from_user:
+            if (message.chat.type not in {"private", "group", "supergroup"} or not message.from_user
+                    or not runtime["user_is_admin"](message.from_user.id)):
                 return False
             batch = batches.get((message.chat.id, message.from_user.id))
             if not batch or not batch.awaiting_link or batch.busy:

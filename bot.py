@@ -3427,7 +3427,7 @@ def make_work_dir() -> Path:
 
 # -------------------- Telegram commands --------------------
 
-def commands_hint() -> str:
+def commands_hint(user_id: int | None = None) -> str:
     """
     Visitor-facing usage text.
 
@@ -3435,13 +3435,16 @@ def commands_hint() -> str:
     deployment notes such as the @BotFather privacy-mode step belong in the
     README, not in a reply every stranger can read.
     """
+    upload_hint = (
+        "• 本機檔案（僅管理員）：私聊傳圖片／壓縮檔；群組回覆 ZIP／CBZ 並輸入 /publish@機器人名稱\n"
+        "  /cancel_upload 可取消待製作的檔案。\n"
+    ) if user_id is not None and user_is_admin(user_id) else ""
     return (
         "直接把連結傳給我就行：\n"
         "• X/Twitter 連結：圖片傳回聊天\n"
         f"• Pixiv 連結：傳送原圖檔案（單個作品最多 {MAX_FILES} 張）\n"
         "• e-hentai 連結：整理成 Telegraph 頁面，附標籤分類\n"
-        "• 本機檔案：私聊傳圖片／壓縮檔；群組回覆 ZIP／CBZ 並輸入 /publish@機器人名稱\n"
-        "  /cancel_upload 可取消待製作的檔案。\n"
+        f"{upload_hint}"
         "\n每則結果都會附上原始連結。\n"
         "連結可以寫在文字裡，也可以寫在圖片的說明文字裡。\n"
         f"{SUPPORTED_SITES_NOTICE}"
@@ -3984,14 +3987,14 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "你好！我是 X/Twitter + Pixiv 解析機器人。\n\n" + commands_hint(),
+        "你好！我是 X/Twitter + Pixiv 解析機器人。\n\n" + commands_hint(getattr(update.effective_user, "id", None)),
         link_preview_options=source_link_options(),
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        commands_hint(),
+        commands_hint(getattr(update.effective_user, "id", None)),
         link_preview_options=source_link_options(),
     )
 
@@ -4544,6 +4547,11 @@ async def demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     changed = AUTHORIZATION.demote(target)
     saved = save_authorization()
+    if changed:
+        try:
+            await context.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=target))
+        except TelegramError:
+            logger.warning("無法清除已移除管理員的專屬指令選單。")
     note = "已取消管理員身分。" if changed else "本來就不是管理員。"
     warning = "" if saved else "\n⚠ 無法寫入授權檔，這個變更在重新啟動後會消失。"
     await message.reply_text(f"{target}：{note}{warning}\n\n{authorization_report()}")
@@ -8861,15 +8869,11 @@ async def post_init(application: Application):
         BotCommand("start", "開始使用"),
         BotCommand("help", "使用說明"),
         BotCommand("id", "顯示你的 ID"),
-        BotCommand("publish", "回覆 ZIP／CBZ 製作 Telegraph（圖片限私聊）"),
-        BotCommand("cancel_upload", "取消待製作的本機檔案"),
     ])
     await application.bot.set_my_commands([
         BotCommand("start", "開始使用"),
         BotCommand("help", "使用說明"),
         BotCommand("id", "顯示你的 ID"),
-        BotCommand("publish", "將上傳的圖片或壓縮檔製作成 Telegraph"),
-        BotCommand("cancel_upload", "取消待製作的本機檔案"),
     ], scope=BotCommandScopeAllPrivateChats())
 
     # The admin menu. There is no longer a separate "operator" tier: the list commands became
