@@ -198,6 +198,8 @@ class Batch:
     page_text: str = ""
     page_link: str = ""
     awaiting_link: str = ""
+    input_prompt_id: int = 0
+    source_message_ids: set = field(default_factory=set)
     total_bytes: int = 0
     reserved_bytes: int = 0
     touched: float = field(default_factory=time.monotonic)
@@ -261,14 +263,14 @@ async def download_file(media, target, runtime):
 
 
 def register(application, runtime):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
     batches = {}
     profiles = PageProfiles(runtime["BASE_DIR"] / "local_upload_profiles.json")
 
     def owner(update):
         message, user, chat = update.effective_message, update.effective_user, update.effective_chat
-        if (not message or not user or not chat or chat.type != "private"
+        if (not message or not user or not chat or chat.type not in {"private", "group", "supergroup"}
                 or not runtime["user_is_allowed"](user.id, chat.id, chat.type)):
             return None
         return (chat.id, user.id)
@@ -290,17 +292,19 @@ def register(application, runtime):
                 f"頁面文字（已記憶）：{batch.page_text[:160] or '未設定'}\n"
                 f"文字連結（已記憶）：{batch.page_link[:160] or '未設定'}\n"
                 "製作日期：建立頁面時自動填入（UTC+8）。\n\n"
-                "可先設定連結，或直接選擇上傳；也可繼續傳送圖片，傳完輸入 /publish。")
+                "可先設定文字與連結，再按「上傳並製作」；不製作可按取消。")
 
     def sweep():
         for key, batch in list(batches.items()):
             if not batch.busy and not batch.pending and time.monotonic() - batch.touched > 86400:
                 cleanup_batch(batches.pop(key))
 
-    async def collect(update, context):
+    async def collect(update, context, source=None):
         message = update.effective_message
+        if update.effective_chat.type != "private" and source is None:
+            return
         # 保留原本「圖片說明中附作品連結」的解析行為。
-        if any(runtime["detect_media_platform"](url) or runtime["ehentai"].is_gallery_url(url)
+        if source is None and any(runtime["detect_media_platform"](url) or runtime["ehentai"].is_gallery_url(url)
                for url in runtime["extract_urls"](message.caption or "")):
             return await runtime["handle_message"](update, context)
         key = owner(update)
@@ -316,7 +320,8 @@ def register(application, runtime):
                 await message.reply_text("目前待製作作品較多，請稍後再試。")
                 return
             batch = batches[key] = Batch(runtime["make_work_dir"](), **profiles.get(key[1]))
-        media = message.document or message.photo[-1]
+        incoming = source or message
+        media = incoming.document or incoming.photo[-1]
         name = getattr(media, "file_name", None) or f"圖片_{message.message_id}.jpg"
         name = name.replace("\\", "/").rsplit("/", 1)[-1]
         if not batch.title:
@@ -339,6 +344,8 @@ def register(application, runtime):
             if batch.total_bytes + actual_size > MAX_INPUT_BYTES:
                 raise ValueError("下載檔案超過大小上限")
             batch.records.append((name, target))
+            if source is not None:
+                batch.source_message_ids.add(source.message_id)
             batch.total_bytes += actual_size
             batch.touched = time.monotonic()
         except Exception as exc:
@@ -356,7 +363,7 @@ def register(application, runtime):
         key = owner(update)
         query = update.callback_query
         if key is None:
-            await query.answer("此功能僅供可使用 bot 的私聊使用者操作。", show_alert=True)
+            await query.answer("目前無法在這個聊天使用此功能。", show_alert=True)
             return
         parts = (query.data or "").split("|")
         batch = batches.get(key)
@@ -388,7 +395,12 @@ def register(application, runtime):
             else:
                 label = "作者" if action == "author" else "E站"
                 prompt = f"請傳送{label}連結；不提供可按下方略過，保留普通文字。"
-            await update.effective_message.reply_text(prompt,
+            if update.effective_chat.type != "private":
+                sent = await update.effective_message.reply_text(html.escape(prompt) +
+                    f'\n<a href="tg://user?id={key[1]}">請回覆這則提示輸入內容。</a>',
+                    parse_mode="HTML", reply_markup=ForceReply(selective=True))
+                batch.input_prompt_id = sent.message_id
+            await update.effective_message.reply_text(prompt if update.effective_chat.type == "private" else "不提供時可按下方清除／略過。",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("清除記憶設定" if action.startswith("page_") else "略過／移除連結",
                     callback_data=f"lu|{batch.token}|clear_{action}")]]))
         elif action in {"clear_author", "clear_source", "clear_page_text", "clear_page_link"}:
@@ -407,10 +419,13 @@ def register(application, runtime):
 
     class LinkReplyFilter(filters.MessageFilter):
         def filter(self, message):
-            if message.chat.type != "private" or not message.from_user:
+            if message.chat.type not in {"private", "group", "supergroup"} or not message.from_user:
                 return False
             batch = batches.get((message.chat.id, message.from_user.id))
-            return bool(batch and batch.awaiting_link and not batch.busy)
+            if not batch or not batch.awaiting_link or batch.busy:
+                return False
+            return message.chat.type == "private" or (
+                bool(message.reply_to_message) and message.reply_to_message.message_id == batch.input_prompt_id)
 
     async def receive_link(update, context):
         key = owner(update)
@@ -419,6 +434,10 @@ def register(application, runtime):
         batch = batches.get(key)
         if batch is None or not batch.awaiting_link or batch.busy:
             return
+        if update.effective_chat.type != "private":
+            reply = getattr(update.effective_message, "reply_to_message", None)
+            if reply is None or reply.message_id != batch.input_prompt_id:
+                return
         try:
             text = (update.effective_message.text or "").strip()
             if batch.awaiting_link == "page_text":
@@ -580,12 +599,31 @@ def register(application, runtime):
                 batch.creating_page = False
                 batch.touched = time.monotonic()
 
+    async def start_or_publish(update, context):
+        key = owner(update)
+        if key is None:
+            return
+        message = update.effective_message
+        if update.effective_chat.type != "private":
+            source = getattr(message, "reply_to_message", None)
+            if source is not None:
+                document = getattr(source, "document", None)
+                if document is None or Path(document.file_name or "").suffix.lower() not in {".zip", ".cbz"}:
+                    return await message.reply_text("群組僅支援回覆 ZIP／CBZ 壓縮檔製作；圖片請傳到 bot 私聊。")
+                batch = batches.get(key)
+                if batch and source.message_id in batch.source_message_ids:
+                    return await message.reply_text(summary(batch), reply_markup=keyboard(batch))
+                return await collect(update, context, source=source)
+            if key not in batches:
+                return await message.reply_text("請回覆群組內的 ZIP／CBZ 訊息，輸入 /publish@機器人名稱 開始製作。")
+        return await publish(update, context)
+
     image_filter = filters.PHOTO | filters.Document.IMAGE
     for extension in sorted(IMAGE_SUFFIXES | {".zip", ".cbz"}):
         image_filter |= filters.Document.FileExtension(extension.lstrip("."))
     application.add_handler(CallbackQueryHandler(choose, pattern=r"^lu\|"))
-    application.add_handler(CommandHandler("publish", publish, filters=filters.ChatType.PRIVATE))
-    application.add_handler(CommandHandler("cancel_upload", cancel, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("publish", start_or_publish))
+    application.add_handler(CommandHandler("cancel_upload", cancel))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & LinkReplyFilter(), receive_link))
     application.add_handler(MessageHandler(image_filter & filters.ChatType.PRIVATE, collect))
     previous_shutdown = application.post_shutdown

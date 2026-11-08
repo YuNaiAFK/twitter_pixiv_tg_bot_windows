@@ -208,9 +208,9 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
 
     def update(self, name=None, user=1, chat=2, data=None):
-        status = NS(edit_text=AsyncMock())
+        status = NS(message_id=900, edit_text=AsyncMock())
         message = NS(document=None, photo=[], caption=None, message_id=10,
-                     reply_text=AsyncMock(return_value=status), reply_photo=AsyncMock())
+                     reply_text=AsyncMock(return_value=status), reply_photo=AsyncMock(), reply_to_message=None)
         if name:
             source = self.root / f"source{os.urandom(4).hex()}"
             source.write_bytes(data if data is not None else picture())
@@ -231,6 +231,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     def callback(self, message_update, data, user=1):
         update = self.update(user=user)
         update.effective_message = message_update.effective_message
+        update.effective_chat = message_update.effective_chat
         update.callback_query = NS(data=data, answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
         return update
 
@@ -327,19 +328,70 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.choose(self.callback(update, data), None)
         self.create_page.assert_not_called()
 
-    async def test_group_uploads_and_commands_are_not_handled(self):
+    async def test_group_images_are_not_automatically_collected(self):
         from datetime import datetime, timezone
         from telegram import Chat, Document, Message, Update, User
         update = self.update("work.png")
         update.effective_chat.type = "supergroup"
         await self.collect(update, None)
-        await self.publish(update, None)
-        await self.cancel(update, None)
         self.assertEqual(self.sequence, 0)
         update.effective_message.reply_text.assert_not_called()
         message = Message(message_id=1, date=datetime.now(timezone.utc), chat=Chat(-1, "supergroup"),
                           from_user=User(1, "User", False), document=Document("a", "b", file_name="work.zip"))
         self.assertFalse(self.handlers[-1].check_update(Update(1, message=message)))
+
+    async def test_group_reply_archive_waits_for_choice_then_publishes(self):
+        with io.BytesIO() as buffer:
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("1.png", picture())
+            source = self.update("群組作品.zip", user=2, data=buffer.getvalue()).effective_message
+        command = self.update(chat=-100)
+        command.effective_chat.type = "supergroup"
+        command.effective_message.reply_to_message = source
+        await self.publish(command, None)
+        self.create_page.assert_not_called()
+        menu = command.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
+        self.assertEqual(menu.inline_keyboard[0][0].text, "上傳並製作")
+        # 重複回覆同一個壓縮檔，不再加入一次。
+        await self.publish(command, None)
+        callback = self.callback(command, menu.inline_keyboard[0][0].callback_data)
+        with patch.object(r2, "upload_many", side_effect=self.upload_ok):
+            await self.choose(callback, None)
+        self.create_page.assert_called_once_with("群組作品", ["https://img.example/0"], "", "")
+        callback.effective_message.reply_photo.assert_awaited_once()
+
+    async def test_group_rejects_image_reply_and_unauthorized_group(self):
+        update = self.update(chat=-100)
+        update.effective_chat.type = "group"
+        update.effective_message.reply_to_message = self.update("image.png").effective_message
+        await self.publish(update, None)
+        self.assertIn("圖片請傳到", update.effective_message.reply_text.call_args.args[0])
+        self.assertEqual(self.sequence, 0)
+        self.runtime["user_is_allowed"] = lambda *args: False
+        update.effective_message.reply_text.reset_mock()
+        await self.publish(update, None)
+        update.effective_message.reply_text.assert_not_called()
+
+    async def test_group_setting_requires_reply_to_prompt_from_initiator(self):
+        command = self.update(chat=-100)
+        command.effective_chat.type = "supergroup"
+        command.effective_message.reply_to_message = self.update("work.zip").effective_message
+        await self.publish(command, None)
+        menu = command.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
+        callback = self.callback(command, menu.inline_keyboard[2][0].callback_data)
+        await self.choose(callback, None)
+        reply = self.update(chat=-100)
+        reply.effective_chat.type = "supergroup"
+        reply.effective_message.text = "群組文字"
+        await self.receive_link(reply, None)
+        self.assertFalse((self.root / "local_upload_profiles.json").exists())
+        reply.effective_message.reply_to_message = NS(message_id=900)
+        reply.effective_user.id = 2
+        await self.receive_link(reply, None)
+        self.assertFalse((self.root / "local_upload_profiles.json").exists())
+        reply.effective_user.id = 1
+        await self.receive_link(reply, None)
+        self.assertEqual(uploads.PageProfiles(self.root / "local_upload_profiles.json").get(1)["page_text"], "群組文字")
 
     async def test_direct_images_publish_in_filename_order_and_cleanup(self):
         await self.collect(self.update("10.png", data=picture(color="blue")), None)

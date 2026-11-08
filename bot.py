@@ -3440,7 +3440,7 @@ def commands_hint() -> str:
         "• X/Twitter 連結：圖片傳回聊天\n"
         f"• Pixiv 連結：傳送原圖檔案（單個作品最多 {MAX_FILES} 張）\n"
         "• e-hentai 連結：整理成 Telegraph 頁面，附標籤分類\n"
-        "• 本機圖片／ZIP／CBZ（僅私聊）：設定可選連結後，按上傳或輸入 /publish 製作\n"
+        "• 本機檔案：私聊傳圖片／壓縮檔；群組回覆 ZIP／CBZ 並輸入 /publish@機器人名稱\n"
         "  /cancel_upload 可取消待製作的檔案。\n"
         "\n每則結果都會附上原始連結。\n"
         "連結可以寫在文字裡，也可以寫在圖片的說明文字裡。\n"
@@ -8846,6 +8846,8 @@ async def post_init(application: Application):
         BotCommand("start", "開始使用"),
         BotCommand("help", "使用說明"),
         BotCommand("id", "顯示你的 ID"),
+        BotCommand("publish", "回覆 ZIP／CBZ 製作 Telegraph（圖片限私聊）"),
+        BotCommand("cancel_upload", "取消待製作的本機檔案"),
     ])
     await application.bot.set_my_commands([
         BotCommand("start", "開始使用"),
