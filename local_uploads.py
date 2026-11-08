@@ -13,6 +13,7 @@ import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
@@ -91,8 +92,20 @@ def prepare_inputs(records, output_dir):
     return sorted(entries, key=lambda entry: natural_key(entry[0]))
 
 
-def page_content(title, urls):
+def production_date():
+    current = datetime.now(timezone(timedelta(hours=8)))
+    return f"{current.year}年{current.month}月{current.day}日"
+
+
+def page_content(title, urls, page_text="", page_link="", made_on=None):
     nodes = [{"tag": "h3", "children": [title]}]
+    children = [f"製作日期：{made_on or production_date()}"]
+    if page_link:
+        children.extend([" — ", {"tag": "a", "attrs": {"href": optional_link(page_link)},
+                                  "children": [page_text or "連結"]}])
+    elif page_text:
+        children.extend([" — ", page_text])
+    nodes.append({"tag": "p", "children": children})
     nodes.extend({"tag": "img", "attrs": {"src": url}} for url in urls)
     content = json.dumps(nodes, ensure_ascii=False)
     if len(content.encode("utf-8")) > 62 * 1024:
@@ -100,16 +113,17 @@ def page_content(title, urls):
     return content
 
 
-def create_page(title, urls):
+def create_page(title, urls, page_text="", page_link=""):
     import ehentai
     import httpx
-    content = page_content(title, urls)
+    content = page_content(title, urls, page_text, page_link)
     with httpx.Client(**ehentai.http_client_kwargs(60)) as client:
         account = client.post(f"{ehentai.TELEGRAPH_API}/createAccount", data={"short_name": "Local files"}).json()
         if not account.get("ok"):
             raise ValueError("建立 Telegraph 帳號失敗")
         return ehentai._telegraph_post("createPage", access_token=account["result"]["access_token"],
-            title=title, author_name="本機檔案", author_url="", content=content, timeout=60,
+            title=title, author_name=(page_text.splitlines()[0][:128] if page_text else "本機檔案"),
+            author_url=page_link, content=content, timeout=60,
             http_client=client)
 
 
@@ -120,6 +134,45 @@ def optional_link(value):
             or parsed.username or parsed.password or any(char.isspace() for char in value)):
         raise ValueError("請提供完整的 http:// 或 https:// 連結，或按略過。")
     return value
+
+
+class PageProfiles:
+    """各發送者的頁面文字與連結，與作品暫存分開保存。"""
+    def __init__(self, path):
+        self.path = Path(path)
+        self.values = {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("設定格式錯誤")
+            for user, profile in data.items():
+                if not isinstance(profile, dict):
+                    continue
+                text, link = profile.get("page_text", ""), profile.get("page_link", "")
+                if not isinstance(text, str) or not isinstance(link, str) or len(text) > 2000:
+                    continue
+                try:
+                    if link:
+                        optional_link(link)
+                except ValueError:
+                    continue
+                self.values[str(user)] = {"page_text": text, "page_link": link}
+        except FileNotFoundError:
+            pass
+        except (ValueError, OSError):
+            logger.warning("無法讀取頁面文字設定，請重新設定文字與連結。")
+
+    def save(self, user_id, field_name, value):
+        updated = {user: dict(profile) for user, profile in self.values.items()}
+        updated.setdefault(str(user_id), {})[field_name] = value
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(self.path)
+        self.values = updated
+
+    def get(self, user_id):
+        return dict(self.values.get(str(user_id), {}))
 
 
 def result_text(title, url, author_url="", source_url=""):
@@ -142,6 +195,8 @@ class Batch:
     token: str = field(default_factory=lambda: os.urandom(6).hex())
     author_url: str = ""
     source_url: str = ""
+    page_text: str = ""
+    page_link: str = ""
     awaiting_link: str = ""
     total_bytes: int = 0
     reserved_bytes: int = 0
@@ -209,6 +264,7 @@ def register(application, runtime):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
     batches = {}
+    profiles = PageProfiles(runtime["BASE_DIR"] / "local_upload_profiles.json")
 
     def owner(update):
         message, user, chat = update.effective_message, update.effective_user, update.effective_chat
@@ -223,13 +279,17 @@ def register(application, runtime):
         return InlineKeyboardMarkup([
             [button("上傳並製作", "publish"), button("取消", "cancel")],
             [button("作者連結", "author"), button("E站連結", "source")],
+            [button("頁面文字（記憶）", "page_text"), button("文字連結（記憶）", "page_link")],
         ])
 
     def summary(batch):
         author = "已設定" if batch.author_url else "未提供（普通文字）"
         source = "已設定" if batch.source_url else "未提供（普通文字）"
         return (f"已接收 {len(batch.records)} 個檔案，尚未上傳 R2。\n"
-                f"作者連結：{author}\nE站連結：{source}\n\n"
+                f"作者連結：{author}\nE站連結：{source}\n"
+                f"頁面文字（已記憶）：{batch.page_text[:160] or '未設定'}\n"
+                f"文字連結（已記憶）：{batch.page_link[:160] or '未設定'}\n"
+                "製作日期：建立頁面時自動填入（UTC+8）。\n\n"
                 "可先設定連結，或直接選擇上傳；也可繼續傳送圖片，傳完輸入 /publish。")
 
     def sweep():
@@ -255,7 +315,7 @@ def register(application, runtime):
             if len(batches) >= 32:
                 await message.reply_text("目前待製作作品較多，請稍後再試。")
                 return
-            batch = batches[key] = Batch(runtime["make_work_dir"]())
+            batch = batches[key] = Batch(runtime["make_work_dir"](), **profiles.get(key[1]))
         media = message.document or message.photo[-1]
         name = getattr(media, "file_name", None) or f"圖片_{message.message_id}.jpg"
         name = name.replace("\\", "/").rsplit("/", 1)[-1]
@@ -307,6 +367,9 @@ def register(application, runtime):
         if batch.busy or batch.pending:
             await query.answer("檔案仍在接收或製作中，請稍候。", show_alert=True)
             return
+        if batch.page_url and action in {"page_text", "page_link", "clear_page_text", "clear_page_link"}:
+            await query.answer("頁面已建立，請先完成傳送，再於下一份作品修改。", show_alert=True)
+            return
         await query.answer()
         if action == "cancel":
             await query.edit_message_reply_markup(reply_markup=None)
@@ -315,15 +378,29 @@ def register(application, runtime):
             batch.awaiting_link = ""
             await query.edit_message_reply_markup(reply_markup=None)
             return await publish(update, context)
-        if action in {"author", "source"}:
+        if action in {"author", "source", "page_text", "page_link"}:
             batch.awaiting_link = action
             batch.touched = time.monotonic()
-            label = "作者" if action == "author" else "E站"
-            await update.effective_message.reply_text(f"請傳送{label}連結；不提供可按下方略過，保留普通文字。",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("略過／移除連結",
+            if action == "page_text":
+                prompt = "請傳送標題下方的頁面文字（最多 2000 字），會記憶供下次套用；可按下方清除。"
+            elif action == "page_link":
+                prompt = "請傳送頁面文字要連到的完整網址，會記憶供下次套用；可按下方清除。"
+            else:
+                label = "作者" if action == "author" else "E站"
+                prompt = f"請傳送{label}連結；不提供可按下方略過，保留普通文字。"
+            await update.effective_message.reply_text(prompt,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("清除記憶設定" if action.startswith("page_") else "略過／移除連結",
                     callback_data=f"lu|{batch.token}|clear_{action}")]]))
-        elif action in {"clear_author", "clear_source"}:
-            setattr(batch, action.removeprefix("clear_") + "_url", "")
+        elif action in {"clear_author", "clear_source", "clear_page_text", "clear_page_link"}:
+            field_name = action.removeprefix("clear_")
+            field_name = field_name if field_name.startswith("page_") else field_name + "_url"
+            if field_name.startswith("page_"):
+                try:
+                    profiles.save(key[1], field_name, "")
+                except OSError:
+                    await update.effective_message.reply_text("設定無法儲存，請稍後再試；尚未清除。")
+                    return
+            setattr(batch, field_name, "")
             batch.awaiting_link = ""
             await query.edit_message_reply_markup(reply_markup=None)
             await update.effective_message.reply_text(summary(batch), reply_markup=keyboard(batch))
@@ -343,11 +420,24 @@ def register(application, runtime):
         if batch is None or not batch.awaiting_link or batch.busy:
             return
         try:
-            value = optional_link(update.effective_message.text or "")
+            text = (update.effective_message.text or "").strip()
+            if batch.awaiting_link == "page_text":
+                if not text or len(text) > 2000:
+                    raise ValueError("請提供 1 至 2000 字的頁面文字，或按清除。")
+                value = text
+            else:
+                value = optional_link(text)
         except ValueError as exc:
             await update.effective_message.reply_text(str(exc))
             return
-        setattr(batch, batch.awaiting_link + "_url", value)
+        field_name = batch.awaiting_link if batch.awaiting_link.startswith("page_") else batch.awaiting_link + "_url"
+        if field_name.startswith("page_"):
+            try:
+                profiles.save(key[1], field_name, value)
+            except OSError:
+                await update.effective_message.reply_text("設定無法儲存，請稍後重新傳送；尚未套用。")
+                return
+        setattr(batch, field_name, value)
         batch.awaiting_link = ""
         batch.touched = time.monotonic()
         await update.effective_message.reply_text(summary(batch), reply_markup=keyboard(batch))
@@ -470,7 +560,7 @@ def register(application, runtime):
                     raise ValueError("圖片上傳尚未完成，沒有建立不完整頁面")
                 await status.edit_text("圖片已完成上傳，正在建立 Telegraph……")
                 batch.creating_page = True
-                page = await asyncio.to_thread(create_page, batch.title, urls)
+                page = await asyncio.to_thread(create_page, batch.title, urls, batch.page_text, batch.page_link)
                 batch.page_url = page.url
                 await send_result(message, batch)
                 batches.pop(key, None)

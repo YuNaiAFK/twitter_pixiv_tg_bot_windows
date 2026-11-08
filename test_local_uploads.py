@@ -103,7 +103,8 @@ class PreparationTests(unittest.TestCase):
         urls = ["https://img.example/2", "https://img.example/10"]
         nodes = json.loads(uploads.page_content("作品", urls))
         self.assertEqual(nodes[0], {"tag": "h3", "children": ["作品"]})
-        self.assertEqual([node["attrs"]["src"] for node in nodes[1:]], urls)
+        self.assertTrue(nodes[1]["children"][0].startswith("製作日期："))
+        self.assertEqual([node["attrs"]["src"] for node in nodes[2:]], urls)
         with self.assertRaisesRegex(ValueError, "上限"):
             uploads.page_content("作品", ["https://img.example/" + "x" * 64000])
 
@@ -112,6 +113,42 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("&lt;作品 &amp;", text)
         self.assertEqual(text.count("<a "), 1)
         self.assertIn('>即時預覽</a> ] / [ 作者 ] / [ E站 ]', text)
+
+    def test_page_date_linked_text_below_title_before_images(self):
+        nodes = json.loads(uploads.page_content("標題", ["https://img.example/1"],
+            "書庫 <原樣文字>", "https://library.example/?a=1&b=2", made_on="2026年11月9日"))
+        self.assertEqual(nodes[0]["children"], ["標題"])
+        self.assertEqual(nodes[1]["children"][0], "製作日期：2026年11月9日")
+        self.assertEqual(nodes[1]["children"][2], {"tag": "a",
+            "attrs": {"href": "https://library.example/?a=1&b=2"}, "children": ["書庫 <原樣文字>"]})
+        self.assertEqual(nodes[2]["tag"], "img")
+        plain = json.loads(uploads.page_content("標題", [], "普通文字"))
+        self.assertIn("普通文字", plain[1]["children"])
+
+    def test_profiles_persist_and_are_isolated_per_sender(self):
+        path = self.root / "profiles.json"
+        profiles = uploads.PageProfiles(path)
+        profiles.save(1, "page_text", "書庫")
+        profiles.save(1, "page_link", "https://library.example")
+        profiles.save(2, "page_text", "另一位作者")
+        restored = uploads.PageProfiles(path)
+        self.assertEqual(restored.get(1), {"page_text": "書庫", "page_link": "https://library.example"})
+        self.assertEqual(restored.get(2), {"page_text": "另一位作者", "page_link": ""})
+        restored.save(1, "page_link", "")
+        self.assertEqual(uploads.PageProfiles(path).get(1)["page_link"], "")
+        self.assertEqual(uploads.PageProfiles(path).get(2)["page_text"], "另一位作者")
+
+    def test_native_telegraph_author_line_uses_saved_text_and_link(self):
+        import ehentai
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        client.post.return_value.json.return_value = {"ok": True, "result": {"access_token": "dummy"}}
+        with patch("httpx.Client") as factory, patch.object(ehentai, "_telegraph_post") as post:
+            factory.return_value.__enter__.return_value = client
+            uploads.create_page("作品", [], "我的書庫", "https://library.example")
+        self.assertEqual(post.call_args.kwargs["author_name"], "我的書庫")
+        self.assertEqual(post.call_args.kwargs["author_url"], "https://library.example")
+        self.assertIn("製作日期：", post.call_args.kwargs["content"])
 
     def test_local_r2_injection_reuses_duplicate_content(self):
         bucket = MemoryBucket()
@@ -148,6 +185,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             def __exit__(self, *args): pass
 
         self.runtime = dict(user_is_allowed=lambda *args: True, make_work_dir=work_dir,
+            BASE_DIR=self.root,
             extract_urls=lambda text: [], detect_media_platform=lambda url: None,
             ehentai=NS(is_gallery_url=lambda url: False), handle_message=AsyncMock(),
             RequestGuard=Guard, busy_message=lambda user: "忙碌中", gallery_semaphore=asyncio.Semaphore(1),
@@ -244,6 +282,40 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caption.count("<a "), 1)
         self.assertIn("[ 作者 ] / [ E站 ]", caption)
 
+    async def test_page_settings_reused_after_cancel_and_restart_then_clear(self):
+        update = self.update("work.png")
+        await self.collect(update, None)
+        markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
+        for position, value in ((0, "我的書庫"), (1, "https://library.example")):
+            await self.choose(self.callback(update, markup.inline_keyboard[2][position].callback_data), None)
+            reply = self.update()
+            reply.effective_message.text = value
+            await self.receive_link(reply, None)
+        await self.cancel(self.update(), None)
+        # 重新註冊模擬 bot 重啟，使用同一份磁碟設定。
+        new_handlers = []
+        new_app = NS(add_handler=new_handlers.append, post_shutdown=None)
+        uploads.register(new_app, self.runtime)
+        collect = new_handlers[-1].callback
+        publish = next(handler.callback for handler in new_handlers if "publish" in getattr(handler, "commands", []))
+        choose = new_handlers[0].callback
+        next_update = self.update("next.png")
+        await collect(next_update, None)
+        with patch.object(r2, "upload_many", side_effect=self.upload_ok):
+            await publish(self.update(), None)
+        self.create_page.assert_called_once_with("next", ["https://img.example/0"], "我的書庫", "https://library.example")
+        await collect(self.update("third.png"), None)
+        third = self.update("fourth.png")
+        await collect(third, None)
+        menu = third.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
+        callback = self.callback(third, menu.inline_keyboard[2][1].callback_data)
+        await choose(callback, None)
+        clear_menu = callback.effective_message.reply_text.call_args.kwargs["reply_markup"]
+        await choose(self.callback(third, clear_menu.inline_keyboard[0][0].callback_data), None)
+        stored = uploads.PageProfiles(self.root / "local_upload_profiles.json").get(1)
+        self.assertEqual(stored, {"page_text": "我的書庫", "page_link": ""})
+        await new_app.post_shutdown(new_app)
+
     async def test_old_or_other_user_buttons_cannot_publish(self):
         update = self.update("work.png")
         await self.collect(update, None)
@@ -286,7 +358,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             await self.publish(update, None)
         self.assertGreater(seen[0][0], 240)
         self.assertGreater(seen[1][2], 240)
-        self.create_page.assert_called_once_with("10", ["https://img.example/0", "https://img.example/1"])
+        self.create_page.assert_called_once_with("10", ["https://img.example/0", "https://img.example/1"], "", "")
         sent = update.effective_message.reply_photo.call_args.kwargs
         self.assertIn("即時預覽", sent["caption"])
         self.assertEqual(sent["parse_mode"], "HTML")
@@ -301,7 +373,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.collect(update, None)
         with patch.object(r2, "upload_many", side_effect=self.upload_ok):
             await self.publish(self.update(), None)
-        self.create_page.assert_called_once_with("我的作品", ["https://img.example/0"])
+        self.create_page.assert_called_once_with("我的作品", ["https://img.example/0"], "", "")
 
     async def test_three_failures_stop_before_telegraph(self):
         await self.collect(self.update("work.png"), None)

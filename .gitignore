@@ -36,3 +36,7 @@ _*.txt
 # 執行時登記的頻道
 channel_targets.json
 channel_targets.tmp
+
+# 使用者的 Telegraph 頁面文字與連結設定
+local_upload_profiles.json
+local_upload_profiles.tmp
