@@ -40,3 +40,6 @@ channel_targets.tmp
 # 使用者的 Telegraph 頁面文字與連結設定
 local_upload_profiles.json
 local_upload_profiles.tmp
+
+eh_channel_targets.json
+eh_channel_targets.tmp

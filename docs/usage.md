@@ -343,3 +343,9 @@ RESTART_LOG_MAX_MB=2         # restart.log 超過這個大小就輪替
 ### e-hentai 頁面與封面
 
 Telegraph 的文字僅保留原標題與日文標題，不加入標籤或畫廊資料；圖片照常依序排列。Telegram 完成訊息使用實際第一頁大圖作為封面。舊快取頁面下次解析時會原地更新版型，網址不變。
+
+### e-hentai 獨立頻道發布
+
+管理員在私聊完成 e-hentai Telegraph 後，可確認傳送完成封面與連結到 EH 頻道，5 分鐘未選擇預設不發布。一般使用者不顯示選項。
+
+以 `/ehchannels @頻道名稱` 或 `/ehchannels -100頻道ID` 登記目標；`/ehchannels` 查詢，`/ehchannels remove -100頻道ID` 移除。bot 須有該頻道的發布權限。EH 目標清單、確認選項與 Twitter 的 `/channels` 完全分開，不會自動沿用 Twitter 頻道。

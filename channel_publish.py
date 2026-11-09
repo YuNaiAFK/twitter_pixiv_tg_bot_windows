@@ -1,4 +1,4 @@
-"""管理員私聊的 X／Twitter 解析結果，經確認後複製至頻道。"""
+"""管理員私聊的 Twitter／e-hentai 解析結果，經確認後複製至頻道。"""
 import asyncio
 import json
 import logging
@@ -67,7 +67,9 @@ class Choice:
 
 
 class ChannelPublisher:
-    def __init__(self, path, is_admin):
+    def __init__(self, path, is_admin, *, label="X／Twitter", command_name="channels", prefix="cp", auto_register=True):
+        self.label, self.command_name, self.prefix = label, command_name, prefix
+        self.auto_register = auto_register
         self.path = Path(path)
         self.is_admin = is_admin
         self.channels = {}
@@ -79,7 +81,7 @@ class ChannelPublisher:
         except FileNotFoundError:
             pass
         except (ValueError, TypeError, AttributeError):
-            logger.warning("頻道設定無法讀取；請用 /channels 重新登記。")
+            logger.warning(f"頻道設定無法讀取；請用 /{self.command_name} 重新登記。")
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +98,7 @@ class ChannelPublisher:
             if channel_id in self.channels:
                 self.channels.pop(channel_id)
                 self.save()
-        elif self.is_admin(event.from_user.id):
+        elif self.auto_register and self.is_admin(event.from_user.id):
             self.channels[channel_id] = event.chat.title or str(channel_id)
             self.save()
 
@@ -109,7 +111,7 @@ class ChannelPublisher:
             try:
                 channel_id = int(args[1])
             except ValueError:
-                return await message.reply_text("請使用 /channels remove -100頻道ID。")
+                return await message.reply_text(f"請使用 /{self.command_name} remove -100頻道ID。")
             self.channels.pop(channel_id, None)
             self.save()
             return await message.reply_text("已移除該頻道的傳送選項。")
@@ -118,7 +120,7 @@ class ChannelPublisher:
             if target.startswith("-100") and target[1:].isdigit():
                 target = int(target)
             elif not target.startswith("@"):
-                return await message.reply_text("請使用 /channels @頻道名稱 或 /channels -100頻道ID。")
+                return await message.reply_text(f"請使用 /{self.command_name} @頻道名稱 或 /{self.command_name} -100頻道ID。")
             try:
                 channel = await context.bot.get_chat(target)
                 member = await context.bot.get_chat_member(channel.id, context.bot.id)
@@ -131,22 +133,23 @@ class ChannelPublisher:
                 return await message.reply_text("無法登記頻道，請確認名稱／ID，以及 bot 的發布權限。")
         lines = [f"{title}（{channel_id}）" for channel_id, title in self.channels.items()]
         await message.reply_text("已登記頻道：\n" + ("\n".join(lines) or "尚無頻道") +
-            "\n\n將 bot 加入頻道並授予發布權限即可自動登記。\n"
-            "也可使用 /channels @頻道名稱 或 /channels -100頻道ID 登記，"
-            "/channels remove -100頻道ID 移除。")
+            ("\n\n將 bot 加入頻道並授予發布權限即可自動登記。\n" if self.auto_register
+             else "\n\n請先授予 bot 頻道發布權限，再使用下列指令登記。\n") +
+            f"也可使用 /{self.command_name} @頻道名稱 或 /{self.command_name} -100頻道ID 登記，"
+            f"/{self.command_name} remove -100頻道ID 移除。")
 
     async def offer(self, message):
         if not self.is_admin(message.user_id):
             return
         if not self.channels:
             await message.original.reply_text("尚無可傳送的頻道。請先將 bot 加入頻道並授予發布權限，"
-                                              "或用 /channels 登記；本次結果不會自動傳送。")
+                                              f"或用 /{self.command_name} 登記；本次結果不會自動傳送。")
             return
         token = os.urandom(8).hex()
-        rows = [[InlineKeyboardButton(f"傳送到 {title}", callback_data=f"cp|{token}|{channel_id}")]
+        rows = [[InlineKeyboardButton(f"傳送到 {title}", callback_data=f"{self.prefix}|{token}|{channel_id}")]
                 for channel_id, title in self.channels.items()]
-        rows.append([InlineKeyboardButton("不傳送", callback_data=f"cp|{token}|skip")])
-        prompt = await message.original.reply_text("要將這次 X／Twitter 解析結果傳送到頻道嗎？\n"
+        rows.append([InlineKeyboardButton("不傳送", callback_data=f"{self.prefix}|{token}|skip")])
+        prompt = await message.original.reply_text(f"要將這次 {self.label} 解析結果傳送到頻道嗎？\n"
             "5 分鐘內未選擇，預設不傳送。", reply_markup=InlineKeyboardMarkup(rows))
         choice = Choice(message.user_id, message.chat_id, sorted(set(message.media_ids)),
                         set(self.channels), asyncio.get_running_loop().time() + CHOICE_SECONDS, prompt)
@@ -170,7 +173,7 @@ class ChannelPublisher:
         if not user or chat.type != "private" or not self.is_admin(user.id):
             return await query.answer("此選項僅供管理員在私聊使用。", show_alert=True)
         parts = (query.data or "").split("|")
-        choice = self.pending.get(parts[1]) if len(parts) == 3 else None
+        choice = self.pending.get(parts[1]) if len(parts) == 3 and parts[0] == self.prefix else None
         if (choice is None or choice.user_id != user.id or choice.chat_id != chat.id
                 or choice.prompt.message_id != update.effective_message.message_id):
             return await query.answer("這個選項已失效。", show_alert=True)
@@ -225,14 +228,30 @@ def register(application, runtime):
     from telegram.ext import CallbackQueryHandler, ChatMemberHandler, CommandHandler, filters
     publisher = ChannelPublisher(runtime["BASE_DIR"] / "channel_targets.json", runtime["user_is_admin"])
     runtime["CHANNEL_PUBLISHER"] = publisher
-    application.add_handler(ChatMemberHandler(publisher.membership, ChatMemberHandler.MY_CHAT_MEMBER))
+    eh_publisher = ChannelPublisher(runtime["BASE_DIR"] / "eh_channel_targets.json", runtime["user_is_admin"],
+        label="e-hentai", command_name="ehchannels", prefix="ecp", auto_register=False)
+    runtime["EH_CHANNEL_PUBLISHER"] = eh_publisher
+    async def membership(update, context):
+        await publisher.membership(update, context)
+        await eh_publisher.membership(update, context)
+    application.add_handler(ChatMemberHandler(membership, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("channels", publisher.command, filters=filters.ChatType.PRIVATE))
     application.add_handler(CallbackQueryHandler(publisher.choose, pattern=r"^cp\|"))
+    application.add_handler(CommandHandler("ehchannels", eh_publisher.command, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CallbackQueryHandler(eh_publisher.choose, pattern=r"^ecp\|"))
     previous = application.post_shutdown
 
     async def shutdown(app):
         await publisher.shutdown(app)
+        await eh_publisher.shutdown(app)
         if previous is not None:
             await previous(app)
     application.post_shutdown = shutdown
     return publisher
+
+async def offer_eh_publish(message, status, user_id, publisher):
+    if publisher is None or status is None or message.chat.type != "private" or not publisher.is_admin(user_id):
+        return
+    captured = CapturedMessage(message, user_id, publisher)
+    captured.media_ids = [status.message_id]
+    await offer_publish(captured)

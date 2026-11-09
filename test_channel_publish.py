@@ -15,6 +15,49 @@ from channel_publish import ChannelPublisher, CapturedMessage, capture_message, 
 
 
 class ChannelPublishTests(unittest.IsolatedAsyncioTestCase):
+    async def test_eh_publishing_has_separate_targets_and_callbacks(self):
+        from channel_publish import offer_eh_publish
+        eh = ChannelPublisher(self.root / "eh.json", lambda user: user == 1,
+            label="e-hentai", command_name="ehchannels", prefix="ecp", auto_register=False)
+        self.addAsyncCleanup(eh.shutdown, None)
+        eh.channels = {-100456: "EH 頻道"}
+        await offer_eh_publish(self.message, self.prompt, 1, eh)
+        token = next(iter(eh.pending))
+        self.assertFalse(self.publisher.pending)
+        self.assertEqual(self.publisher.channels, {-100123: "測試頻道"})
+        self.assertIn("e-hentai", self.message.reply_text.call_args.args[0])
+        update = self.update(token, "-100456")
+        await eh.choose(update, self.context)  # Twitter 前綴不得操作 EH。
+        self.bot.copy_messages.assert_not_called()
+        update.callback_query.data = f"ecp|{token}|-100456"
+        self.bot.copy_messages.return_value = [NS(message_id=1)]
+        await eh.choose(update, self.context)
+        self.bot.copy_messages.assert_awaited_once_with(chat_id=-100456, from_chat_id=11, message_ids=[100])
+
+    async def test_eh_offer_only_for_admin_private_and_timeout_does_not_post(self):
+        from channel_publish import offer_eh_publish
+        eh = ChannelPublisher(self.root / "eh.json", lambda user: user == 1,
+            label="e-hentai", command_name="ehchannels", prefix="ecp", auto_register=False)
+        self.addAsyncCleanup(eh.shutdown, None)
+        eh.channels = {-100456: "EH"}
+        await offer_eh_publish(self.message, self.prompt, 2, eh)
+        self.message.chat.type = "group"
+        await offer_eh_publish(self.message, self.prompt, 1, eh)
+        self.assertFalse(eh.pending)
+        self.message.chat.type = "private"
+        await offer_eh_publish(self.message, self.prompt, 1, eh)
+        token = next(iter(eh.pending)); choice = eh.pending[token]
+        choice.expires_at = asyncio.get_running_loop().time() - 1
+        await eh.expire(token, choice)
+        self.bot.copy_messages.assert_not_called()
+
+    async def test_eh_targets_require_explicit_registration(self):
+        eh = ChannelPublisher(self.root / "eh.json", lambda user: True,
+            label="e-hentai", command_name="ehchannels", prefix="ecp", auto_register=False)
+        event = NS(chat=NS(type="channel", id=-100999, title="頻道"), from_user=NS(id=1),
+            new_chat_member=NS(status="administrator", can_post_messages=True))
+        await eh.membership(NS(my_chat_member=event), self.context)
+        self.assertFalse(eh.channels)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
