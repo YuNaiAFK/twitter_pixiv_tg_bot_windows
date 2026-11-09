@@ -5830,6 +5830,9 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
     status = await send_status(message, "正在讀取 e-hentai 畫廊……")
 
     try:
+        from exviewer_import import reuse
+        if await reuse(message, status, url, user.id, globals()):
+            return True
         # A gallery parsed before is served from the cache, so a repeat request
         # costs no request to e-hentai at all. The facts are cheap to fetch; the
         # per-page sweep is not, and that is what the cache mostly saves.

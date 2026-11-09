@@ -493,3 +493,13 @@ TELEGRAM_LOCAL=                 # 只有伺服器以 --local 執行時才設 1
 安裝 Python 依賴後即可使用：`python -m pip install "libarchive-c>=5.3,<6"`。程式會使用 Windows 系統 `System32/archiveint.dll`；若系統未提供，請安裝 libarchive 並以 `LIBARCHIVE` 指定其 DLL 完整路徑。ZIP／CBZ 仍使用 Python 內建解壓。
 
 以串流逐張讀取圖片，不會直接還原壓縮檔內路徑；沿用原有張數、單張與解壓大小上限。加密、不完整分卷或無法解碼的壓縮檔會在原操作訊息顯示錯誤，請先提供完整且未加密的單一檔案。
+
+## exviewer 專用帳號登入
+
+此功能只供管理員私聊使用，需使用有 `@exviewer_bot` 查詢資格的 Telegram 使用者帳號。沿用 `TELEGRAM_API_ID`、`TELEGRAM_API_HASH`；bot 身分不能執行 inline 查詢。
+
+Windows 在專案目錄執行 `.venv\Scripts\python.exe exviewer_login.py`；Android 在專案根目錄執行 `python bot/exviewer_login.py`。登入工具需 `qrcode>=8.2,<9`（安裝清單已加入）。
+
+用瀏覽器開啟 `http://127.0.0.1:8876`，在 Telegram 的「設定 → 裝置 → 連結桌面裝置」掃描 QR Code。若在手機啟動工具、要由電腦顯示 QR，先執行 `adb forward tcp:8876 tcp:8876`，再從電腦開啟該本機網址。密碼只在本機頁面輸入；遇到限流會顯示倒數。登入完成後工具會關閉。
+
+各裝置應分別登入；不要跨裝置複製 `.mtproto/exviewer-user.session`。可在 Telegram「裝置」撤銷名為 `EH exviewer helper` 的工作階段。`EXVIEWER_ENABLED=0` 停用查詢；未登入時也會照常本機解析。密碼、QR 權杖與工作階段不可提交至 GitHub。

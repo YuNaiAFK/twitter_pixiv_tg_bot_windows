@@ -16,3 +16,6 @@ certifi>=2026.10.19
 
 # 7z / RAR streaming decoder (uses the system libarchive library).
 libarchive-c>=5.3,<6
+
+# exviewer 專用帳號的本機 QR 登入工具。
+qrcode>=8.2,<9

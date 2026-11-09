@@ -141,3 +141,9 @@ Telegraph 的文字僅保留原標題與日文標題，不加入標籤或畫廊�
 確認發布後，bot 會唯讀檢查所選頻道的歷史訊息、圖片說明及隱藏超連結；已有相同來源或預覽連結就不傳送，並提示原訊息編號。Twitter 的追蹤參數、x.com／twitter.com，以及 e-hentai／exhentai 的同作品網址會合併比對。不同頻道各自檢查。
 
 此功能沿用 GIF 文件模式的 `TELEGRAM_API_ID`、`TELEGRAM_API_HASH` 與 bot MTProto 工作階段，不需登入個人帳號。歷史訊息較多時檢查會較久；遇到 Telegram 限流會依服務要求等待（最多自動等待 60 秒），讀取失敗則本次不發布。只讀取訊息，不標記已讀或傳送測試訊息。
+
+### 管理員私聊優先取用 exviewer
+
+管理員在私聊傳送 EH 連結時，先查詢 `@exviewer_bot` 的既有結果。找到同一畫廊與 Telegraph 預覽後，由本 bot 重現原文字、超連結及大型預覽，不顯示轉發標頭，再提供 EH 頻道發布選項。查無結果、未登入或查詢失敗時照常使用本機解析。群組與一般使用者不觸發此功能。
+
+需先以 `exviewer_login.py` 登入有 exviewer 使用資格的專用 Telegram 使用者帳號；各裝置應分別登入，不複製工作階段。`EXVIEWER_ENABLED=0` 可停用。工作階段保存在已忽略的 `.mtproto/`，請勿分享或提交。詳見 [設定指南](docs/setup.md#exviewer-專用帳號登入)。
