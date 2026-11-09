@@ -15,6 +15,35 @@ from channel_publish import ChannelPublisher, CapturedMessage, capture_message, 
 
 
 class ChannelPublishTests(unittest.IsolatedAsyncioTestCase):
+    async def test_duplicate_channel_link_prevents_copy(self):
+        self.publisher.duplicate_check = AsyncMock(return_value=55)
+        token = await self.offer()
+        await self.publisher.choose(self.update(token), self.context)
+        self.bot.copy_messages.assert_not_called()
+        self.assertIn("相同連結", self.prompt.edit_text.call_args.args[0])
+
+    async def test_failed_duplicate_check_does_not_send(self):
+        from channel_links import ChannelCheckError
+        self.publisher.duplicate_check = AsyncMock(side_effect=ChannelCheckError("offline"))
+        token = await self.offer()
+        await self.publisher.choose(self.update(token), self.context)
+        self.bot.copy_messages.assert_not_called()
+        self.assertIn("未傳送", self.prompt.edit_text.call_args.args[0])
+
+    async def test_concurrent_choices_check_after_previous_copy(self):
+        from channel_publish import _channel_locks
+        async def check(*args):
+            await asyncio.sleep(0)
+            return 55 if self.bot.copy_messages.await_count else None
+        self.publisher.duplicate_check = check
+        first = await self.offer()
+        second = await self.offer()
+        try:
+            await asyncio.gather(self.publisher.choose(self.update(first), self.context), self.publisher.choose(self.update(second), self.context))
+            self.assertEqual(self.bot.copy_messages.await_count, 1)
+        finally:
+            _channel_locks.pop(-100123, None)
+
     async def test_eh_publishing_has_separate_targets_and_callbacks(self):
         from channel_publish import offer_eh_publish
         eh = ChannelPublisher(self.root / "eh.json", lambda user: user == 1,

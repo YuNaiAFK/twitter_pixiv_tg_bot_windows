@@ -6967,7 +6967,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
                                    cover_url=embed[0] if embed else ""):
         if mode == "view" and telegraph_page is not None:
             from channel_publish import offer_eh_publish
-            await offer_eh_publish(message, status, user.id, globals().get("EH_CHANNEL_PUBLISHER"))
+            await offer_eh_publish(message, status, user.id, globals().get("EH_CHANNEL_PUBLISHER"), source_url=gallery.page_url)
         return
 
     await status.edit_text(
@@ -8656,7 +8656,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     platform = detect_media_platform(media_url)
     from channel_publish import capture_message, offer_publish
-    message = capture_message(message, user.id, platform, globals().get("CHANNEL_PUBLISHER"))
+    message = capture_message(message, user.id, platform, globals().get("CHANNEL_PUBLISHER"), source_url=media_url)
 
     # A link that has been parsed before is served from the cache: the files were
     # copied aside, so this costs no download at all.

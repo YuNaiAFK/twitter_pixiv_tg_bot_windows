@@ -351,3 +351,9 @@ Telegraph 的文字僅保留原標題與日文標題，不加入標籤或畫廊�
 管理員在私聊使用「Telegraph · 顯示圖」，頁面製作成功且顯示封面後，才會出現傳送至 EH 頻道的選項；5 分鐘未選擇預設不發布。歸檔、重新生成、取消、製作失敗及純文字備援不顯示發布選項，一般使用者也不顯示。
 
 以 `/ehchannels @頻道名稱` 或 `/ehchannels -100頻道ID` 登記目標；`/ehchannels` 查詢，`/ehchannels remove -100頻道ID` 移除。bot 須有該頻道的發布權限。EH 目標清單、確認選項與 Twitter 的 `/channels` 完全分開，不會自動沿用 Twitter 頻道。
+
+### 頻道發布前檢查重複連結
+
+確認發布後，bot 會唯讀檢查所選頻道的歷史訊息、圖片說明及隱藏超連結；已有相同來源或預覽連結就不傳送，並提示原訊息編號。Twitter 的追蹤參數、x.com／twitter.com，以及 e-hentai／exhentai 的同作品網址會合併比對。不同頻道各自檢查。
+
+此功能沿用 GIF 文件模式的 `TELEGRAM_API_ID`、`TELEGRAM_API_HASH` 與 bot MTProto 工作階段，不需登入個人帳號。歷史訊息較多時檢查會較久；遇到 Telegram 限流會依服務要求等待（最多自動等待 60 秒），讀取失敗則本次不發布。只讀取訊息，不標記已讀或傳送測試訊息。

@@ -11,6 +11,7 @@ from telegram.error import TelegramError
 
 logger = logging.getLogger(__name__)
 CHOICE_SECONDS = 300
+_channel_locks = {}
 MEDIA_REPLIES = {"reply_photo", "reply_video", "reply_animation", "reply_document", "reply_media_group"}
 
 
@@ -20,7 +21,8 @@ def can_post(member):
 
 
 class CapturedMessage:
-    def __init__(self, message, user_id, publisher):
+    def __init__(self, message, user_id, publisher, source_url=""):
+        self.source_url = source_url
         self.original = message
         self.user_id = user_id
         self.publisher = publisher
@@ -39,10 +41,10 @@ class CapturedMessage:
         return reply
 
 
-def capture_message(message, user_id, platform, publisher):
+def capture_message(message, user_id, platform, publisher, source_url=""):
     if (publisher is not None and platform == "twitter" and message.chat.type == "private"
             and publisher.is_admin(user_id)):
-        return CapturedMessage(message, user_id, publisher)
+        return CapturedMessage(message, user_id, publisher, source_url)
     return message
 
 
@@ -64,11 +66,13 @@ class Choice:
     expires_at: float
     prompt: object
     task: object = None
+    source_url: str = ""
 
 
 class ChannelPublisher:
-    def __init__(self, path, is_admin, *, label="X／Twitter", command_name="channels", prefix="cp", auto_register=True):
+    def __init__(self, path, is_admin, *, label="X／Twitter", command_name="channels", prefix="cp", auto_register=True, duplicate_check=None):
         self.label, self.command_name, self.prefix = label, command_name, prefix
+        self.duplicate_check = duplicate_check
         self.auto_register = auto_register
         self.path = Path(path)
         self.is_admin = is_admin
@@ -153,6 +157,7 @@ class ChannelPublisher:
             "5 分鐘內未選擇，預設不傳送。", reply_markup=InlineKeyboardMarkup(rows))
         choice = Choice(message.user_id, message.chat_id, sorted(set(message.media_ids)),
                         set(self.channels), asyncio.get_running_loop().time() + CHOICE_SECONDS, prompt)
+        choice.source_url = message.source_url
         self.pending[token] = choice
         task = asyncio.create_task(self.expire(token, choice))
         choice.task = task
@@ -198,20 +203,31 @@ class ChannelPublisher:
             member = await context.bot.get_chat_member(channel_id, context.bot.id)
             if not can_post(member):
                 return await choice.prompt.edit_text("bot 已無頻道發布權限，本次未傳送。", reply_markup=None)
-            copied = 0
-            for start in range(0, len(choice.media_ids), 100):
-                ids = choice.media_ids[start:start + 100]
-                result = await context.bot.copy_messages(chat_id=channel_id, from_chat_id=choice.chat_id,
-                                                         message_ids=ids)
-                copied += len(result)
-                if len(result) != len(ids):
-                    break
-            if copied != len(choice.media_ids):
-                await choice.prompt.edit_text(f"頻道僅收到 {copied}/{len(choice.media_ids)} 則媒體，"
-                    "請先檢查頻道；未自動重送。", reply_markup=None)
-            else:
-                await choice.prompt.edit_text(f"已傳送到頻道：{self.channels.get(channel_id, channel_id)}。",
-                                             reply_markup=None)
+            async with _channel_locks.setdefault(channel_id, asyncio.Lock()):
+                if self.duplicate_check is not None:
+                    from channel_links import ChannelCheckError
+                    await choice.prompt.edit_text("正在檢查頻道是否已有相同連結……", reply_markup=None)
+                    try:
+                        duplicate = await self.duplicate_check(channel_id, choice.chat_id, choice.media_ids, choice.source_url)
+                    except ChannelCheckError as exc:
+                        logger.warning("頻道連結檢查失敗：%s", exc)
+                        return await choice.prompt.edit_text("無法完成頻道連結檢查，本次未傳送。請確認 MTProto 設定、連線及頻道讀取權限。", reply_markup=None)
+                    if duplicate is not None:
+                        return await choice.prompt.edit_text(f"頻道已有相同連結（訊息 {duplicate}），未重複傳送。", reply_markup=None)
+                copied = 0
+                for start in range(0, len(choice.media_ids), 100):
+                    ids = choice.media_ids[start:start + 100]
+                    result = await context.bot.copy_messages(chat_id=channel_id, from_chat_id=choice.chat_id,
+                                                             message_ids=ids)
+                    copied += len(result)
+                    if len(result) != len(ids):
+                        break
+                if copied != len(choice.media_ids):
+                    await choice.prompt.edit_text(f"頻道僅收到 {copied}/{len(choice.media_ids)} 則媒體，"
+                        "請先檢查頻道；未自動重送。", reply_markup=None)
+                else:
+                    await choice.prompt.edit_text(f"已傳送到頻道：{self.channels.get(channel_id, channel_id)}。",
+                                                 reply_markup=None)
         except TelegramError as exc:
             logger.warning("頻道傳送失敗：%s", type(exc).__name__)
             await choice.prompt.edit_text("頻道傳送未完成或回應逾時，請先檢查頻道；未自動重送，避免重複發布。",
@@ -226,10 +242,12 @@ class ChannelPublisher:
 
 def register(application, runtime):
     from telegram.ext import CallbackQueryHandler, ChatMemberHandler, CommandHandler, filters
-    publisher = ChannelPublisher(runtime["BASE_DIR"] / "channel_targets.json", runtime["user_is_admin"])
+    from channel_links import ChannelLinkChecker
+    checker = ChannelLinkChecker(runtime["BASE_DIR"] / ".mtproto", runtime["ehentai"].proxy_url())
+    publisher = ChannelPublisher(runtime["BASE_DIR"] / "channel_targets.json", runtime["user_is_admin"], duplicate_check=checker)
     runtime["CHANNEL_PUBLISHER"] = publisher
     eh_publisher = ChannelPublisher(runtime["BASE_DIR"] / "eh_channel_targets.json", runtime["user_is_admin"],
-        label="e-hentai", command_name="ehchannels", prefix="ecp", auto_register=False)
+        label="e-hentai", command_name="ehchannels", prefix="ecp", auto_register=False, duplicate_check=checker)
     runtime["EH_CHANNEL_PUBLISHER"] = eh_publisher
     async def membership(update, context):
         await publisher.membership(update, context)
@@ -249,9 +267,9 @@ def register(application, runtime):
     application.post_shutdown = shutdown
     return publisher
 
-async def offer_eh_publish(message, status, user_id, publisher):
+async def offer_eh_publish(message, status, user_id, publisher, source_url=""):
     if publisher is None or status is None or message.chat.type != "private" or not publisher.is_admin(user_id):
         return
-    captured = CapturedMessage(message, user_id, publisher)
+    captured = CapturedMessage(message, user_id, publisher, source_url)
     captured.media_ids = [status.message_id]
     await offer_publish(captured)
