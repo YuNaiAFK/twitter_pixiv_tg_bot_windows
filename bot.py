@@ -1917,7 +1917,7 @@ def telegraph_page_from_entry(entry: dict):
     return ehentai.TelegraphPage(url=url, path=path, access_token=token)
 
 
-def remember_telegraph_page(url: str, gallery, mode: str, page, embedded=None) -> None:
+def remember_telegraph_page(url: str, gallery, mode: str, page, embedded=None, *, layout_version: int = 2) -> None:
     """
     Record a published page against its gallery, so a later parse reuses it.
 
@@ -1945,7 +1945,7 @@ def remember_telegraph_page(url: str, gallery, mode: str, page, embedded=None) -
         "path": page.path,
         "access_token": page.access_token,
         "images": samples,
-        "layout_version": 2,
+        "layout_version": layout_version,
         "count": len(embedded or []),
         "at": time.time(),
     }
@@ -6913,6 +6913,10 @@ async def run_gallery_images(message, status, gallery, mode: str,
                 )
         except ehentai.TelegraphError as exc:
             logger.warning("Telegraph 建立失敗：%s", exc)
+            partial_page = getattr(exc, "page", None)
+            if partial_page is not None:
+                await asyncio.to_thread(remember_telegraph_page, gallery.page_url, gallery, mode,
+                                        partial_page, embed, layout_version=0)
             telegraph_page = None
             telegraph_note = f"（Telegraph 頁面建立失敗：{exc}）"
 

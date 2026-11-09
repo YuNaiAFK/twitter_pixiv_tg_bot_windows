@@ -13,6 +13,47 @@ def bot_function(name, namespace):
     return namespace[name]
 
 class RegressionTests(unittest.IsolatedAsyncioTestCase):
+    def test_title_save_failure_uses_short_path_and_restores_original(self):
+        title = "原作品標題" * 20
+        page = {"ok": True, "result": {"url": "https://telegra.ph/short", "path": "short"}}
+        replies = [{"ok": True, "result": {"access_token": "test-token"}},
+                   {"ok": False, "error": "PAGE_SAVE_FAILED"}, page, page]
+        client = NS(post=Mock(side_effect=[NS(json=lambda r=r:r) for r in replies]))
+        result = ehentai.create_telegraph_page(NS(title=title, title_jpn="日本語"),
+            ["https://img.example/1.jpg"], author_name="作者", http_client=client)
+        calls = client.post.call_args_list
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[1].kwargs["data"]["title"], title[:256])
+        self.assertRegex(calls[2].kwargs["data"]["title"], r"^Gallery-[a-f0-9]{16}$")
+        self.assertTrue(calls[3].args[0].endswith("editPage/short"))
+        self.assertEqual(calls[3].kwargs["data"]["title"], title[:256])
+        for field in ("content", "author_name", "access_token"):
+            self.assertEqual(calls[1].kwargs["data"][field], calls[3].kwargs["data"][field])
+        self.assertIn(title, calls[3].kwargs["data"]["content"])
+        self.assertEqual(result.url, "https://telegra.ph/short")
+
+    def test_title_fallback_only_for_explicit_save_failure(self):
+        gallery = NS(title="title", title_jpn="")
+        for reply in [{"ok": False, "error": "ACCESS_TOKEN_INVALID"}, TimeoutError("timeout")]:
+            responses = [NS(json=lambda: {"ok": True, "result": {"access_token": "test-token"}}),
+                         reply if isinstance(reply, Exception) else NS(json=lambda r=reply:r)]
+            client = NS(post=Mock(side_effect=responses))
+            with self.assertRaises(ehentai.TelegraphError):
+                ehentai.create_telegraph_page(gallery, [], http_client=client)
+            self.assertEqual(client.post.call_count, 2)
+
+    def test_failed_retitle_keeps_page_credentials(self):
+        replies = [{"ok": True, "result": {"access_token": "test-token"}},
+                   {"ok": False, "error": "PAGE_SAVE_FAILED"},
+                   {"ok": True, "result": {"url": "https://telegra.ph/short", "path": "short"}},
+                   {"ok": False, "error": "ACCESS_TOKEN_INVALID"}]
+        client = NS(post=Mock(side_effect=[NS(json=lambda r=r:r) for r in replies]))
+        with self.assertRaises(ehentai.TelegraphError) as caught:
+            ehentai.create_telegraph_page(NS(title="title", title_jpn=""), [], http_client=client)
+        self.assertEqual(caught.exception.page.path, "short")
+        self.assertEqual(caught.exception.page.access_token, "test-token")
+        self.assertNotIn("test-token", str(caught.exception))
+
     def test_metadata_refresh_preserves_page_and_r2(self):
         existing = {"telegraph": {"view": {"path": "existing"}}, "r2": {"view": ["r2-url"]}, "display_urls": ["image"]}
         cache = NS(store=Mock(), needs_pruning=lambda: False, save=Mock())

@@ -1108,6 +1108,7 @@ def _telegraph_post(
     content: str,
     timeout: float,
     http_client=None,
+    retry_save: bool = True,
 ) -> TelegraphPage:
     """
     POST to createPage or editPage and return the resulting page.
@@ -1131,7 +1132,7 @@ def _telegraph_post(
 
         for attempt in range(3):
             page = client.post(f"{TELEGRAPH_API}/{endpoint}", data=data).json()
-            if page.get("ok") or page.get("error") != "PAGE_SAVE_FAILED" or attempt == 2:
+            if page.get("ok") or page.get("error") != "PAGE_SAVE_FAILED" or attempt == 2 or not retry_save:
                 break
             # 只重試伺服器明確拒絕儲存的回應；網路逾時不重送，避免重複建頁。
             logger.warning("Telegraph %s 儲存失敗，準備第 %s 次重試", endpoint.split("/")[0], attempt + 1)
@@ -1199,8 +1200,7 @@ def create_telegraph_page(
         if http_client is None:
             client.close()
 
-    return _telegraph_post(
-        "createPage",
+    request = dict(
         access_token=token,
         title=(gallery.title or "Gallery"),
         author_name=resolved_author,
@@ -1209,6 +1209,25 @@ def create_telegraph_page(
         timeout=timeout,
         http_client=http_client,
     )
+    try:
+        return _telegraph_post("createPage", **request, retry_save=False)
+    except TelegraphError as exc:
+        if str(exc) != "PAGE_SAVE_FAILED":
+            raise
+
+    # 實測同內容原標題建頁失敗，短標題建頁、再改回原標題成功。
+    # 短標題只決定網址；文章標題與內文仍保留原作品名稱。
+    logger.warning("Telegraph 原標題建頁失敗，改以短網址建立後恢復原標題")
+    short_request = dict(request, title="Gallery-" + os.urandom(8).hex())
+    page = _telegraph_post("createPage", **short_request, retry_save=False)
+    try:
+        return _telegraph_post(f"editPage/{page.path}", **request)
+    except TelegraphError as exc:
+        # 頁面已建立：讓呼叫端保留編輯憑證，下次修復原頁而非重複建頁。
+        failure = TelegraphError(f"頁面已建立，但恢復原標題失敗：{exc}（{page.url}）")
+        failure.page = page
+        raise failure from exc
+
 
 
 @dataclass
