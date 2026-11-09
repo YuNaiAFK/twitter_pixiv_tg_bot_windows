@@ -1966,8 +1966,9 @@ def remember_gallery(url: str, gallery, image_urls=None) -> None:
     """
     if not GALLERY_CACHE_ENABLED:
         return
-    PARSE_CACHE.store(gallery_cache_key(url, gallery), "gallery",
-                      gallery_cache_payload(gallery, image_urls))
+    payload = dict(gallery_cache_lookup(url, gallery))
+    payload.update(gallery_cache_payload(gallery, image_urls))
+    PARSE_CACHE.store(gallery_cache_key(url, gallery), "gallery", payload)
     if PARSE_CACHE.needs_pruning():
         removed = PARSE_CACHE.prune()
         if removed:
@@ -6960,7 +6961,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
                 if telegraph_url else None)
     if await edit_message_to_cover(status, gallery, summary, keyboard, parse_mode="HTML",
                                    cover_url=embed[0] if embed else ""):
-        if telegraph_page is not None:
+        if mode == "view" and telegraph_page is not None:
             from channel_publish import offer_eh_publish
             await offer_eh_publish(message, status, user.id, globals().get("EH_CHANNEL_PUBLISHER"))
         return
@@ -6970,10 +6971,6 @@ async def run_gallery_images(message, status, gallery, mode: str,
         link_preview_options=source_link_options(),
         reply_markup=keyboard,
     )
-
-    if telegraph_page is not None:
-        from channel_publish import offer_eh_publish
-        await offer_eh_publish(message, status, user.id, globals().get("EH_CHANNEL_PUBLISHER"))
 
 
 def download_gallery_direct(urls: list[str], output_dir: Path, *, referer: str,

@@ -1053,9 +1053,7 @@ def build_telegraph_content(
     """
     Build the Telegraph node tree for a gallery.
 
-    Layout: the gallery's facts, one section per tag namespace, then the images, then
-    a link back to the gallery. Tags come before the images because they are what a
-    reader scans, and a long image list would otherwise push them off the page.
+    Layout: the original title, Japanese title, then images in gallery order.
 
     The cover is deliberately **not** included. It is shown in the chat message
     instead, and repeating it at the top of the page only used up content budget that
@@ -1131,7 +1129,13 @@ def _telegraph_post(
         if author_url:
             data["author_url"] = author_url[:512]
 
-        page = client.post(f"{TELEGRAPH_API}/{endpoint}", data=data).json()
+        for attempt in range(3):
+            page = client.post(f"{TELEGRAPH_API}/{endpoint}", data=data).json()
+            if page.get("ok") or page.get("error") != "PAGE_SAVE_FAILED" or attempt == 2:
+                break
+            # 只重試伺服器明確拒絕儲存的回應；網路逾時不重送，避免重複建頁。
+            logger.warning("Telegraph %s 儲存失敗，準備第 %s 次重試", endpoint.split("/")[0], attempt + 1)
+            time.sleep(attempt + 1)
         if not page.get("ok"):
             raise TelegraphError(page.get("error") or "Telegraph 回應沒有 ok")
         result = page["result"]

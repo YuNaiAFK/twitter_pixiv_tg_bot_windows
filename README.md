@@ -130,6 +130,6 @@ Telegraph 的文字僅保留原標題與日文標題，不加入標籤或畫廊�
 
 ### e-hentai 獨立頻道發布
 
-管理員在私聊完成 e-hentai Telegraph 後，可確認傳送完成封面與連結到 EH 頻道，5 分鐘未選擇預設不發布。一般使用者不顯示選項。
+管理員在私聊使用「Telegraph · 顯示圖」，頁面製作成功且顯示封面後，才會出現傳送至 EH 頻道的選項；5 分鐘未選擇預設不發布。歸檔、重新生成、取消、製作失敗及純文字備援不顯示發布選項，一般使用者也不顯示。
 
 以 `/ehchannels @頻道名稱` 或 `/ehchannels -100頻道ID` 登記目標；`/ehchannels` 查詢，`/ehchannels remove -100頻道ID` 移除。bot 須有該頻道的發布權限。EH 目標清單、確認選項與 Twitter 的 `/channels` 完全分開，不會自動沿用 Twitter 頻道。
