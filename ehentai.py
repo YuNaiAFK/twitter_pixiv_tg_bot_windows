@@ -1071,48 +1071,7 @@ def build_telegraph_content(
     if gallery.title_jpn and gallery.title_jpn != gallery.title:
         content.append(_node("p", [_node("em", [_text(gallery.title_jpn)])]))
 
-    facts = []
-    if gallery.category:
-        facts.append(("分類", gallery.category))
-    if gallery.language:
-        facts.append(("語言", gallery.language))
-    if gallery.rating:
-        facts.append(("評分", gallery.rating))
-    if gallery.filecount:
-        facts.append(("頁數", gallery.filecount))
-    if gallery.filesize:
-        facts.append(("大小", format_filesize(gallery.filesize)))
-    if gallery.uploader:
-        facts.append(("上傳者", gallery.uploader))
-    if gallery.date:
-        facts.append(("上傳日期", gallery.date))
-    if gallery.favorites:
-        facts.append(("收藏數", gallery.favorites))
-
-    if facts:
-        children = []
-        for index, (label, value) in enumerate(facts):
-            if index:
-                children.append(_node("br", []))
-            children.append(_node("b", [f"{label}："]))
-            children.append(_text(value))
-        content.append(_node("p", children))
-
-    if gallery.expunged:
-        content.append(_node("p", [_node("b", ["⚠ 此畫廊已被刪除（expunged）"])]))
-
-    for namespace in gallery.ordered_namespaces():
-        label = NAMESPACE_LABELS.get(namespace, namespace.title())
-        values = gallery.tags.get(namespace, [])
-        if not values:
-            continue
-        content.append(_node("h4", [label]))
-        content.append(_node("ul", [
-            _node("li", [_text(display_tag(value))]) for value in values
-        ]))
-
     if image_urls:
-        content.append(_node("h4", [f"圖片（共 {len(image_urls)} 頁）"]))
         budget = embed_limit_kb * 1024
         used = len(json.dumps(content, ensure_ascii=False))
         embedded = 0
@@ -1129,11 +1088,6 @@ def build_telegraph_content(
                 f"（因 Telegraph 內容上限，僅嵌入前 {embedded} 頁，"
                 f"其餘請見原畫廊）"
             ])]))
-
-    content.append(_node("hr", []))
-    content.append(_node("p", [
-        _node("a", ["在 e-hentai 開啟原畫廊"], {"href": gallery.page_url}),
-    ]))
 
     return content
 

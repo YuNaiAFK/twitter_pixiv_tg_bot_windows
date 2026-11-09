@@ -1945,6 +1945,7 @@ def remember_telegraph_page(url: str, gallery, mode: str, page, embedded=None) -
         "path": page.path,
         "access_token": page.access_token,
         "images": samples,
+        "layout_version": 2,
         "count": len(embedded or []),
         "at": time.time(),
     }
@@ -5211,7 +5212,7 @@ def public_thumbnail_url(thumb: str) -> str:
 
 
 async def edit_message_to_cover(status, gallery, caption: str,
-                                reply_markup=None, parse_mode=None) -> bool:
+                                reply_markup=None, parse_mode=None, cover_url: str = "") -> bool:
     """
     Turn the status message into the gallery's cover photo. Returns success.
 
@@ -5242,7 +5243,7 @@ async def edit_message_to_cover(status, gallery, caption: str,
     message: refusing to deliver a gallery because its cover would not load would be
     the wrong trade.
     """
-    url = public_thumbnail_url(gallery.thumb)
+    url = cover_url or public_thumbnail_url(gallery.thumb)
     if not url or status is None:
         return False
     try:
@@ -6847,6 +6848,10 @@ async def run_gallery_images(message, status, gallery, mode: str,
                     logger.info("Telegraph 頁面有圖片載入失敗，將修復（%s）：%s",
                                 report.summary(), candidate.url)
 
+    if reuse_page is not None and embed and cached_entry.get("layout_version") != 2:
+        reuse_page = await asyncio.to_thread(ehentai.edit_telegraph_page, reuse_page, gallery, embed)
+        await asyncio.to_thread(remember_telegraph_page, gallery.page_url, gallery, mode, reuse_page, embed)
+
     telegraph_page = reuse_page
     telegraph_note = ""
     if reuse_page is None:
@@ -6953,7 +6958,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
     # source link either way.
     keyboard = (regenerate_keyboard(gallery.gid, gallery.token)
                 if telegraph_url else None)
-    if await edit_message_to_cover(status, gallery, summary, keyboard, parse_mode="HTML"):
+    if await edit_message_to_cover(status, gallery, summary, keyboard, parse_mode="HTML",
+                                   cover_url=embed[0] if embed else ""):
         return
 
     await status.edit_text(
