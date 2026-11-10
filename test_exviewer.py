@@ -37,7 +37,7 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
     async def test_private_admin_guard_prevents_any_external_query(self):
         runtime = {"user_is_admin": lambda user: user == 1}
         with patch.object(external, "lookup", new_callable=AsyncMock) as lookup:
-            self.assertFalse(await external.reuse(NS(chat=NS(type="group")), NS(), URL, 1, runtime))
+            self.assertFalse(await external.reuse(NS(chat=NS(type="channel")), NS(), URL, 1, runtime))
             self.assertFalse(await external.reuse(NS(chat=NS(type="private")), NS(), URL, 2, runtime))
             lookup.assert_not_called()
 
@@ -107,3 +107,14 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(login.asyncio, "sleep", new_callable=AsyncMock) as sleep:
             self.assertEqual(await login.retry_login_rpc(rpc, {}), 123)
             self.assertEqual(sleep.await_count, 3)
+
+
+    async def test_group_members_can_reuse_but_never_offer_channel_publish(self):
+        runtime={"BASE_DIR":Path("."),"user_is_admin":lambda user:user==1,"ehentai":NS(proxy_url=lambda:"")}
+        for kind in ("group","supergroup"):
+            for user in (1,2):
+                with patch.object(external,"lookup",AsyncMock(return_value=external.existing_result(results(),URL))), patch("channel_publish.offer_eh_publish",new_callable=AsyncMock) as offer:
+                    status=NS(edit_text=AsyncMock())
+                    self.assertTrue(await external.reuse(NS(chat=NS(type=kind)),status,URL,user,runtime))
+                    status.edit_text.assert_awaited_once()
+                    offer.assert_not_called()

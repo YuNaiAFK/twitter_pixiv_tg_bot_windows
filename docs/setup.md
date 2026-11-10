@@ -496,7 +496,7 @@ TELEGRAM_LOCAL=                 # 只有伺服器以 --local 執行時才設 1
 
 ## exviewer 專用帳號登入
 
-此功能只供管理員私聊使用，需使用有 `@exviewer_bot` 查詢資格的 Telegram 使用者帳號。沿用 `TELEGRAM_API_ID`、`TELEGRAM_API_HASH`；bot 身分不能執行 inline 查詢。
+此功能供管理員私聊與已授權群組使用；頻道發布僅限管理員私聊。需使用有 `@exviewer_bot` 查詢資格的 Telegram 使用者帳號。沿用 `TELEGRAM_API_ID`、`TELEGRAM_API_HASH`；bot 身分不能執行 inline 查詢。
 
 Windows 在專案目錄執行 `.venv\Scripts\python.exe exviewer_login.py`；Android 在專案根目錄執行 `python bot/exviewer_login.py`。登入工具需 `qrcode>=8.2,<9`（安裝清單已加入）。
 

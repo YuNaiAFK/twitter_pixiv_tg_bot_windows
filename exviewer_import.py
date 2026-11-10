@@ -101,7 +101,9 @@ async def lookup(source_url, session_dir, proxy_url=""):
 
 
 async def reuse(message, status, source_url, user_id, runtime):
-    if message.chat.type != "private" or not runtime["user_is_admin"](user_id):
+    if message.chat.type not in {"private", "group", "supergroup"}:
+        return False
+    if message.chat.type == "private" and not runtime["user_is_admin"](user_id):
         return False
     result = await lookup(source_url, runtime["BASE_DIR"] / ".mtproto", runtime["ehentai"].proxy_url())
     if result is None:
@@ -112,5 +114,6 @@ async def reuse(message, status, source_url, user_id, runtime):
         reply_markup=None)
     logger.info("已沿用 exviewer 的既有 EH 預覽結果")
     from channel_publish import offer_eh_publish
-    await offer_eh_publish(message, status, user_id, runtime.get("EH_CHANNEL_PUBLISHER"), source_url=source_url)
+    if message.chat.type == "private" and runtime["user_is_admin"](user_id):
+        await offer_eh_publish(message, status, user_id, runtime.get("EH_CHANNEL_PUBLISHER"), source_url=source_url)
     return True
