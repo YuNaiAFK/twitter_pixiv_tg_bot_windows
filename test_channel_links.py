@@ -43,3 +43,25 @@ class LinkTests(unittest.IsolatedAsyncioTestCase):
         client = NS(get_messages=AsyncMock(return_value=[None, NS(id=1, message="https://x.com/a/status/999")]))
         with patch("channel_links.latest_message_id", AsyncMock(return_value=100)):
             self.assertIsNone(await scan_links(client, "peer", {"twitter:123"}))
+
+
+class IndexTests(unittest.IsolatedAsyncioTestCase):
+    async def test_incremental_edit_delete_and_restart_without_history_read(self):
+        import tempfile,json
+        from pathlib import Path
+        from channel_links import indexed_links
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"index.json"
+            path.write_text(json.dumps({"version":1,"pts":10,"messages":{"1":["twitter:123"],"2":["twitter:456"]}}))
+            edit=type("UpdateEditChannelMessage",(),{})()
+            edit.message=NS(id=1,message="https://x.com/a/status/999")
+            delete=type("UpdateDeleteChannelMessages",(),{})()
+            delete.messages=[2]
+            client=AsyncMock(return_value=NS(pts=12,final=True,new_messages=[],other_updates=[edit,delete]))
+            self.assertEqual(await indexed_links(client,"peer",{"twitter:999"},path),1)
+            self.assertEqual(client.call_args.args[0].pts,10)
+            client.get_messages.assert_not_called()
+            client.return_value=NS(pts=12,final=True,new_messages=[],other_updates=[])
+            self.assertIsNone(await indexed_links(client,"peer",{"twitter:123","twitter:456"},path))
+            self.assertEqual(client.call_args.args[0].pts,12)
+            client.get_messages.assert_not_called()

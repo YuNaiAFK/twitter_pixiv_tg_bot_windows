@@ -1,6 +1,7 @@
 """以 bot 可用的 MTProto 方法，唯讀比對目標頻道的歷史連結。"""
 import asyncio
 import os
+import json
 import re
 from urllib.parse import urlsplit, unquote
 
@@ -79,6 +80,65 @@ async def scan_links(client, peer, links):
     return None
 
 
+async def indexed_links(client, peer, links, path):
+    from telethon import functions, types
+    try:
+        index = json.loads(path.read_text(encoding="utf-8"))
+        if index.get("version") != 1:
+            index = None
+    except (FileNotFoundError, ValueError):
+        index = None
+    while True:
+        if index is None:
+            # 先記錄掃描前的 pts；掃描期間的變動會在下方增量同步補齊。
+            info = (await client(functions.channels.GetFullChannelRequest(peer))).full_chat
+            pts = info.pts
+            top = await latest_message_id(client, peer)
+            index = {"version": 1, "pts": pts, "messages": {}}
+            for end in range(top, 0, -100):
+                if end != top:
+                    await asyncio.sleep(1)
+                batch = await client.get_messages(peer, ids=list(range(max(1, end-99), end+1)))
+                for message in batch:
+                    if message is not None:
+                        found = message_links(message)
+                        if found:
+                            index["messages"][str(message.id)] = sorted(found)
+        result = await client(functions.updates.GetChannelDifferenceRequest(
+            peer, types.ChannelMessagesFilterEmpty(), pts=index["pts"], limit=100, force=True))
+        if getattr(result, "dialog", None) is not None:
+            # Telegram 已無法提供完整增量：重建，而非拿不完整快取放行。
+            index = None
+            continue
+        for message in getattr(result, "new_messages", ()):
+            index["messages"].pop(str(message.id), None)
+            found = message_links(message)
+            if found:
+                index["messages"][str(message.id)] = sorted(found)
+        for update in getattr(result, "other_updates", ()):
+            name = type(update).__name__
+            if name == "UpdateDeleteChannelMessages":
+                for message_id in update.messages:
+                    index["messages"].pop(str(message_id), None)
+            elif name in {"UpdateEditChannelMessage", "UpdateNewChannelMessage"}:
+                message = update.message
+                index["messages"].pop(str(message.id), None)
+                found = message_links(message)
+                if found:
+                    index["messages"][str(message.id)] = sorted(found)
+        previous = index["pts"]
+        index["pts"] = result.pts
+        if result.final:
+            break
+        if result.pts <= previous:
+            raise ChannelCheckError("頻道增量進度無法確認")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+    return next((int(mid) for mid, stored in index["messages"].items() if links.intersection(stored)), None)
+
+
 class ChannelLinkChecker:
     def __init__(self, session_dir, proxy_url=""):
         self.session_dir, self.proxy_url = session_dir, proxy_url
@@ -113,7 +173,7 @@ class ChannelLinkChecker:
                 if not links:
                     raise ChannelCheckError("解析結果沒有可比對的連結")
                 peer = await client.get_input_entity(channel_id)
-                return await scan_links(client, peer, links)
+                return await indexed_links(client, peer, links, self.session_dir / f"channel-links-{me.id}-{channel_id}.json")
             except ChannelCheckError:
                 raise
             except Exception as exc:
