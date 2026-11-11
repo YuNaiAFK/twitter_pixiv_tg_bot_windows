@@ -50,6 +50,8 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
                 patch("channel_publish.offer_eh_publish", new_callable=AsyncMock) as offer:
             self.assertTrue(await external.reuse(message, status, URL, 1, runtime))
             self.assertIsNone(status.edit_text.call_args.kwargs["parse_mode"])
+            buttons = status.edit_text.call_args.kwargs["reply_markup"].inline_keyboard[0]
+            self.assertEqual([button.callback_data for button in buttons], ["eh|zip1280|123|abc", "eh|ziporig|123|abc"])
             self.assertTrue(status.edit_text.call_args.kwargs["link_preview_options"].show_above_text)
             offer.assert_awaited_once_with(message, status, 1, runtime["EH_CHANNEL_PUBLISHER"], source_url=URL)
 

@@ -3,10 +3,11 @@ import asyncio
 from dataclasses import dataclass
 import logging
 import os
+import re
 from urllib.parse import urlsplit, parse_qs
 
 from channel_links import normalize_link, message_links
-from telegram import MessageEntity, LinkPreviewOptions
+from telegram import MessageEntity, LinkPreviewOptions, InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
 _user_lock = asyncio.Lock()
@@ -108,10 +109,18 @@ async def reuse(message, status, source_url, user_id, runtime):
     result = await lookup(source_url, runtime["BASE_DIR"] / ".mtproto", runtime["ehentai"].proxy_url())
     if result is None:
         return False
+    match = re.search(r"/g/(\d+)/([a-fA-F0-9]+)", source_url)
+    keyboard = None
+    if match:
+        gid, token = match.groups()
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("官方壓縮包 · 1280", callback_data=f"eh|zip1280|{gid}|{token}"),
+            InlineKeyboardButton("官方壓縮包 · 原圖", callback_data=f"eh|ziporig|{gid}|{token}"),
+        ]])
     # 由本 bot 發送同一份文字與 entities，不建立轉發標頭或 via_bot 標記。
     await status.edit_text(result.text, entities=result.entities, parse_mode=None,
         link_preview_options=LinkPreviewOptions(url=result.preview_url, prefer_large_media=True, show_above_text=True),
-        reply_markup=None)
+        reply_markup=keyboard)
     logger.info("已沿用 exviewer 的既有 EH 預覽結果")
     from channel_publish import offer_eh_publish
     if message.chat.type == "private" and runtime["user_is_admin"](user_id):
