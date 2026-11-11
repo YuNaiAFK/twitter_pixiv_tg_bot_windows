@@ -5830,6 +5830,9 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
     status = await send_status(message, "正在讀取 e-hentai 畫廊……")
 
     try:
+        from channel_reuse import reuse as reuse_channel
+        if await reuse_channel(message, status, url, user.id, globals()):
+            return True
         from exviewer_import import reuse
         if await reuse(message, status, url, user.id, globals()):
             return True
