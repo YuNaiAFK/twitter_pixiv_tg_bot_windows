@@ -50,7 +50,9 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
                 patch("channel_publish.offer_eh_publish", new_callable=AsyncMock) as offer:
             self.assertTrue(await external.reuse(message, status, URL, 1, runtime))
             self.assertIsNone(status.edit_text.call_args.kwargs["parse_mode"])
-            buttons = status.edit_text.call_args.kwargs["reply_markup"].inline_keyboard[0]
+            keyboard = status.edit_text.call_args.kwargs["reply_markup"].inline_keyboard
+            self.assertEqual(keyboard[1][0].callback_data, "eh|cancel")
+            buttons = keyboard[0]
             self.assertEqual([button.callback_data for button in buttons], ["eh|zip1280|123|abc", "eh|ziporig|123|abc"])
             self.assertTrue(status.edit_text.call_args.kwargs["link_preview_options"].show_above_text)
             offer.assert_awaited_once_with(message, status, 1, runtime["EH_CHANNEL_PUBLISHER"], source_url=URL)
@@ -120,3 +122,16 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(await external.reuse(NS(chat=NS(type=kind)),status,URL,user,runtime))
                     status.edit_text.assert_awaited_once()
                     offer.assert_not_called()
+
+
+    async def test_cancel_hides_only_keyboard(self):
+        tree=ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
+        node=next(n for n in tree.body if isinstance(n,ast.AsyncFunctionDef) and n.name=="handle_gallery_callback")
+        ns={"Update":object,"ContextTypes":NS(DEFAULT_TYPE=object),"parse_gallery_callback":lambda data:("cancel","",""),"user_is_allowed":lambda *a:True}
+        exec(compile(ast.Module(body=[node],type_ignores=[]),"<cancel>","exec"),ns)
+        message=NS(chat_id=1,chat=NS(type="private"),edit_reply_markup=AsyncMock(),edit_text=AsyncMock(),delete=AsyncMock())
+        query=NS(data="eh|cancel",answer=AsyncMock())
+        await ns["handle_gallery_callback"](NS(callback_query=query,effective_message=message,effective_user=NS(id=1)),NS())
+        message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
+        message.edit_text.assert_not_called()
+        message.delete.assert_not_called()
