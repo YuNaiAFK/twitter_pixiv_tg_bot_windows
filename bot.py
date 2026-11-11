@@ -8581,6 +8581,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # send a link or the command.
         return
 
+    from eh_origin import should_ignore
+    if gallery_url(text) and should_ignore(message, globals()):
+        return
+
     # There is something to act on, so authorization is checked now - and only now.
     # The chat is passed too, because in a group the group's own authorization
     # decides, not the member's - which is what makes authorizing a group enough for
