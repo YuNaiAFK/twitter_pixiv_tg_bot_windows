@@ -19,6 +19,7 @@ class ReuseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.bot.copy_message.await_args.kwargs["message_id"],12)
             self.status.delete.assert_awaited_once()
             offer.assert_awaited_once()
+            self.assertEqual(offer.await_args.kwargs["excluded_channels"], {-1001})
     async def test_miss_falls_back(self):
         runtime=self.setup_case(None)
         self.assertFalse(await reuse(self.message,self.status,"https://e-hentai.org/g/123/abc/",2,runtime))

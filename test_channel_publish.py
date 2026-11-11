@@ -250,3 +250,32 @@ class ChannelPublishTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExcludedChannelsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_matched_channel_hidden_and_remaining_channel_allowed(self):
+        from channel_publish import offer_eh_publish
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            publisher = ChannelPublisher(Path(directory) / "eh.json", lambda uid: True)
+            publisher.channels = {-1001: "已存在", -1002: "另一個頻道"}
+            message = NS(chat=NS(type="private"), chat_id=7, reply_text=AsyncMock(return_value=NS(message_id=9)))
+            try:
+                await offer_eh_publish(message, NS(message_id=8), 1, publisher, excluded_channels={-1001})
+                choice = next(iter(publisher.pending.values()))
+                self.assertEqual(choice.channels, {-1002})
+                markup = message.reply_text.await_args.kwargs["reply_markup"]
+                self.assertEqual(len(markup.inline_keyboard), 2)
+                self.assertIn("另一個頻道", markup.inline_keyboard[0][0].text)
+            finally:
+                await publisher.shutdown(None)
+    async def test_no_other_channel_no_prompt(self):
+        from channel_publish import offer_eh_publish
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            publisher = ChannelPublisher(Path(directory) / "eh.json", lambda uid: True)
+            publisher.channels = {-1001: "已存在"}
+            message = NS(chat=NS(type="private"), chat_id=7, reply_text=AsyncMock())
+            await offer_eh_publish(message, NS(message_id=8), 1, publisher, excluded_channels={-1001})
+            message.reply_text.assert_not_awaited()
+            self.assertFalse(publisher.pending)

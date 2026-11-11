@@ -44,7 +44,8 @@ async def reuse(message, status, source_url, user_id, runtime):
             logger.warning("EH 頻道結果已複製；讀取提示未能刪除")
         from channel_publish import offer_eh_publish
         try:
-            await offer_eh_publish(message, copied, user_id, publisher, source_url=source_url)
+            await offer_eh_publish(message, copied, user_id, publisher, source_url=source_url,
+                                   excluded_channels={channel_id})
         except Exception as exc:
             logger.warning("EH 頻道結果已複製；發布選項建立失敗（%s）", type(exc).__name__)
         return True

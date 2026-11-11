@@ -149,14 +149,18 @@ class ChannelPublisher:
             await message.original.reply_text("尚無可傳送的頻道。請先將 bot 加入頻道並授予發布權限，"
                                               f"或用 /{self.command_name} 登記；本次結果不會自動傳送。")
             return
+        channels = {cid: title for cid, title in self.channels.items()
+                    if cid not in getattr(message, "excluded_channels", set())}
+        if not channels:
+            return
         token = os.urandom(8).hex()
         rows = [[InlineKeyboardButton(f"傳送到 {title}", callback_data=f"{self.prefix}|{token}|{channel_id}")]
-                for channel_id, title in self.channels.items()]
+                for channel_id, title in channels.items()]
         rows.append([InlineKeyboardButton("不傳送", callback_data=f"{self.prefix}|{token}|skip")])
         prompt = await message.original.reply_text(f"要將這次 {self.label} 解析結果傳送到頻道嗎？\n"
             "5 分鐘內未選擇，預設不傳送。", reply_markup=InlineKeyboardMarkup(rows))
         choice = Choice(message.user_id, message.chat_id, sorted(set(message.media_ids)),
-                        set(self.channels), asyncio.get_running_loop().time() + CHOICE_SECONDS, prompt)
+                        set(channels), asyncio.get_running_loop().time() + CHOICE_SECONDS, prompt)
         choice.source_url = message.source_url
         self.pending[token] = choice
         task = asyncio.create_task(self.expire(token, choice))
@@ -267,9 +271,10 @@ def register(application, runtime):
     application.post_shutdown = shutdown
     return publisher
 
-async def offer_eh_publish(message, status, user_id, publisher, source_url=""):
+async def offer_eh_publish(message, status, user_id, publisher, source_url="", excluded_channels=()):
     if publisher is None or status is None or message.chat.type != "private" or not publisher.is_admin(user_id):
         return
     captured = CapturedMessage(message, user_id, publisher, source_url)
     captured.media_ids = [status.message_id]
+    captured.excluded_channels = set(excluded_channels)
     await offer_publish(captured)
