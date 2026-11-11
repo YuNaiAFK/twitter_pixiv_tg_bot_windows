@@ -37,6 +37,8 @@ async def reuse(message, status, source_url, user_id, runtime):
         except Exception as exc:
             logger.warning("EH 頻道結果複製未完成（%s）；沿用正常解析", type(exc).__name__)
             return False
+        from eh_idle import arm
+        arm(message.get_bot(), message.chat.id, copied.message_id, hide_only=True)
         # 複製成功後不再重新解析，避免狀態清理／發布提示失敗造成重複結果。
         try:
             await status.delete()

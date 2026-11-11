@@ -45,7 +45,7 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
         runtime = {"BASE_DIR": Path("."), "user_is_admin": lambda user: True,
             "ehentai": NS(proxy_url=lambda: ""), "EH_CHANNEL_PUBLISHER": NS()}
         message = NS(chat=NS(type="private"))
-        status = NS(edit_text=AsyncMock())
+        status = NS(edit_text=AsyncMock(), get_bot=lambda: NS(delete_message=AsyncMock()), chat_id=7, message_id=8)
         with patch.object(external, "lookup", AsyncMock(return_value=external.existing_result(results(), URL))), \
                 patch("channel_publish.offer_eh_publish", new_callable=AsyncMock) as offer:
             self.assertTrue(await external.reuse(message, status, URL, 1, runtime))
@@ -59,7 +59,7 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_result_leaves_original_parser_in_control(self):
         runtime = {"BASE_DIR": Path("."), "user_is_admin": lambda user: True, "ehentai": NS(proxy_url=lambda: "")}
-        status = NS(edit_text=AsyncMock())
+        status = NS(edit_text=AsyncMock(), get_bot=lambda: NS(delete_message=AsyncMock()), chat_id=7, message_id=8)
         with patch.object(external, "lookup", AsyncMock(return_value=None)):
             self.assertFalse(await external.reuse(NS(chat=NS(type="private")), status, URL, 1, runtime))
             status.edit_text.assert_not_called()
@@ -81,7 +81,7 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
     async def test_eh_entry_shows_normal_menu_when_no_external_result(self):
         tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
         node = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "handle_ehentai_gallery")
-        status = NS(edit_text=AsyncMock())
+        status = NS(edit_text=AsyncMock(), get_bot=lambda: NS(delete_message=AsyncMock()), chat_id=7, message_id=8)
         namespace = {"send_status": AsyncMock(return_value=status), "gallery_cache_lookup": Mock(return_value={"gallery": {}}),
             "gallery_from_payload": Mock(return_value=NS(is_adult=False, gid="123", token="abc")),
             "gallery_cache_age": lambda url: 0, "GALLERY_META_TTL_SECONDS": 60, "logger": Mock(),
@@ -118,7 +118,7 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
         for kind in ("group","supergroup"):
             for user in (1,2):
                 with patch.object(external,"lookup",AsyncMock(return_value=external.existing_result(results(),URL))), patch("channel_publish.offer_eh_publish",new_callable=AsyncMock) as offer:
-                    status=NS(edit_text=AsyncMock())
+                    status=NS(edit_text=AsyncMock(), get_bot=lambda: NS(delete_message=AsyncMock()), chat_id=7, message_id=8)
                     self.assertTrue(await external.reuse(NS(chat=NS(type=kind)),status,URL,user,runtime))
                     status.edit_text.assert_awaited_once()
                     offer.assert_not_called()
@@ -129,7 +129,7 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
         node=next(n for n in tree.body if isinstance(n,ast.AsyncFunctionDef) and n.name=="handle_gallery_callback")
         ns={"Update":object,"ContextTypes":NS(DEFAULT_TYPE=object),"parse_gallery_callback":lambda data:("cancel","",""),"user_is_allowed":lambda *a:True}
         exec(compile(ast.Module(body=[node],type_ignores=[]),"<cancel>","exec"),ns)
-        message=NS(chat_id=1,chat=NS(type="private"),edit_reply_markup=AsyncMock(),edit_text=AsyncMock(),delete=AsyncMock())
+        message=NS(chat_id=1,message_id=8,chat=NS(type="private"),edit_reply_markup=AsyncMock(),edit_text=AsyncMock(),delete=AsyncMock())
         query=NS(data="eh|cancel",answer=AsyncMock())
         await ns["handle_gallery_callback"](NS(callback_query=query,effective_message=message,effective_user=NS(id=1)),NS())
         message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)

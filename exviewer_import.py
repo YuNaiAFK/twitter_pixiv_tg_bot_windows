@@ -121,6 +121,8 @@ async def reuse(message, status, source_url, user_id, runtime):
     await status.edit_text(result.text, entities=result.entities, parse_mode=None,
         link_preview_options=LinkPreviewOptions(url=result.preview_url, prefer_large_media=True, show_above_text=True),
         reply_markup=keyboard)
+    from eh_idle import arm
+    arm(status.get_bot(), status.chat_id, status.message_id, hide_only=True)
     logger.info("已沿用 exviewer 的既有 EH 預覽結果")
     from channel_publish import offer_eh_publish
     if message.chat.type == "private" and runtime["user_is_admin"](user_id):

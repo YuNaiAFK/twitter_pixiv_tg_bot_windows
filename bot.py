@@ -5895,6 +5895,8 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
             link_preview_options=source_link_options(),
             reply_markup=gallery_keyboard(gallery.gid, gallery.token),
         )
+        from eh_idle import arm
+        arm(status.get_bot(), status.chat_id, status.message_id)
         return True
 
     except ehentai.EhentaiError as exc:
@@ -6231,6 +6233,9 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
             getattr(getattr(message, "chat", None), "type", None)):
         await query.answer("此機器人目前不允許你的帳號使用。", show_alert=True)
         return
+
+    from eh_idle import cancel as cancel_idle
+    cancel_idle(message.chat_id, message.message_id)
 
     if mode == "stop":
         stopped = stop_running_download(message.chat_id)
