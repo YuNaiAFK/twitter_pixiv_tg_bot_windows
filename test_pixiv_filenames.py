@@ -129,13 +129,13 @@ class PixivFilenameTests(unittest.TestCase):
                 restore_pixiv_cached_files([source], [name], scratch)
         self.assertEqual(list(scratch.iterdir()), [])
 
-    def test_only_pixiv_downloads_request_metadata_before_url_terminator(self):
+    def test_metadata_before_url_terminator_preserves_pixiv_only_filename(self):
         build = self.ns["build_gallery_dl_command"]
         pixiv = build("https://www.pixiv.net/artworks/12345", self.root, "pixiv")
         self.assertEqual(pixiv[pixiv.index("--filename") + 1], PIXIV_DOWNLOAD_FILENAME)
         self.assertLess(pixiv.index("--write-metadata"), pixiv.index("--"))
         twitter = build("https://x.com/u/status/1", self.root, "twitter")
-        self.assertNotIn("--write-metadata", twitter)
+        self.assertLess(twitter.index("--write-metadata"), twitter.index("--"))
         self.assertNotIn("--filename", twitter)
 
     def test_actual_download_flow_renames_before_sending(self):
