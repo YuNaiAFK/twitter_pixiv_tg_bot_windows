@@ -57,7 +57,7 @@ class SingleResultMessage:
         filename = kwargs.pop("filename", None)
         if filename is not None:
             from telegram import InputFile
-            media = InputFile(media, filename=filename)
+            media = InputFile(media, filename=filename, attach=True)
         result = await self.status.original.edit_media(media=builder(media=media, **kwargs), reply_markup=markup)
         self.complete()
         return result

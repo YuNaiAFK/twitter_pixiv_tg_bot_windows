@@ -17,6 +17,10 @@ class SingleResultTests(unittest.IsolatedAsyncioTestCase):
             await getattr(message,method)(**kwargs)
             media=original.edit_media.await_args.kwargs["media"]
             self.assertIsInstance(media,builder)
+            from telegram.request._requestparameter import RequestParameter
+            parameter = RequestParameter.from_input("media", media)
+            self.assertTrue(parameter.value["media"].startswith("attach://"))
+            self.assertIn(media.media.attach_name, parameter.multipart_data)
             self.assertEqual(media.media.filename,"original.gif")
             if method!="reply_document":self.assertTrue(media.has_spoiler)
             self.assertEqual(source.media_ids,[12])
