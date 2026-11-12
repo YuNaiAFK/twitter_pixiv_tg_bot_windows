@@ -120,6 +120,12 @@ def ad_candidate_pages(count):
     return range(max(4, count - 9), count + 1)
 
 
+def validate_image_response(data, page):
+    # CDN 的失效回應可能仍是 HTTP 200（例如 Invalid request），不可交給 OCR 解碼。
+    if not isinstance(data, bytes) or not ehentai._looks_like_an_image(data[:32]):
+        raise AdImageFetchError(f"第 {page} 頁來源未回傳圖片，可能是失效網址；本次未上傳。")
+
+
 def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=None, inspector=None, progress=None):
     items = list(urls)
     candidates = list(ad_candidate_pages(len(items)))
@@ -143,6 +149,8 @@ def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=No
                 with httpx.Client(**ehentai.http_client_kwargs(25)) as client:
                     data, _ = r2.fetch_image(url, referer=gallery.page_url, cookies=None, http_client=client)
                     # public_embed_urls 已將需要登入的網址轉成可公開讀取的圖片網址。
+            if inspector is None:
+                validate_image_response(data, page)
             reason = (inspector or inspect_image)(data, samples, binary, tessdata)
             return page, url, reason
         except AdFilterError:

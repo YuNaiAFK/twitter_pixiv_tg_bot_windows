@@ -152,3 +152,19 @@ class NewAdSampleTests(unittest.TestCase):
         self.assertEqual(report.kept,[str(i) for i in range(1,7)])
         self.assertEqual(report.removed,[(7,"sample"),(8,"sample")])
         self.assertEqual(sorted(fetched),[4,5,6,7,8])
+
+
+class SoftImageErrorTests(unittest.TestCase):
+    def test_http_200_error_body_requests_refresh_before_decoder(self):
+        from eh_ad_filter import AdImageFetchError
+        for data in (b"Invalid request",b"<html>expired</html>",b""):
+            with patch("eh_ad_filter.ocr_binary",return_value="ocr"),patch("eh_ad_filter.inspect_image") as inspect:
+                with self.assertRaises(AdImageFetchError):
+                    scan_images(["1","2","3","4"],NS(tags={"other":["extraneous ads"]}),fetcher=lambda url:data)
+                inspect.assert_not_called()
+    def test_real_image_signature_is_not_mistaken_for_error_body(self):
+        import io
+        from PIL import Image
+        from eh_ad_filter import validate_image_response
+        buffer=io.BytesIO();Image.new("RGB",(4,4),"white").save(buffer,format="PNG")
+        validate_image_response(buffer.getvalue(),7)
