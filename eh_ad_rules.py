@@ -1,5 +1,5 @@
 """只有原站外部廣告標籤啟用圖片內容辨識，不以畫廊頁碼刪圖。"""
-CONTENT_RULE_VERSION = "content-tail10-protect3-samples25-v4"
+CONTENT_RULE_VERSION = "content-tail10-protect3-samples27-v5"
 
 
 def has_external_ads(gallery):

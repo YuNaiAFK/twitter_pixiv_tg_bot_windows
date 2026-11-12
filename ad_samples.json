@@ -100,6 +100,14 @@
     {
       "dhash": "358e33e8367057e437c6a5ca8fd09e7245b48be00bca7b1a74287108780c790c",
       "ahash": "c200ff01fe03f49ff657ffe1fecff8fff0f9fc81e89fc03f003f803f802c00"
+    },
+    {
+      "dhash": "8cc4ccc4c8c08cd88a4c8a648bb1d85379133d2e3c213f23b90cf90cec0cec35",
+      "ahash": "7e707ffeff7fff7fefffe5ff1ff91fc30000000007800e803f86ff003e00"
+    },
+    {
+      "dhash": "b166e06129e0b9e4fda47da4ef2079e0bae0bb626f2273407be13df03d66b784",
+      "ahash": "fc12ff00fcf0fff0fff00ff007f00ff80ff809f017f03bf801f800780ff01ff0"
     }
   ]
 }

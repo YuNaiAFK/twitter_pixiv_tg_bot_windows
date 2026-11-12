@@ -189,3 +189,23 @@ class ConfirmedTail3976179Tests(unittest.TestCase):
             self.assertEqual(text_ad_reason(text),"confirmed-ad-domain")
         for text in ("作者後記 感謝閱讀", "https://example.com", "https://fanbox.cc 作者網站"):
             self.assertEqual(text_ad_reason(text),"")
+
+
+class PartialAdTail3893498Tests(unittest.TestCase):
+    def test_only_confirmed_four_removed_and_standalone_illustration_kept(self):
+        base=Path(__file__).parent
+        rows=json.loads((base/"ad_regression_tail_3893498.json").read_text())
+        by_page={str(row["page"]):row for row in rows}
+        samples=[(int(s["dhash"],16),int(s["ahash"],16)) for s in json.loads((base/"ad_samples.json").read_text())["samples"]]
+        # 第 17 頁由既有已確認網域辨識，刻意不新增樣本來掩蓋 OCR 路徑。
+        def inspect(row,known,*args):
+            if row["page"]==17:return text_ad_reason("https://mdaa11.com/0mdktk")
+            return "sample" if matches_sample((int(row["dhash"],16),int(row["ahash"],16)),known) else ""
+        fetch=Mock(side_effect=lambda url:by_page[url])
+        with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
+            report=scan_images([str(i) for i in range(1,19)],NS(tags={"other":["extraneous ads"]}),fetcher=fetch,inspector=inspect)
+        self.assertEqual(report.kept,[str(i) for i in range(1,15)])
+        self.assertEqual([p for p,r in report.removed],list(range(15,19)))
+        self.assertEqual(sorted(int(c.args[0]) for c in fetch.call_args_list),list(range(9,19)))
+        normal=next(r for r in rows if r["page"]==14)
+        self.assertFalse(matches_sample((int(normal["dhash"],16),int(normal["ahash"],16)),samples))
