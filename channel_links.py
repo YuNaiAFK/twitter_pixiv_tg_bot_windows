@@ -143,7 +143,18 @@ class ChannelLinkChecker:
     def __init__(self, session_dir, proxy_url=""):
         self.session_dir, self.proxy_url = session_dir, proxy_url
 
-    async def __call__(self, channel_id, from_chat_id, message_ids, source_url=""):
+    async def find_first(self, channel_ids, source_url):
+        ids = tuple(channel_ids)
+        if not ids:
+            return None
+        import time, logging
+        started = time.monotonic()
+        try:
+            return await self(ids[0], 0, [], source_url, _channel_ids=ids)
+        finally:
+            logging.getLogger(__name__).info("EH 批次頻道查詢：%d 個頻道，耗時 %.2f 秒", len(ids), time.monotonic() - started)
+
+    async def __call__(self, channel_id, from_chat_id, message_ids, source_url="", *, _channel_ids=None):
         from telethon import TelegramClient
         from telegram_documents import _send_lock, proxy_settings
         api_id = os.getenv("TELEGRAM_API_ID", "").strip()
@@ -172,8 +183,19 @@ class ChannelLinkChecker:
                         links.update(message_links(message))
                 if not links:
                     raise ChannelCheckError("解析結果沒有可比對的連結")
-                peer = await client.get_input_entity(channel_id)
-                return await indexed_links(client, peer, links, self.session_dir / f"channel-links-{me.id}-{channel_id}.json")
+                for target in (_channel_ids if _channel_ids is not None else (channel_id,)):
+                    try:
+                        peer = await client.get_input_entity(target)
+                        found = await indexed_links(client, peer, links, self.session_dir / f"channel-links-{me.id}-{target}.json")
+                    except Exception as exc:
+                        if _channel_ids is None:
+                            raise
+                        import logging
+                        logging.getLogger(__name__).warning("頻道 %s 查詢失敗（%s），繼續其他頻道", target, type(exc).__name__)
+                        continue
+                    if found is not None:
+                        return (target, found) if _channel_ids is not None else found
+                return None
             except ChannelCheckError:
                 raise
             except Exception as exc:

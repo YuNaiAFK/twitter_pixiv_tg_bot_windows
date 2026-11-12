@@ -126,7 +126,7 @@ def validate_image_response(data, page):
         raise AdImageFetchError(f"第 {page} 頁來源未回傳圖片，可能是失效網址；本次未上傳。")
 
 
-def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=None, inspector=None, progress=None):
+def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=None, inspector=None, progress=None, cache_dir=None, download_cache=None):
     items = list(urls)
     candidates = list(ad_candidate_pages(len(items)))
     if not has_external_ads(gallery) or not candidates:
@@ -142,16 +142,22 @@ def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=No
         if stop_event is not None and stop_event.is_set():
             raise AdFilterError("已停止廣告檢查；本次未上傳。")
         try:
+            content_type = ""
             if fetcher is not None:
                 data = fetcher(url)
             else:
                 import r2
-                with httpx.Client(**ehentai.http_client_kwargs(25)) as client:
-                    data, _ = r2.fetch_image(url, referer=gallery.page_url, cookies=None, http_client=client)
-                    # public_embed_urls 已將需要登入的網址轉成可公開讀取的圖片網址。
+                data, content_type = r2.fetch_image(url, referer=gallery.page_url, cookies=None, http_client=source_client)
+                # public_embed_urls 已將需要登入的網址轉成可公開讀取的圖片網址。
             if inspector is None:
                 validate_image_response(data, page)
             reason = (inspector or inspect_image)(data, samples, binary, tessdata)
+            if cache_dir is not None and download_cache is not None and not reason:
+                directory = Path(cache_dir)
+                directory.mkdir(parents=True, exist_ok=True)
+                path = directory / f"page-{page}.bin"
+                path.write_bytes(data)
+                download_cache[url] = (path, content_type)
             return page, url, reason
         except AdFilterError:
             raise
@@ -162,17 +168,20 @@ def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=No
         except Exception as exc:
             raise AdFilterError(f"第 {page} 頁無法完成廣告檢查（{type(exc).__name__}）；本次未上傳。") from exc
     removed = []
-    pool = ThreadPoolExecutor(max_workers=2)
-    futures = [pool.submit(one, (page, items[page - 1])) for page in candidates]
-    try:
-        for done, future in enumerate(futures, 1):
-            page, url, reason = future.result()
-            if reason:
-                removed.append((page, reason))
-            if progress:
-                progress(done, len(candidates))
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+    from contextlib import nullcontext
+    transport = httpx.Client(**ehentai.http_client_kwargs(25)) if fetcher is None else nullcontext(None)
+    with transport as source_client:
+        pool = ThreadPoolExecutor(max_workers=2)
+        futures = [pool.submit(one, (page, items[page - 1])) for page in candidates]
+        try:
+            for done, future in enumerate(futures, 1):
+                page, url, reason = future.result()
+                if reason:
+                    removed.append((page, reason))
+                if progress:
+                    progress(done, len(candidates))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
     if not removed:
         raise AdFilterError("畫廊標示外部廣告，但未能可靠辨識廣告頁；本次未上傳，請提供廣告頁碼供確認。")
     removed_pages = {page for page, reason in removed}

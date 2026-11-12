@@ -23,10 +23,23 @@ async def reuse(message, status, source_url, user_id, runtime):
         InlineKeyboardButton("官方壓縮包 · 1280", callback_data=f"eh|zip1280|{gid}|{token}"),
         InlineKeyboardButton("官方壓縮包 · 原圖", callback_data=f"eh|ziporig|{gid}|{token}"),
     ], [InlineKeyboardButton("取消", callback_data="eh|cancel")]])
-    for channel_id in tuple(publisher.channels):
+    from channel_links import ChannelLinkChecker
+    batched = isinstance(publisher.duplicate_check, ChannelLinkChecker)
+    if batched:
+        try:
+            match = await publisher.duplicate_check.find_first(publisher.channels, source_url)
+        except ChannelCheckError as exc:
+            logger.warning("EH 頻道批次查詢失敗（%s）；繼續其他來源", exc)
+            return False
+        if match is None:
+            return False
+        targets = [match]
+    else:
+        targets = [(cid, None) for cid in publisher.channels]
+    for channel_id, prefetched in targets:
         try:
             # 與發布查重共用同一份增量索引，直接比對正規化 EH 來源連結。
-            found = await publisher.duplicate_check(channel_id, message.chat.id, [], source_url)
+            found = prefetched if batched else await publisher.duplicate_check(channel_id, message.chat.id, [], source_url)
         except ChannelCheckError as exc:
             logger.warning("EH 頻道查詢未完成（%s）；繼續其他來源", exc)
             continue

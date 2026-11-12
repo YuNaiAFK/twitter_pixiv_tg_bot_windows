@@ -382,6 +382,7 @@ def upload_many(
     already_used: int = 0,
     budget: int = 0,
     image_fetcher=None,
+    download_cache=None,
 ) -> UploadReport:
     """
     Download each URL and put it in R2, in parallel, keeping the original order.
@@ -414,6 +415,7 @@ def upload_many(
     # read and added to under the lock; a per-image check against a stale total would let several
     # images through at once and overshoot by however many workers are running.
     committed = [already_used]
+    download_hits = [0]
     known_keys: dict[str, str] = {}
 
     def one(item):
@@ -421,11 +423,16 @@ def upload_many(
         if stop_event is not None and stop_event.is_set():
             return index, UploadResult(url, error="已取消")
         try:
-            if image_fetcher is not None:
+            if download_cache is not None and url in download_cache:
+                cached_path, content_type = download_cache[url]
+                data = cached_path.read_bytes()
+                with lock:
+                    download_hits[0] += 1
+            elif image_fetcher is not None:
                 data, content_type = image_fetcher(url)
             else:
                 data, content_type = fetch_image(url, timeout=timeout, referer=referer,
-                                                 cookies=cookies)
+                                                 cookies=cookies, http_client=download_client)
         except Exception as exc:  # noqa: BLE001
             return index, UploadResult(url, error=f"{type(exc).__name__}: {exc}")
 
@@ -487,7 +494,9 @@ def upload_many(
             return index, result
 
     results: list = [None] * len(items)
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+    from contextlib import nullcontext
+    transport = httpx.Client(timeout=timeout, follow_redirects=True) if image_fetcher is None else nullcontext(None)
+    with transport as download_client, ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {pool.submit(one, (i, url)): i for i, url in enumerate(items)}
         for future in as_completed(futures):
             try:
@@ -519,6 +528,9 @@ def upload_many(
 
     # A None here would mean a future never completed, which as_completed does not allow; the
     # substitution is a guard so the report is always the same shape as the input.
+    if download_hits[0]:
+        import logging
+        logging.getLogger(__name__).info("R2 沿用本次已下載圖片：%d 張，不重複取圖", download_hits[0])
     report.results = [r if r is not None else UploadResult(items[i], error="未完成")
                       for i, r in enumerate(results)]
     return report

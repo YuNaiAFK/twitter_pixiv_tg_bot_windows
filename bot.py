@@ -6051,6 +6051,8 @@ async def run_regenerate(query, user, entry: dict) -> None:
     # an entry remembered before pages carried their access token.
     regenerated_link_changed = False
 
+    ad_temp_dir = make_work_dir()
+    ad_download_cache = {}
     try:
         gallery = await asyncio.to_thread(
             ehentai.fetch_gallery, gallery.page_url, cookies_path=resolve_ehentai_cookies(),
@@ -6072,7 +6074,8 @@ async def run_regenerate(query, user, entry: dict) -> None:
         # Same conversion as publishing: the button embeds the same list, so without this
         # a regenerated page would be broken again on every page.
         embed = await public_embed_urls(embed, gallery, query.message)
-        embed = await remove_gallery_ads(embed, gallery, progress_status)
+        embed = await remove_gallery_ads(embed, gallery, progress_status,
+            cache_dir=ad_temp_dir / "ad-downloads", download_cache=ad_download_cache)
 
         # **And the same R2 host as publishing, which this path was missing.**
         #
@@ -6080,7 +6083,7 @@ async def run_regenerate(query, user, entry: dict) -> None:
         # expire, so the page broke again hours later and the button only ever bought time.
         embed = await host_on_r2(
             embed, gallery, mode, progress_status,
-            user_id=user.id, stop_event=threading.Event())
+            user_id=user.id, stop_event=threading.Event(), download_cache=ad_download_cache)
 
         # **Edit the existing page, so the URL does not change.**
         #
@@ -6125,6 +6128,9 @@ async def run_regenerate(query, user, entry: dict) -> None:
             link_preview_options=source_link_options())
         await query.answer("重新生成時發生錯誤，請稍後再試。", show_alert=True)
         return
+
+    finally:
+        shutil.rmtree(ad_temp_dir, ignore_errors=True)
 
     # The message being replaced is the finished result, so its new text is built the same
     # way. **It is usually the cover photo by now**, which is why this goes through
@@ -6547,7 +6553,7 @@ async def handle_r2_retry_decision(update: Update) -> None:
 
 
 async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | None = None,
-                     stop_event=None) -> list:
+                     stop_event=None, download_cache=None) -> list:
     """
     Copy the page's images into R2 and return the URLs to embed instead.
 
@@ -6695,6 +6701,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                     already_used=committed_bytes,
                     budget=allowance,
                     stop_event=stop_event,
+                    download_cache=download_cache,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("R2 上傳失敗：%s", exc)
@@ -6846,7 +6853,7 @@ async def public_embed_urls(embed: list[str], gallery, status,
     return resolved
 
 
-async def remove_gallery_ads(embed, gallery, status, *, stop_event=None):
+async def remove_gallery_ads(embed, gallery, status, *, stop_event=None, cache_dir=None, download_cache=None):
     from eh_ad_rules import has_external_ads
     if not has_external_ads(gallery):
         return embed
@@ -6869,7 +6876,8 @@ async def remove_gallery_ads(embed, gallery, status, *, stop_event=None):
             pass
     try:
         report = await asyncio.to_thread(scan_images, embed, gallery,
-            cookies_path=resolve_ehentai_cookies(), stop_event=stop_event, progress=progress)
+            cookies_path=resolve_ehentai_cookies(), stop_event=stop_event, progress=progress,
+            cache_dir=cache_dir, download_cache=download_cache)
         logger.info("EH 圖片內容去廣告：排除 %s；保留 %s 頁（gid=%s）", report.removed, len(report.kept), gallery.gid)
         await status.edit_text(f"已排除 {len(report.removed)} 頁廣告，保留 {len(report.kept)} 頁。正在繼續製作……", reply_markup=None)
         return report.kept
@@ -6964,6 +6972,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
         # so a gallery already looked at costs no sweep there either.
         # One flag for both slow phases of this parse; neither used to register anything.
         parse_stop = threading.Event()
+        ad_download_cache = {}
         display_urls, original_urls = await gallery_page_urls(
             gallery, status, False, stop_event=parse_stop)
 
@@ -6977,7 +6986,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
         embed = await public_embed_urls(embed, gallery, status, report=True)
         from eh_ad_filter import AdImageFetchError
         try:
-            embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop)
+            embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop,
+                cache_dir=temp_dir / "ad-downloads", download_cache=ad_download_cache)
         except AdImageFetchError:
             if parse_stop.is_set():
                 raise
@@ -6986,7 +6996,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
             display_urls, original_urls = await gallery_page_urls(
                 gallery, status, False, force=True, stop_event=parse_stop)
             embed = await public_embed_urls(display_urls, gallery, status, report=True)
-            embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop)
+            embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop,
+                cache_dir=temp_dir / "ad-downloads", download_cache=ad_download_cache)
 
         # **Copy them somewhere permanent before the page is built.**
         #
@@ -6994,7 +7005,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
         # page keeps working after the keystamp lapses - which is the failure the 重新生成 button
         # exists to repair. Degrades to the original URLs whenever R2 is unavailable.
         embed = await host_on_r2(
-            embed, gallery, mode, status, user_id=user.id, stop_event=parse_stop)
+            embed, gallery, mode, status, user_id=user.id, stop_event=parse_stop,
+            download_cache=ad_download_cache)
 
         try:
             if cached_entry is not None:
