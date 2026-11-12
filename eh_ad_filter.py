@@ -110,9 +110,15 @@ def inspect_image(data, samples, binary, tessdata):
     return ""
 
 
+def ad_candidate_pages(count):
+    # 圖片頁碼從 1 起算；前三張永遠不取圖、不辨識、不排除。
+    return range(max(4, count - 9), count + 1)
+
+
 def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=None, inspector=None, progress=None):
     items = list(urls)
-    if not has_external_ads(gallery):
+    candidates = list(ad_candidate_pages(len(items)))
+    if not has_external_ads(gallery) or not candidates:
         return AdFilterReport(items, [])
     binary = ocr_binary()
     base = Path(__file__).resolve().parent
@@ -138,22 +144,22 @@ def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=No
             raise
         except Exception as exc:
             raise AdFilterError(f"第 {page} 頁無法完成廣告檢查（{type(exc).__name__}）；本次未上傳。") from exc
-    kept, removed = [], []
+    removed = []
     pool = ThreadPoolExecutor(max_workers=2)
-    futures = [pool.submit(one, item) for item in enumerate(items, 1)]
+    futures = [pool.submit(one, (page, items[page - 1])) for page in candidates]
     try:
         for done, future in enumerate(futures, 1):
             page, url, reason = future.result()
             if reason:
                 removed.append((page, reason))
-            else:
-                kept.append(url)
             if progress:
-                progress(done, len(items))
+                progress(done, len(candidates))
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     if not removed:
         raise AdFilterError("畫廊標示外部廣告，但未能可靠辨識廣告頁；本次未上傳，請提供廣告頁碼供確認。")
+    removed_pages = {page for page, reason in removed}
+    kept = [url for page, url in enumerate(items, 1) if page not in removed_pages]
     if not kept or len(removed) > len(items) / 2:
         raise AdFilterError("疑似廣告頁比例過高，為避免誤刪已停止製作；本次未上傳。")
     return AdFilterReport(kept, removed)

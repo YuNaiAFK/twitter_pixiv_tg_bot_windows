@@ -20,15 +20,15 @@ class AdRulesTests(unittest.TestCase):
         self.assertEqual(rule_version("a",self.tagged),rule_version("b",self.tagged))
         self.assertFalse(rule_version("a",NS(tags={})))
     def test_content_not_page_number_selects_ads_and_preserves_order(self):
-        images=["ad","normal1","normal2","normal3"]
+        images=["normal1","normal2","normal3","ad"]
         with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
             report=scan_images(images,self.tagged,fetcher=lambda url:url,inspector=lambda data,*args:"sample" if data=="ad" else "")
         self.assertEqual(report.kept,["normal1","normal2","normal3"])
-        self.assertEqual(report.removed,[(1,"sample")])
+        self.assertEqual(report.removed,[(4,"sample")])
     def test_no_reliable_match_or_scan_failure_prevents_upload(self):
         with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
-            with self.assertRaises(AdFilterError):scan_images(["one","two"],self.tagged,fetcher=lambda u:b"x",inspector=lambda *args:"")
-            with self.assertRaises(AdFilterError):scan_images(["one","two"],self.tagged,fetcher=Mock(side_effect=TimeoutError()))
+            with self.assertRaises(AdFilterError):scan_images(["one","two","three","four"],self.tagged,fetcher=lambda u:b"x",inspector=lambda *args:"")
+            with self.assertRaises(AdFilterError):scan_images(["one","two","three","four"],self.tagged,fetcher=Mock(side_effect=TimeoutError()))
     def test_creator_qr_and_url_alone_are_not_ads(self):
         for text in ("掃碼關注作者", "https://example.com", "作者後記 https://pixiv.net/123 掃碼下載", "QR CODE"):
             self.assertEqual(text_ad_reason(text),"")
@@ -63,3 +63,28 @@ class FilterPipelineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AdFilterError):
             await ns["run_gallery_images"](NS(),NS(edit_text=AsyncMock()),NS(tags={"other":["extraneous ads"]},page_url="url"),"view",Path("."),"",NS())
         host.assert_not_awaited();create.assert_not_called()
+
+
+class TailWindowTests(unittest.TestCase):
+    def test_first_three_never_fetched_even_if_they_match_ads(self):
+        tagged=NS(tags={"other":["extraneous ads"]})
+        fetch=Mock(side_effect=lambda url:url)
+        with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
+            report=scan_images(["ad1","ad2","ad3","keep","ad4"],tagged,fetcher=fetch,
+                               inspector=lambda data,*args:"sample" if data.startswith("ad") else "")
+        self.assertEqual(report.kept,["ad1","ad2","ad3","keep"])
+        self.assertEqual({call.args[0] for call in fetch.call_args_list},{"keep","ad4"})
+    def test_only_last_ten_of_long_gallery_are_fetched(self):
+        tagged=NS(tags={"other":["extraneous ads"]})
+        images=[str(i) for i in range(1,34)];fetch=Mock(side_effect=lambda url:url)
+        with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
+            report=scan_images(images,tagged,fetcher=fetch,inspector=lambda data,*args:"sample" if int(data)>=27 else "")
+        self.assertEqual(report.kept,images[:26])
+        self.assertEqual([p for p,r in report.removed],list(range(27,34)))
+        self.assertEqual({c.args[0] for c in fetch.call_args_list},set(images[-10:]))
+    def test_three_or_fewer_pages_skip_engine_and_images(self):
+        with patch("eh_ad_filter.ocr_binary") as engine:
+            fetch=Mock()
+            report=scan_images(["1","2","3"],NS(tags={"other":["extraneous ads"]}),fetcher=fetch)
+            self.assertEqual(report.kept,["1","2","3"])
+            engine.assert_not_called();fetch.assert_not_called()

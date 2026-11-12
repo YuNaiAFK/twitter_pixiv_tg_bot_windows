@@ -6850,11 +6850,11 @@ async def remove_gallery_ads(embed, gallery, status, *, stop_event=None):
     from eh_ad_rules import has_external_ads
     if not has_external_ads(gallery):
         return embed
-    from eh_ad_filter import scan_images
+    from eh_ad_filter import scan_images, ad_candidate_pages
     stop_event = stop_event or threading.Event()
     chat_id = status.chat_id
     register_running_stop(chat_id, stop_event)
-    await status.edit_text(f"正在本機辨識 {len(embed)} 頁的外部廣告……", reply_markup=stop_keyboard(gallery.gid, gallery.token))
+    await status.edit_text(f"正在檢查末段 {len(ad_candidate_pages(len(embed)))} 張圖片的外部廣告（跳過前 3 張）……", reply_markup=stop_keyboard(gallery.gid, gallery.token))
     loop = asyncio.get_running_loop()
     last = [0.0]
     def progress(done, total):
