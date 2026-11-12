@@ -1445,8 +1445,8 @@ def telegraph_page_images(path: str, *, timeout: float = 20.0, http_client=None)
     Returns an empty list when the page cannot be read, which the caller must treat as "cannot
     confirm" rather than "healthy" - see check_image_urls.
 
-    Only absolute http(s) sources are returned: the page also references scripts and an image
-    proxy, and those are not the gallery's images.
+    Relative image sources (including /file/...) are resolved against the page URL.
+    Only http(s) image sources are returned; scripts and Telegram proxy links are excluded.
     """
     import httpx
 
@@ -1471,6 +1471,9 @@ def telegraph_page_images(path: str, *, timeout: float = 20.0, http_client=None)
     seen = set()
     for match in re.finditer(r'<img\b[^>]*?\bsrc=["\']([^"\']+)["\']', page_html, re.I):
         src = html.unescape(match.group(1)).strip()
+        if not src:
+            continue
+        src = urllib.parse.urljoin(f"https://telegra.ph/{path.lstrip('/')}", src)
         if not src.lower().startswith(("http://", "https://")):
             continue
         # The page includes Telegram's own image proxy in some renderings; it is not the gallery.
