@@ -1,0 +1,32 @@
+[
+  {
+    "page": 4,
+    "dhash": "fa30389824a6f0c6c55634971c4d8ec09c2e9634762684269a6c1a5010e094e1",
+    "ahash": "7f909fc89ffffffffe7bfecfdf25e7f847804f807f00ff00ff00eb00fe30fa78",
+    "ad": false
+  },
+  {
+    "page": 5,
+    "dhash": "98cc5886d8c7b0c51dc125a38f19c739e87bf8789460a60c56e8adc888c9b84d",
+    "ahash": "ef46ffe7ec6158610079c0f06080ff8c7f1f7f3f7ffcfffeab7c74ec7e040c00",
+    "ad": false
+  },
+  {
+    "page": 6,
+    "dhash": "9605e37600e062f0126958cb48c49c0497949b94b93061b0c9e0e582f0c05b98",
+    "ahash": "ffffffffffffffffffffffffffe70fe04bd40dd00c883c9835f83ff01f700080",
+    "ad": false
+  },
+  {
+    "page": 7,
+    "dhash": "6e11f253fe3be73fd73e1738a743a643f6c96cc8bcf9cc663be279e3fbe49984",
+    "ahash": "0fffff1f071f039f03bf03ff13f903e31fff14ff003f0037007004f800f00000",
+    "ad": true
+  },
+  {
+    "page": 8,
+    "dhash": "80ecd371bf787aec38fc79946d1cee9c6b9869807882f841f879d8bfe676b676",
+    "ahash": "f80028f801fe003f043e0ede1ffe3ffe3fde3ff83ff03fe00e000400001a0002",
+    "ad": true
+  }
+]

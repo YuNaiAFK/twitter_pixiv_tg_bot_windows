@@ -133,3 +133,22 @@ class RefreshPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sweep.await_count,2)
             self.assertTrue(sweep.await_args.kwargs["force"])
             self.assertEqual(scan.await_count,2)
+
+
+class NewAdSampleTests(unittest.TestCase):
+    def test_3391383_only_last_two_match_and_first_three_not_fetched(self):
+        base=Path(__file__).parent
+        rows=json.loads((base/"ad_regression_tail_3391383.json").read_text())
+        by_page={str(row["page"]):row for row in rows}
+        fetched=[]
+        def fetch(url):
+            fetched.append(int(url))
+            return by_page[url]
+        def inspect(row,samples,*args):
+            value=(int(row["dhash"],16),int(row["ahash"],16))
+            return "sample" if matches_sample(value,samples) else ""
+        with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
+            report=scan_images([str(i) for i in range(1,9)],NS(tags={"other":["extraneous ads"]}),fetcher=fetch,inspector=inspect)
+        self.assertEqual(report.kept,[str(i) for i in range(1,7)])
+        self.assertEqual(report.removed,[(7,"sample"),(8,"sample")])
+        self.assertEqual(sorted(fetched),[4,5,6,7,8])

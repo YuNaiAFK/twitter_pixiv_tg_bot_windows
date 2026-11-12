@@ -72,6 +72,14 @@
     {
       "dhash": "c8ea98c8c6dcfc80ec10a4d2f4c6fc2eda64f864f830f470e4a0c4cce4aecca8",
       "ahash": "267e066c7f403ffc3ffcfffe7e771f0300200c220c183f303a00324032a227ac"
+    },
+    {
+      "dhash": "6e11f253fe3be73fd73e1738a743a643f6c96cc8bcf9cc663be279e3fbe49984",
+      "ahash": "0fffff1f071f039f03bf03ff13f903e31fff14ff003f0037007004f800f00000"
+    },
+    {
+      "dhash": "80ecd371bf787aec38fc79946d1cee9c6b9869807882f841f879d8bfe676b676",
+      "ahash": "f80028f801fe003f043e0ede1ffe3ffe3fde3ff83ff03fe00e000400001a0002"
     }
   ]
 }
