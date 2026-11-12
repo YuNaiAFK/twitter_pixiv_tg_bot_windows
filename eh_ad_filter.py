@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import httpx
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -16,6 +17,10 @@ from eh_ad_rules import has_external_ads
 
 class AdFilterError(ehentai.EhentaiError):
     pass
+
+
+class AdImageFetchError(AdFilterError):
+    """來源圖片簽名可能失效，允許上層刷新一次網址。"""
 
 
 @dataclass
@@ -134,7 +139,7 @@ def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=No
             if fetcher is not None:
                 data = fetcher(url)
             else:
-                import httpx, r2
+                import r2
                 with httpx.Client(**ehentai.http_client_kwargs(25)) as client:
                     data, _ = r2.fetch_image(url, referer=gallery.page_url, cookies=None, http_client=client)
                     # public_embed_urls 已將需要登入的網址轉成可公開讀取的圖片網址。
@@ -142,6 +147,10 @@ def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=No
             return page, url, reason
         except AdFilterError:
             raise
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            error = AdImageFetchError if code in {401, 403, 404, 410} else AdFilterError
+            raise error(f"第 {page} 頁圖片讀取失敗（HTTP {code}）；本次未上傳。") from exc
         except Exception as exc:
             raise AdFilterError(f"第 {page} 頁無法完成廣告檢查（{type(exc).__name__}）；本次未上傳。") from exc
     removed = []

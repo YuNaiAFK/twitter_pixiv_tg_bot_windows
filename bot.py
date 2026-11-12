@@ -6975,7 +6975,18 @@ async def run_gallery_images(message, status, gallery, mode: str,
         # The display URLs. The original-resolution page was removed.
         embed = display_urls
         embed = await public_embed_urls(embed, gallery, status, report=True)
-        embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop)
+        from eh_ad_filter import AdImageFetchError
+        try:
+            embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop)
+        except AdImageFetchError:
+            if parse_stop.is_set():
+                raise
+            logger.info("去廣告圖片網址失效，重新取得一次圖片清單：gid=%s", gallery.gid)
+            await status.edit_text("圖片網址已失效，正在重新取得並再次檢查廣告……", reply_markup=None)
+            display_urls, original_urls = await gallery_page_urls(
+                gallery, status, False, force=True, stop_event=parse_stop)
+            embed = await public_embed_urls(display_urls, gallery, status, report=True)
+            embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop)
 
         # **Copy them somewhere permanent before the page is built.**
         #

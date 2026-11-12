@@ -88,3 +88,48 @@ class TailWindowTests(unittest.TestCase):
             report=scan_images(["1","2","3"],NS(tags={"other":["extraneous ads"]}),fetcher=fetch)
             self.assertEqual(report.kept,["1","2","3"])
             engine.assert_not_called();fetch.assert_not_called()
+
+
+class ExpiredImageTests(unittest.TestCase):
+    def test_expired_signature_has_refreshable_error(self):
+        import httpx
+        from eh_ad_filter import AdImageFetchError
+        for status in (401,403,404,410):
+            response=httpx.Response(status,request=httpx.Request("GET","https://img.test/expired"))
+            with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
+                with self.assertRaises(AdImageFetchError):
+                    scan_images(["1","2","3","4"],NS(tags={"other":["extraneous ads"]}),
+                                fetcher=Mock(side_effect=httpx.HTTPStatusError("expired",request=response.request,response=response)))
+
+
+class RefreshPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refresh_once_before_any_r2_upload(self):
+        import asyncio,threading,logging
+        from unittest.mock import AsyncMock
+        from eh_ad_filter import AdImageFetchError
+        import ehentai
+        tree=ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
+        node=next(n for n in tree.body if isinstance(n,ast.AsyncFunctionDef) and n.name=="run_gallery_images")
+        for second in (["clean"],AdImageFetchError("still expired")):
+            scan=AsyncMock(side_effect=[AdImageFetchError("403"),second])
+            sweep=AsyncMock(return_value=(["image"],[]));host=AsyncMock(return_value=["hosted"])
+            create=Mock(return_value=NS(url="https://telegra.ph/page"))
+            ns=dict(Path=Path,asyncio=asyncio,threading=threading,cached_telegraph_entry=lambda *a:None,
+                    gallery_page_urls=sweep,source_link_options=lambda:None,public_embed_urls=AsyncMock(return_value=["image"]),
+                    remove_gallery_ads=scan,host_on_r2=host,ehentai=NS(create_telegraph_page=create,TelegraphError=ehentai.TelegraphError),
+                    TELEGRAPH_AUTHOR="test",remember_telegraph_page=Mock(),build_gallery_info=lambda *a,**k:"summary",
+                    escape_html=lambda s:s,remember_regenerate=Mock(),regenerate_keyboard=lambda *a:None,
+                    edit_message_to_cover=AsyncMock(return_value=True),logger=logging.getLogger("refresh-test"),EH_CHANNEL_PUBLISHER=None)
+            exec(compile(ast.Module(body=[node],type_ignores=[]),"<refresh-pipeline>","exec"),ns)
+            with patch("channel_publish.offer_eh_publish",new_callable=AsyncMock):
+                call=ns["run_gallery_images"](NS(chat_id=1),NS(edit_text=AsyncMock()),NS(page_url="url",gid="1",token="a"),"view",Path("."),"",NS(id=1))
+                if isinstance(second,Exception):
+                    with self.assertRaises(AdImageFetchError):await call
+                    host.assert_not_awaited();create.assert_not_called()
+                else:
+                    await call
+                    host.assert_awaited_once()
+                    self.assertEqual(host.await_args.args[0],["clean"])
+            self.assertEqual(sweep.await_count,2)
+            self.assertTrue(sweep.await_args.kwargs["force"])
+            self.assertEqual(scan.await_count,2)
