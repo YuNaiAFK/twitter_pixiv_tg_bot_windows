@@ -1950,7 +1950,7 @@ def remember_telegraph_page(url: str, gallery, mode: str, page, embedded=None, *
         "access_token": page.access_token,
         "images": samples,
         "layout_version": layout_version,
-        "ad_rule_version": rule_version(url),
+        "ad_rule_version": rule_version(url, gallery),
         "count": len(embedded or []),
         "at": time.time(),
     }
@@ -5872,20 +5872,33 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
     status = await send_status(message, "正在讀取 e-hentai 畫廊……")
 
     try:
+        from eh_ad_rules import known_rule, rule_version
+        reuse_runtime = globals()
+        prefetched_gallery = None
+        if known_rule(url):
+            # 僅讀取標籤，不下載圖片；未標示外部廣告時沿用原解析流程。
+            try:
+                ad_gallery = await asyncio.to_thread(
+                    ehentai.fetch_gallery, url, cookies_path=resolve_ehentai_cookies(),
+                    timeout=float(EHENTAI_TIMEOUT_SECONDS))
+                prefetched_gallery = ad_gallery
+                reuse_runtime = dict(globals(), EH_AD_FILTER_REQUIRED=bool(rule_version(url, ad_gallery)))
+            except ehentai.EhentaiError as exc:
+                logger.warning("外部廣告標籤讀取失敗，未啟用圖片排除：%s", exc)
         from channel_reuse import reuse as reuse_channel
-        if await reuse_channel(message, status, url, user.id, globals()):
+        if await reuse_channel(message, status, url, user.id, reuse_runtime):
             return True
         from exviewer_import import reuse
-        if await reuse(message, status, url, user.id, globals()):
+        if await reuse(message, status, url, user.id, reuse_runtime):
             return True
         # A gallery parsed before is served from the cache, so a repeat request
         # costs no request to e-hentai at all. The facts are cheap to fetch; the
         # per-page sweep is not, and that is what the cache mostly saves.
         cached = gallery_cache_lookup(url)
-        gallery = gallery_from_payload(cached) if cached else None
+        gallery = prefetched_gallery or (gallery_from_payload(cached) if cached else None)
         age = None
         if gallery is not None:
-            age = gallery_cache_age(url)
+            age = None if prefetched_gallery is not None else gallery_cache_age(url)
             logger.info("命中畫廊快取（%.0f 秒前）：%s", age or 0, url)
 
         # The facts go stale separately from the sweep: one request against fifty.
@@ -6060,7 +6073,7 @@ async def run_regenerate(query, user, entry: dict) -> None:
                                 (display_urls, original_urls))
         # The display URLs: there is only one Telegraph mode now.
         from eh_ad_rules import filter_pages
-        embed = filter_pages(gallery.page_url, display_urls)
+        embed = filter_pages(gallery.page_url, display_urls, gallery)
         # Same conversion as publishing: the button embeds the same list, so without this
         # a regenerated page would be broken again on every page.
         embed = await public_embed_urls(embed, gallery, query.message)
@@ -6865,9 +6878,9 @@ async def run_gallery_images(message, status, gallery, mode: str,
     repaired = False
     embed = []
     damage = None
-    from eh_ad_rules import rule_version, filter_pages
-    needs_ad_filter = bool(rule_version(gallery.page_url)) and (
-        cached_entry is None or cached_entry.get("ad_rule_version") != rule_version(gallery.page_url))
+    from eh_ad_rules import known_rule, rule_version, filter_pages
+    needs_ad_filter = known_rule(gallery.page_url) and (
+        cached_entry is None or cached_entry.get("ad_rule_version", "") != rule_version(gallery.page_url, gallery))
     if cached_entry is not None and not needs_ad_filter:
         candidate = telegraph_page_from_entry(cached_entry)
         if candidate is not None:
@@ -6927,7 +6940,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
 
         # The display URLs. The original-resolution page was removed.
         from eh_ad_rules import filter_pages
-        embed = filter_pages(gallery.page_url, display_urls)
+        embed = filter_pages(gallery.page_url, display_urls, gallery)
         embed = await public_embed_urls(embed, gallery, status, report=True)
 
         # **Copy them somewhere permanent before the page is built.**
