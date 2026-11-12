@@ -20,6 +20,11 @@ def results(token="abc"):
 
 
 class ExviewerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        validity = patch.object(external, "valid_result", AsyncMock(return_value=True))
+        validity.start()
+        self.addCleanup(validity.stop)
+
     def test_only_exact_gallery_and_existing_telegraph_preview(self):
         self.assertIsNone(external.existing_result(results("def"), URL))
         found = external.existing_result(results(), URL)

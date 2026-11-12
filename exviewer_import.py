@@ -101,6 +101,26 @@ async def lookup(source_url, session_dir, proxy_url=""):
         return None
 
 
+def valid_page(url):
+    import ehentai
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or parts.hostname != "telegra.ph" or not parts.path.strip("/"):
+        return False
+    urls = ehentai.telegraph_page_images(parts.path, timeout=8)
+    if not urls:
+        return False
+    report = ehentai.check_image_urls(urls, workers=16, timeout=6, deep=True, stop_after=1)
+    return report.ok and not report.stopped_early and report.checked == len(set(urls))
+
+
+async def valid_result(url):
+    try:
+        return await asyncio.to_thread(valid_page, url)
+    except Exception as exc:
+        logger.warning("exviewer 預覽檢查未完成（%s）；沿用本機 EH 解析", type(exc).__name__)
+        return False
+
+
 async def reuse(message, status, source_url, user_id, runtime):
     if message.chat.type not in {"private", "group", "supergroup"}:
         return False
@@ -108,6 +128,9 @@ async def reuse(message, status, source_url, user_id, runtime):
         return False
     result = await lookup(source_url, runtime["BASE_DIR"] / ".mtproto", runtime["ehentai"].proxy_url())
     if result is None:
+        return False
+    if not await valid_result(result.preview_url):
+        logger.info("exviewer 預覽或圖片失效，沿用本機 EH 解析")
         return False
     match = re.search(r"/g/(\d+)/([a-fA-F0-9]+)", source_url)
     keyboard = None
