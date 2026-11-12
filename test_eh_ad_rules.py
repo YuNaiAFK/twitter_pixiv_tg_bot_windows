@@ -168,3 +168,24 @@ class SoftImageErrorTests(unittest.TestCase):
         from eh_ad_filter import validate_image_response
         buffer=io.BytesIO();Image.new("RGB",(4,4),"white").save(buffer,format="PNG")
         validate_image_response(buffer.getvalue(),7)
+
+
+class ConfirmedTail3976179Tests(unittest.TestCase):
+    def test_new_samples_remove_only_confirmed_five(self):
+        base=Path(__file__).parent
+        rows=json.loads((base/"ad_regression_tail_3976179.json").read_text())
+        by_page={str(row["page"]):row for row in rows}
+        fetch=Mock(side_effect=lambda url:by_page[url])
+        def inspect(row,samples,*args):
+            value=(int(row["dhash"],16),int(row["ahash"],16))
+            return "sample" if matches_sample(value,samples) else ""
+        with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
+            report=scan_images([str(i) for i in range(1,24)],NS(tags={"other":["extraneous ads"]}),fetcher=fetch,inspector=inspect)
+        self.assertEqual(report.kept,[str(i) for i in range(1,19)])
+        self.assertEqual(report.removed,[(p,"sample") for p in range(19,24)])
+        self.assertEqual(sorted(int(c.args[0]) for c in fetch.call_args_list),list(range(14,24)))
+    def test_confirmed_domains_and_normal_author_text(self):
+        for text in ("http://aifun.ltd/j", "HTTPS://MBCZ85.COM/mcsh02", "https : // gumw39 . com / iwusgt"):
+            self.assertEqual(text_ad_reason(text),"confirmed-ad-domain")
+        for text in ("作者後記 感謝閱讀", "https://example.com", "https://fanbox.cc 作者網站"):
+            self.assertEqual(text_ad_reason(text),"")

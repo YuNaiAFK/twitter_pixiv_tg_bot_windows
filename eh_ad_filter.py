@@ -60,7 +60,8 @@ def matches_sample(value, samples):
 def text_ad_reason(text):
     value = re.sub(r"\s+", "", text).casefold().replace("：", ":")
     # 已確認廣告的導流網域；一般作者／販售平台網址不在此名單。
-    known = ("mdaa11.com", "jm-3x.cc", "17mimei.live", "astonekm.net", "anime.bllaw-0.com")
+    known = ("mdaa11.com", "jm-3x.cc", "17mimei.live", "astonekm.net", "anime.bllaw-0.com",
+             "aifun.ltd", "mbcz85.com", "gumw39.com")
     if any(domain in value for domain in known):
         return "confirmed-ad-domain"
     has_url = bool(re.search(r"(?:https?://|www\.)[a-z0-9]|[a-z0-9-]+\.(?:app|com|net|cc|xyz|live)(?:[/\s]|$)", value))
