@@ -1943,12 +1943,14 @@ def remember_telegraph_page(url: str, gallery, mode: str, page, embedded=None, *
         # the whole page.
         step = max(1, len(embedded) // TELEGRAPH_IMAGE_SAMPLES)
         samples = [embedded[i] for i in range(0, len(embedded), step)][:TELEGRAPH_IMAGE_SAMPLES]
+    from eh_ad_rules import rule_version
     pages[mode] = {
         "url": page.url,
         "path": page.path,
         "access_token": page.access_token,
         "images": samples,
         "layout_version": layout_version,
+        "ad_rule_version": rule_version(url),
         "count": len(embedded or []),
         "at": time.time(),
     }
@@ -6057,7 +6059,8 @@ async def run_regenerate(query, user, entry: dict) -> None:
         await asyncio.to_thread(remember_gallery, gallery.page_url, gallery,
                                 (display_urls, original_urls))
         # The display URLs: there is only one Telegraph mode now.
-        embed = display_urls
+        from eh_ad_rules import filter_pages
+        embed = filter_pages(gallery.page_url, display_urls)
         # Same conversion as publishing: the button embeds the same list, so without this
         # a regenerated page would be broken again on every page.
         embed = await public_embed_urls(embed, gallery, query.message)
@@ -6862,7 +6865,10 @@ async def run_gallery_images(message, status, gallery, mode: str,
     repaired = False
     embed = []
     damage = None
-    if cached_entry is not None:
+    from eh_ad_rules import rule_version, filter_pages
+    needs_ad_filter = bool(rule_version(gallery.page_url)) and (
+        cached_entry is None or cached_entry.get("ad_rule_version") != rule_version(gallery.page_url))
+    if cached_entry is not None and not needs_ad_filter:
         candidate = telegraph_page_from_entry(cached_entry)
         if candidate is not None:
             # **Read the page and check every image it embeds.**
@@ -6920,7 +6926,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
         )
 
         # The display URLs. The original-resolution page was removed.
-        embed = display_urls
+        from eh_ad_rules import filter_pages
+        embed = filter_pages(gallery.page_url, display_urls)
         embed = await public_embed_urls(embed, gallery, status, report=True)
 
         # **Copy them somewhere permanent before the page is built.**

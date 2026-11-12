@@ -122,6 +122,9 @@ async def valid_result(url):
 
 
 async def reuse(message, status, source_url, user_id, runtime):
+    from eh_ad_rules import rule_version
+    if rule_version(source_url):
+        return False
     if message.chat.type not in {"private", "group", "supergroup"}:
         return False
     if message.chat.type == "private" and not runtime["user_is_admin"](user_id):

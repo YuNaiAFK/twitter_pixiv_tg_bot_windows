@@ -8,6 +8,9 @@ logger = logging.getLogger(__name__)
 
 
 async def reuse(message, status, source_url, user_id, runtime):
+    from eh_ad_rules import rule_version
+    if rule_version(source_url):
+        return False
     publisher = runtime.get("EH_CHANNEL_PUBLISHER")
     if publisher is None or not publisher.channels or publisher.duplicate_check is None:
         return False
