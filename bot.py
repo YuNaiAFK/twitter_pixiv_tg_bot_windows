@@ -5872,19 +5872,12 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
     status = await send_status(message, "正在讀取 e-hentai 畫廊……")
 
     try:
-        from eh_ad_rules import known_rule, rule_version
-        reuse_runtime = globals()
-        prefetched_gallery = None
-        if known_rule(url):
-            # 僅讀取標籤，不下載圖片；未標示外部廣告時沿用原解析流程。
-            try:
-                ad_gallery = await asyncio.to_thread(
-                    ehentai.fetch_gallery, url, cookies_path=resolve_ehentai_cookies(),
-                    timeout=float(EHENTAI_TIMEOUT_SECONDS))
-                prefetched_gallery = ad_gallery
-                reuse_runtime = dict(globals(), EH_AD_FILTER_REQUIRED=bool(rule_version(url, ad_gallery)))
-            except ehentai.EhentaiError as exc:
-                logger.warning("外部廣告標籤讀取失敗，未啟用圖片排除：%s", exc)
+        from eh_ad_rules import has_external_ads
+        # 外部結果沿用前先讀原站標籤；無外部廣告時不讀取任何圖片作辨識。
+        prefetched_gallery = await asyncio.to_thread(
+            ehentai.fetch_gallery, url, cookies_path=resolve_ehentai_cookies(),
+            timeout=float(EHENTAI_TIMEOUT_SECONDS))
+        reuse_runtime = dict(globals(), EH_AD_FILTER_REQUIRED=has_external_ads(prefetched_gallery))
         from channel_reuse import reuse as reuse_channel
         if await reuse_channel(message, status, url, user.id, reuse_runtime):
             return True
@@ -6059,6 +6052,9 @@ async def run_regenerate(query, user, entry: dict) -> None:
     regenerated_link_changed = False
 
     try:
+        gallery = await asyncio.to_thread(
+            ehentai.fetch_gallery, gallery.page_url, cookies_path=resolve_ehentai_cookies(),
+            timeout=float(EHENTAI_TIMEOUT_SECONDS))
         # Deliberately fetches fresh URLs rather than reading the sweep from the
         # cache: the whole point of regenerating is that the cached links have
         # expired. The fresh set is then written back, so the cache is current again.
@@ -6072,11 +6068,11 @@ async def run_regenerate(query, user, entry: dict) -> None:
         await asyncio.to_thread(remember_gallery, gallery.page_url, gallery,
                                 (display_urls, original_urls))
         # The display URLs: there is only one Telegraph mode now.
-        from eh_ad_rules import filter_pages
-        embed = filter_pages(gallery.page_url, display_urls, gallery)
+        embed = display_urls
         # Same conversion as publishing: the button embeds the same list, so without this
         # a regenerated page would be broken again on every page.
         embed = await public_embed_urls(embed, gallery, query.message)
+        embed = await remove_gallery_ads(embed, gallery, progress_status)
 
         # **And the same R2 host as publishing, which this path was missing.**
         #
@@ -6384,14 +6380,15 @@ async def run_gallery_action(query, message, user, mode: str,
             # cached separately inside run_gallery_images, since that is the slow part.
             cached = gallery_cache_lookup(gallery_url)
             gallery = gallery_from_payload(cached) if cached else None
-            if gallery is None:
+            if gallery is None or mode == "view":
                 gallery = await asyncio.to_thread(
                     ehentai.fetch_gallery,
                     gallery_url,
                     cookies_path=resolve_ehentai_cookies(),
                     timeout=float(EHENTAI_TIMEOUT_SECONDS),
                 )
-                await asyncio.to_thread(remember_gallery, gallery_url, gallery)
+                if not cached:
+                    await asyncio.to_thread(remember_gallery, gallery_url, gallery)
             source_note = build_caption(gallery_url)
 
             if mode == "view":
@@ -6566,7 +6563,8 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
     if settings is None or not embed:
         return embed
 
-    cached = cached_r2_urls(gallery.page_url, gallery, mode)
+    from eh_ad_rules import has_external_ads
+    cached = [] if has_external_ads(gallery) else cached_r2_urls(gallery.page_url, gallery, mode)
     public_prefix = settings.public_base.rstrip("/") + "/"
     if (cached and len(cached) == len(embed)
             and all(isinstance(url, str) and url.startswith(public_prefix) for url in cached)):
@@ -6848,6 +6846,39 @@ async def public_embed_urls(embed: list[str], gallery, status,
     return resolved
 
 
+async def remove_gallery_ads(embed, gallery, status, *, stop_event=None):
+    from eh_ad_rules import has_external_ads
+    if not has_external_ads(gallery):
+        return embed
+    from eh_ad_filter import scan_images
+    stop_event = stop_event or threading.Event()
+    chat_id = status.chat_id
+    register_running_stop(chat_id, stop_event)
+    await status.edit_text(f"正在本機辨識 {len(embed)} 頁的外部廣告……", reply_markup=stop_keyboard(gallery.gid, gallery.token))
+    loop = asyncio.get_running_loop()
+    last = [0.0]
+    def progress(done, total):
+        if time.monotonic() - last[0] < 4:
+            return
+        last[0] = time.monotonic()
+        future = asyncio.run_coroutine_threadsafe(status.edit_text(
+            f"正在辨識外部廣告：{done}/{total} 頁……", reply_markup=stop_keyboard(gallery.gid, gallery.token)), loop)
+        try:
+            future.result(timeout=10)
+        except Exception:
+            pass
+    try:
+        report = await asyncio.to_thread(scan_images, embed, gallery,
+            cookies_path=resolve_ehentai_cookies(), stop_event=stop_event, progress=progress)
+        logger.info("EH 圖片內容去廣告：排除 %s；保留 %s 頁（gid=%s）", report.removed, len(report.kept), gallery.gid)
+        await status.edit_text(f"已排除 {len(report.removed)} 頁廣告，保留 {len(report.kept)} 頁。正在繼續製作……", reply_markup=None)
+        return report.kept
+    finally:
+        running = _running_downloads.get(chat_id)
+        if running is not None and running[1] is stop_event:
+            _running_downloads.pop(chat_id, None)
+
+
 async def run_gallery_images(message, status, gallery, mode: str,
                              temp_dir: Path, source_note: str, user) -> None:
     """
@@ -6878,9 +6909,9 @@ async def run_gallery_images(message, status, gallery, mode: str,
     repaired = False
     embed = []
     damage = None
-    from eh_ad_rules import known_rule, rule_version, filter_pages
-    needs_ad_filter = known_rule(gallery.page_url) and (
-        cached_entry is None or cached_entry.get("ad_rule_version", "") != rule_version(gallery.page_url, gallery))
+    from eh_ad_rules import rule_version
+    needs_ad_filter = (cached_entry is not None and
+        cached_entry.get("ad_rule_version", "") != rule_version(gallery.page_url, gallery))
     if cached_entry is not None and not needs_ad_filter:
         candidate = telegraph_page_from_entry(cached_entry)
         if candidate is not None:
@@ -6899,8 +6930,11 @@ async def run_gallery_images(message, status, gallery, mode: str,
                 # The page could not be read. That is a problem at Telegraph, not with the
                 # gallery, and punishing a transient outage with a full re-sweep would be worse
                 # than reusing a page that is probably fine.
-                logger.warning("讀不到 Telegraph 頁面的圖片清單，仍沿用原頁面：%s", candidate.url)
-                reuse_page = candidate
+                if not rule_version(gallery.page_url, gallery):
+                    logger.warning("讀不到 Telegraph 圖片清單，沿用原頁面：%s", candidate.url)
+                    reuse_page = candidate
+                else:
+                    logger.info("無法確認已去廣告的頁面內容，重新製作：%s", candidate.url)
             else:
                 report = await asyncio.to_thread(
                     ehentai.check_image_urls,
@@ -6939,9 +6973,9 @@ async def run_gallery_images(message, status, gallery, mode: str,
         )
 
         # The display URLs. The original-resolution page was removed.
-        from eh_ad_rules import filter_pages
-        embed = filter_pages(gallery.page_url, display_urls, gallery)
+        embed = display_urls
         embed = await public_embed_urls(embed, gallery, status, report=True)
+        embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop)
 
         # **Copy them somewhere permanent before the page is built.**
         #

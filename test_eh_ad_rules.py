@@ -1,45 +1,65 @@
 import ast
-import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock, patch
-from eh_ad_rules import filter_pages,rule_version
+import unittest
+from unittest.mock import Mock,patch
+from eh_ad_rules import has_external_ads,rule_version
+from eh_ad_filter import scan_images,AdFilterError,text_ad_reason,matches_sample
 
 class AdRulesTests(unittest.TestCase):
-    def test_known_ranges_preserve_other_pages(self):
-        for url,start,end,total in (("https://exhentai.org/g/2051305/d1969d0ee2/",36,41,41),
-                                    ("https://e-hentai.org/g/2000612/54a53baa2d/?p=1",38,42,45)):
-            pages=list(range(1,total+1))
-            self.assertEqual(filter_pages(url,pages,NS(tags={"other":["extraneous ads"]})),[p for p in pages if not start<=p<=end])
-            self.assertTrue(rule_version(url,NS(tags={"other":["extraneous ads"]})))
-    def test_unrelated_gallery_or_token_not_affected(self):
-        for url in ("https://exhentai.org/g/2051305/abc/","https://exhentai.org/g/123/d1969d0ee2/"):
-            self.assertEqual(filter_pages(url,list(range(50))),list(range(50)))
-            self.assertFalse(rule_version(url))
-    def test_new_publish_and_regenerate_filter_before_r2(self):
+    def setUp(self):
+        self.tagged=NS(tags={"other":["extraneous ads"]},page_url="https://e-hentai.org/g/999/abc/")
+    def test_tag_gate_never_reads_images(self):
+        fetch=Mock()
+        report=scan_images(["one","two"],NS(tags={}),fetcher=fetch)
+        self.assertEqual(report.kept,["one","two"]);fetch.assert_not_called()
+        self.assertFalse(has_external_ads(NS(tags={"other":["watermarked","scanmark"]})))
+    def test_all_tagged_galleries_use_same_content_version(self):
+        self.assertTrue(rule_version("https://e-hentai.org/g/999/abc/",self.tagged))
+        self.assertEqual(rule_version("a",self.tagged),rule_version("b",self.tagged))
+        self.assertFalse(rule_version("a",NS(tags={})))
+    def test_content_not_page_number_selects_ads_and_preserves_order(self):
+        images=["ad","normal1","normal2","normal3"]
+        with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
+            report=scan_images(images,self.tagged,fetcher=lambda url:url,inspector=lambda data,*args:"sample" if data=="ad" else "")
+        self.assertEqual(report.kept,["normal1","normal2","normal3"])
+        self.assertEqual(report.removed,[(1,"sample")])
+    def test_no_reliable_match_or_scan_failure_prevents_upload(self):
+        with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
+            with self.assertRaises(AdFilterError):scan_images(["one","two"],self.tagged,fetcher=lambda u:b"x",inspector=lambda *args:"")
+            with self.assertRaises(AdFilterError):scan_images(["one","two"],self.tagged,fetcher=Mock(side_effect=TimeoutError()))
+    def test_creator_qr_and_url_alone_are_not_ads(self):
+        for text in ("掃碼關注作者", "https://example.com", "作者後記 https://pixiv.net/123 掃碼下載", "QR CODE"):
+            self.assertEqual(text_ad_reason(text),"")
+        self.assertTrue(text_ad_reason("全站免費 掃碼下載 http://example.com"))
+        self.assertTrue(text_ad_reason("掃碼領取優惠券"))
+    def test_real_image_signatures_keep_26_and_remove_only_confirmed_7(self):
+        base=Path(__file__).parent
+        samples=[(int(s["dhash"],16),int(s["ahash"],16)) for s in json.loads((base/"ad_samples.json").read_text())["samples"]]
+        data=json.loads((base/"ad_regression_signatures.json").read_text())
+        removed=[row["page"] for row in data if matches_sample((int(row["dhash"],16),int(row["ahash"],16)),samples)]
+        self.assertEqual(removed,list(range(27,34)))
+    def test_publish_and_regenerate_filter_before_r2(self):
         tree=ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
         for name in ("run_gallery_images","run_regenerate"):
             node=next(n for n in tree.body if isinstance(n,ast.AsyncFunctionDef) and n.name==name)
             calls=[n for n in ast.walk(node) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)]
-            filtered=next(n.lineno for n in calls if n.func.id=="filter_pages")
-            hosted=next(n.lineno for n in calls if n.func.id=="host_on_r2")
-            self.assertLess(filtered,hosted)
-
-class BypassTests(unittest.IsolatedAsyncioTestCase):
-    async def test_known_ads_bypass_channel_and_exviewer(self):
-        import channel_reuse,exviewer_import
-        for module in (channel_reuse,exviewer_import):
-            with patch("exviewer_import.lookup",new_callable=AsyncMock) as lookup:
-                self.assertFalse(await module.reuse(NS(),NS(),"https://exhentai.org/g/2051305/d1969d0ee2/",1,{"EH_AD_FILTER_REQUIRED":True}))
-                lookup.assert_not_awaited()
+            self.assertLess(next(n.lineno for n in calls if n.func.id=="remove_gallery_ads"),next(n.lineno for n in calls if n.func.id=="host_on_r2"))
 
 
-class TagGateTests(unittest.TestCase):
-    def test_no_tag_never_filters_even_known_gallery(self):
-        url="https://exhentai.org/g/2051305/d1969d0ee2/"
-        for gallery in (None,NS(tags={}),NS(tags={"other":["watermarked","scanmark"]})):
-            self.assertEqual(filter_pages(url,list(range(1,42)),gallery),list(range(1,42)))
-            self.assertEqual(rule_version(url,gallery),"")
-    def test_tag_without_known_rule_does_not_guess_pages(self):
-        gallery=NS(tags={"other":["extraneous ads"]})
-        self.assertEqual(filter_pages("https://exhentai.org/g/1/abc/",list(range(45)),gallery),list(range(45)))
+class FilterPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_filter_cannot_reach_r2_or_create_page(self):
+        import asyncio,threading,logging
+        from unittest.mock import AsyncMock
+        tree=ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
+        node=next(n for n in tree.body if isinstance(n,ast.AsyncFunctionDef) and n.name=="run_gallery_images")
+        host=AsyncMock();create=Mock()
+        ns=dict(Path=Path,asyncio=asyncio,threading=threading,cached_telegraph_entry=lambda *args:None,
+                gallery_page_urls=AsyncMock(return_value=(["image"],[])),source_link_options=lambda:None,
+                public_embed_urls=AsyncMock(return_value=["image"]),remove_gallery_ads=AsyncMock(side_effect=AdFilterError("unconfirmed")),
+                host_on_r2=host,ehentai=NS(create_telegraph_page=create),logger=logging.getLogger("ad-filter-test"))
+        exec(compile(ast.Module(body=[node],type_ignores=[]),"<ad-filter-pipeline>","exec"),ns)
+        with self.assertRaises(AdFilterError):
+            await ns["run_gallery_images"](NS(),NS(edit_text=AsyncMock()),NS(tags={"other":["extraneous ads"]},page_url="url"),"view",Path("."),"",NS())
+        host.assert_not_awaited();create.assert_not_called()

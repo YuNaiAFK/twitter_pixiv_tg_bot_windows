@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "samples": [
+    {
+      "dhash": "e5266f306a32f16cf34ccdceee5c8c7af463f6c7b38edb4ccc6cf42ad243f146",
+      "ahash": "3f8331803ffa3fffffff07e0037f023f1fff0ff01fe001c007277f007f003800"
+    },
+    {
+      "dhash": "c324cb34f941f248fe088d0aa983d934db2ccb1cf1589a3184288470c562c386",
+      "ahash": "3ff43d943ff07ffc1ffefffe7ff07fb47fc47f847f88ff00fa38783870302000"
+    },
+    {
+      "dhash": "f2b0a1a6b9e1f0f8299c1cac3e939b139b029c320c4635873da6cc67cc7ff41f",
+      "ahash": "3fd01ff05c30ffffdfff87ef87f3fff0eff8fff0f7e09fe08fe0f403fe03ff07"
+    },
+    {
+      "dhash": "9f1c1c242cb632b8a6b8e6d4b842a871f8f0f1aaf3a2ce50dea834a96aa98a01",
+      "ahash": "efc0ffc0ffbed87f7b7e3f7e7f00ff003e003cfa0880200000000c0036000000"
+    },
+    {
+      "dhash": "35ce179ee09c9c4f1e2e5b1d0d832a692e611bdc558d54cf18372b9310769166",
+      "ahash": "ffffc3dffe064200c703818fc0019f3d873f80000045fa01ef07ffdfff7fffff"
+    },
+    {
+      "dhash": "74d8da1082b4ecb4eaa658e60ce31eafd74ce51cccc8991019c14f520d423b84",
+      "ahash": "0008038879fe1ffe3a820020003000007fec7ffe7ffcfdd0cdf083f887f8dff0"
+    },
+    {
+      "dhash": "925daaab3acf161107211f3712c2f2227320635a67311d2038647a24d131fc55",
+      "ahash": "4b7fffffffffcbdc81f08000c0607ff0bff0bfc8b19c85bc8f309fb03f803f00"
+    },
+    {
+      "dhash": "203348b1d2ef310c231c8619a10d036d196d3169166d526c666b428b332b9669",
+      "ahash": "fffff6ffffffffeffd07f300f800f381efa0cd21d23dea34b32080e1c1a1fbfd"
+    },
+    {
+      "dhash": "b36ea3eedba4e3a0d164e730db308f3837401f111f007b207f20bf42ff07ff87",
+      "ahash": "583f007f002010007cfefffe7d9c01fc01c003c007e00ff00ff003f003f001e1"
+    },
+    {
+      "dhash": "0266cf4e6e4cce89f4a3c33681f808fb0c5b5b1f9ecf4cef98979c1a8d4bdcaf",
+      "ahash": "ffff000007c606e000116010f01ffc3fe71fefffefffe67fcc014000e2016fff"
+    },
+    {
+      "dhash": "b8dab0b0d524d974b31de717a613322d343529532d32583c9b3285cb45095469",
+      "ahash": "000000007f80ffbe7fc0f380fb80ff80ff80fdfbffbfffbffffbc063ff00ff29"
+    },
+    {
+      "dhash": "f99aa95ec167ccb7c5fce0e7f22eb7319dc1f1c07384718171706a443c4c6d0a",
+      "ahash": "00004c0f746707ff00ff10031f877ffffffd3ff83fc03e80ff00bf868e000000"
+    },
+    {
+      "dhash": "decce3ae419e50f6c79e1d3fd6329470d719cf33d187949bacdb9cd8cd86db34",
+      "ahash": "07677bfffceffc1f608f010f031f037c03fd03fb2843004b0248004021c22ddf"
+    },
+    {
+      "dhash": "9906a902b908f192b7a2d98079963c10e0b180c7a396864fb2630cd41ad01ef1",
+      "ahash": "440004000400000000007ce03ff0ffd0f830e043f0c3ffffffffffffffffffff"
+    },
+    {
+      "dhash": "1b461556fa48f0126f0ec604c605569542d9cc14d2202a708a34d2c4d144e868",
+      "ahash": "ffffffff0b007ff801e763fc3fe00000f00022007f00ff0077507f54ff7f1c7f"
+    },
+    {
+      "dhash": "cdb3a516cb304867467b06b379a7c62dd769c7638f98f1e3d1abd38cd708de03",
+      "ahash": "679bffd3fffefe37f01f821b00210025006d03ff01ff007f00ff01ef03fe07ff"
+    },
+    {
+      "dhash": "23b8327c20fe70601178036e10671d5f4d5d0ccf811d3339b318017b016e432f",
+      "ahash": "f9fff81fff7ffe7ff83ff80ff803c403e605e607fc07f88ff90cf809fc23ffa0"
+    },
+    {
+      "dhash": "c8ea98c8c6dcfc80ec10a4d2f4c6fc2eda64f864f830f470e4a0c4cce4aecca8",
+      "ahash": "267e066c7f403ffc3ffcfffe7e771f0300200c220c183f303a00324032a227ac"
+    }
+  ]
+}

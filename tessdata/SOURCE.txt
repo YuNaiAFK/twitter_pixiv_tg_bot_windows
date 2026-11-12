@@ -1,0 +1,3 @@
+來源：https://github.com/tesseract-ocr/tessdata_fast
+版本：87416418657359cb625c412a48b6e1d6d41c29bd
+授權：Apache-2.0（見 LICENSE）。

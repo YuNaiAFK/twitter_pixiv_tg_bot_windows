@@ -78,6 +78,8 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
         tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
         node = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "handle_ehentai_gallery")
         namespace = {"send_status": AsyncMock(return_value=NS()), "gallery_cache_lookup": Mock()}
+        namespace.update(asyncio=asyncio, ehentai=NS(fetch_gallery=lambda *a,**k:NS(tags={},is_adult=False,gid="123",token="abc"),EhentaiError=RuntimeError),
+                         resolve_ehentai_cookies=lambda:None,EHENTAI_TIMEOUT_SECONDS=30)
         exec(compile(ast.Module(body=[node], type_ignores=[]), "<eh-entry>", "exec"), namespace)
         with patch.object(external, "reuse", AsyncMock(return_value=True)):
             self.assertTrue(await namespace["handle_ehentai_gallery"](NS(), URL, NS(id=1)))
@@ -92,6 +94,8 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
             "gallery_cache_age": lambda url: 0, "GALLERY_META_TTL_SECONDS": 60, "logger": Mock(),
             "build_gallery_info": lambda gallery: "正常畫廊資料", "source_link_options": lambda: None,
             "gallery_keyboard": lambda *a: "normal-menu"}
+        namespace.update(asyncio=asyncio, ehentai=NS(fetch_gallery=lambda *a,**k:NS(tags={},is_adult=False,gid="123",token="abc"),EhentaiError=RuntimeError),
+                         resolve_ehentai_cookies=lambda:None,EHENTAI_TIMEOUT_SECONDS=30)
         exec(compile(ast.Module(body=[node], type_ignores=[]), "<eh-entry>", "exec"), namespace)
         with patch.object(external, "reuse", AsyncMock(return_value=False)):
             self.assertTrue(await namespace["handle_ehentai_gallery"](NS(), URL, NS(id=1)))

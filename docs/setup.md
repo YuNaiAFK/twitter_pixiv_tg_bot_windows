@@ -503,3 +503,15 @@ Windows 在專案目錄執行 `.venv\Scripts\python.exe exviewer_login.py`；And
 用瀏覽器開啟 `http://127.0.0.1:8876`，在 Telegram 的「設定 → 裝置 → 連結桌面裝置」掃描 QR Code。若在手機啟動工具、要由電腦顯示 QR，先執行 `adb forward tcp:8876 tcp:8876`，再從電腦開啟該本機網址。密碼只在本機頁面輸入；遇到限流會顯示倒數。登入完成後工具會關閉。
 
 各裝置應分別登入；不要跨裝置複製 `.mtproto/exviewer-user.session`。可在 Telegram「裝置」撤銷名為 `EH exviewer helper` 的工作階段。`EXVIEWER_ENABLED=0` 停用查詢；未登入時也會照常本機解析。密碼、QR 權杖與工作階段不可提交至 GitHub。
+
+## EH 外部廣告辨識
+
+含外部廣告標籤的畫廊需要本機 OCR；沒有標籤的畫廊不需要此依賴。模型位於程式旁的 `tessdata`，來源及 Apache-2.0 授權隨模型附上。
+
+安裝 Tesseract：
+
+```powershell
+winget install --id UB-Mannheim.TesseractOCR --exact
+```
+
+程式會尋找 PATH 或 `C:\Program Files\Tesseract-OCR\tesseract.exe`；其他位置可在 `.env` 設定 `AD_OCR_BINARY`。Windows 發行來源見 [Tesseract 官方安裝說明](https://tesseract-ocr.github.io/tessdoc/Installation.html#windows)。

@@ -75,7 +75,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
                 ns = dict(Path=Path, asyncio=asyncio, threading=threading,
                     cached_telegraph_entry=lambda *a: None, gallery_page_urls=AsyncMock(return_value=(["image"], [])),
                     source_link_options=lambda: None, public_embed_urls=AsyncMock(return_value=["image"]),
-                    host_on_r2=AsyncMock(return_value=["image"]), ehentai=NS(create_telegraph_page=create, TelegraphError=ehentai.TelegraphError),
+                    remove_gallery_ads=AsyncMock(return_value=["image"]), host_on_r2=AsyncMock(return_value=["image"]), ehentai=NS(create_telegraph_page=create, TelegraphError=ehentai.TelegraphError),
                     TELEGRAPH_AUTHOR="test", remember_telegraph_page=Mock(), build_gallery_info=lambda *a, **kw: "summary",
                     escape_html=lambda x:x, remember_regenerate=Mock(), regenerate_keyboard=lambda *a: None,
                     edit_message_to_cover=AsyncMock(return_value=cover_ok), logger=logging.getLogger("regression"), EH_CHANNEL_PUBLISHER=NS())
