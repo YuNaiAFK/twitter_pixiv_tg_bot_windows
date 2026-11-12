@@ -211,7 +211,7 @@ class ChannelPublishTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_parse_flow_offers_for_fresh_and_cached_results(self):
         tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
         function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "handle_message")
-        status = NS(edit_text=AsyncMock())
+        status = NS(edit_text=AsyncMock(), delete=AsyncMock())
         cache = Mock()
         cache.lookup.return_value = None
         self.message.text = "https://x.com/user/status/123"

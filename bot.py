@@ -2152,6 +2152,7 @@ async def send_cached_media(message, status, url: str, payload: dict,
             # original send did not have.
             attach_link=(platform != "pixiv"),
             has_spoiler=(platform == "twitter" and payload.get("twitter_sensitive", True)),
+            result_status=status,
         )
     except TelegramError as exc:
         logger.warning("從快取傳送失敗，將重新下載：%s", exc)
@@ -2165,7 +2166,11 @@ async def send_cached_media(message, status, url: str, payload: dict,
     # No source link here: send_original_files already posted it as its own last
     # message, which is what puts it at the bottom of the result. Repeating it in the
     # summary would show the same link twice.
-    await status.edit_text(summary, link_preview_options=source_link_options())
+    from single_result import ResultStatus
+    if isinstance(status, ResultStatus):
+        await status.finish(summary if sent != len(files) or note else None)
+    else:
+        await status.edit_text(summary, link_preview_options=source_link_options())
     return True
 
 
@@ -5268,7 +5273,7 @@ async def edit_message_to_cover(status, gallery, caption: str,
 async def send_single_media(message, file_path: Path, source_url: str,
                             temp_dir: Path, extra: str = "",
                             prefer_original: bool = False,
-                            keyboard=None, caption=None, has_spoiler=False) -> bool:
+                            keyboard=None, caption=None, has_spoiler=False, result_status=None) -> bool:
     """
     Send one media file. Returns success.
 
@@ -5288,6 +5293,10 @@ async def send_single_media(message, file_path: Path, source_url: str,
     ``extra`` is still used for a per-file note such as "compressed because the
     original exceeded 10 MB", which belongs on the file it describes.
     """
+    if result_status is not None:
+        from single_result import SingleResultMessage
+        message = SingleResultMessage(message, result_status)
+
     size = file_path.stat().st_size
 
     limit = upload_limit_bytes()
@@ -5321,12 +5330,15 @@ async def send_single_media(message, file_path: Path, source_url: str,
                     file_path, chat_id=message.chat_id, reply_to=message.message_id,
                     caption=text, session_dir=BASE_DIR / ".mtproto",
                     proxy_url=system_proxy_url(),
+                    edit_message_id=result_status.message_id if result_status is not None else None,
                 )
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise TimedOut("GIF 文件傳送逾時，可能已送達，未再重送") from exc
             except Exception as exc:
                 logger.error("MTProto GIF 文件傳送失敗：%s", redact_secrets(str(exc)))
                 raise TelegramError("GIF 文件傳送失敗，請查看日誌中的 MTProto 設定或連線資訊") from exc
+            if result_status is not None:
+                message.complete()
             return True
         # 靜態圖片與影片沿用 Bot API 文件模式。
         if has_spoiler:
@@ -5623,7 +5635,7 @@ async def send_source_link(message, source_note: str, source_url: str = ""):
 async def send_original_files(message, files: list[Path], source_url: str,
                               temp_dir: Path,
                               as_document: bool = True,
-                              attach_link: bool = True, has_spoiler: bool = False
+                              attach_link: bool = True, has_spoiler: bool = False, result_status=None
                               ) -> tuple[int, str, list[Path]]:
     """
     Send downloaded files, optionally with the source link above them.
@@ -5661,6 +5673,9 @@ async def send_original_files(message, files: list[Path], source_url: str,
     Only the **first** message carries the link, so a 30-page work does not repeat it
     on all three of its albums.
     """
+    from single_result import ResultStatus
+    if not isinstance(result_status, ResultStatus):
+        result_status = None
     # 依來源網址再次鎖定 Pixiv 文件模式，避免任何呼叫端的預設值改變傳送方式。
     as_document = as_document or detect_media_platform(source_url) == "pixiv"
     sent = 0
@@ -5725,6 +5740,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                     prefer_original=as_document,
                     keyboard=None,
                     caption=None if link_carried else caption, has_spoiler=has_spoiler,
+                    result_status=result_status if len(files) == 1 else None,
                 ):
                     sent += 1
                     link_carried = True
@@ -5749,6 +5765,7 @@ async def send_original_files(message, files: list[Path], source_url: str,
                 prefer_original=as_document,
                 keyboard=None,
                 caption=None if link_carried else caption, has_spoiler=has_spoiler,
+                    result_status=result_status if len(files) == 1 else None,
             ):
                 sent += 1
                 link_carried = True
@@ -8712,6 +8729,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     status = await send_status(message, "收到連結，正在解析……")
+    from single_result import ResultStatus
+    status = ResultStatus(status)
     temp_dir = make_work_dir()
     source_note = build_caption(media_url)
     succeeded = False
@@ -8772,7 +8791,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message, media_files, media_url, temp_dir,
                 # Requested: Pixiv sends the images alone, with no source link and no
                 # button. Only X/Twitter carries the link.
-                attach_link=False,
+                attach_link=False, result_status=status,
             )
 
             if oversize:
@@ -8791,6 +8810,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_single_media(
                     message, archive, media_url, temp_dir,
                     prefer_original=True,      # a document: the ZIP is the payload
+                    result_status=status,
                     caption=build_caption(media_url),
                 )
                 await cleanup_request_messages(status)
@@ -8803,8 +8823,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 summary += f"（{album_note}）"
             # No source link here: send_original_files posts it as its own last
             # message, which is what keeps it at the bottom of the result.
-            await status.edit_text(summary,
-                                   link_preview_options=source_link_options())
+            await status.finish(summary if sent_count != len(media_files) or album_note else None)
             succeeded = True
             # Cached after a successful send, so the next request for this link is
             # served from disk instead of downloading again.
@@ -8820,13 +8839,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_count, album_note, _too_large = await send_original_files(
             message, media_files, media_url, temp_dir, as_document=False,
             # Requested: X/Twitter shows the source link, Pixiv does not.
-            attach_link=True, has_spoiler=twitter_sensitive,
+            attach_link=True, has_spoiler=twitter_sensitive, result_status=status,
         )
 
         summary = f"X/Twitter 解析完成，已傳送 {sent_count}/{len(media_files)} 個檔案。"
         if album_note:
             summary += f"（{album_note}）"
-        await status.edit_text(summary, link_preview_options=source_link_options())
+        await status.finish(summary if sent_count != len(media_files) or album_note else None)
         succeeded = True
         await asyncio.to_thread(remember_media_parse, media_url, media_files)
         await offer_publish(message)

@@ -90,9 +90,9 @@ def proxy_settings(url):
 
 
 async def send_gif_document(path: Path, *, chat_id: int, reply_to: int | None,
-                            caption: str | None, session_dir: Path, proxy_url=""):
+                            caption: str | None, session_dir: Path, proxy_url="", edit_message_id=None):
     from telethon import TelegramClient
-    from telethon.tl.functions.messages import SendMediaRequest
+    from telethon.tl.functions.messages import SendMediaRequest, EditMessageRequest
     from telethon.tl.types import InputReplyToMessage, DocumentAttributeAnimated
     from telethon.errors import FileReferenceExpiredError, FileReferenceInvalidError, FileReferenceEmptyError, RPCError
 
@@ -125,6 +125,9 @@ async def send_gif_document(path: Path, *, chat_id: int, reply_to: int | None,
             random_id = secrets.randbits(63)
 
             async def send(media):
+                if edit_message_id is not None:
+                    return await client(EditMessageRequest(
+                        peer=peer, id=edit_message_id, media=media, message=caption or ""))
                 return await client(SendMediaRequest(
                     peer=peer, media=media, message=caption or "", random_id=random_id,
                     reply_to=InputReplyToMessage(reply_to_msg_id=reply_to) if reply_to else None,

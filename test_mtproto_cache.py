@@ -108,3 +108,17 @@ class CacheTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EditCacheTests(unittest.TestCase):
+    setUp = CacheTests.setUp
+    send = CacheTests.send
+    def test_edit_uses_original_id_and_cached_document(self):
+        from telethon.tl.functions.messages import EditMessageRequest
+        self.send()
+        uploads=self.client.upload_file.await_count
+        with patch.dict("os.environ", {"TELEGRAM_API_ID":"123","TELEGRAM_API_HASH":"hash","BOT_TOKEN":"42:token"}), patch("telethon.TelegramClient",return_value=self.client):
+            asyncio.run(send_gif_document(self.file,chat_id=7,reply_to=None,caption=None,session_dir=self.root / "session",edit_message_id=55))
+        self.assertEqual(self.client.upload_file.await_count,uploads)
+        self.assertIsInstance(self.client.requests[-1],EditMessageRequest)
+        self.assertEqual(self.client.requests[-1].id,55)
