@@ -61,7 +61,8 @@ def text_ad_reason(text):
     value = re.sub(r"\s+", "", text).casefold().replace("：", ":")
     # 已確認廣告的導流網域；一般作者／販售平台網址不在此名單。
     known = ("mdaa11.com", "jm-3x.cc", "17mimei.live", "astonekm.net", "anime.bllaw-0.com",
-             "aifun.ltd", "mbcz85.com", "gumw39.com")
+             "aifun.ltd", "mbcz85.com", "gumw39.com",
+             "mijppa2487.com", "sego88.com", "bcy01.com")
     if any(domain in value for domain in known):
         return "confirmed-ad-domain"
     has_url = bool(re.search(r"(?:https?://|www\.)[a-z0-9]|[a-z0-9-]+\.(?:app|com|net|cc|xyz|live)(?:[/\s]|$)", value))
@@ -70,8 +71,10 @@ def text_ad_reason(text):
         return ""
     scan = any(word in value for word in ("扫码", "掃碼", "扫描二维码", "掃描二維碼"))
     commerce = any(word in value for word in ("优惠券", "優惠券", "全网最低", "全網最低", "淘宝搜索", "淘寶搜索"))
-    platform = any(word in value for word in ("全站免费", "全站免費", "永久免费", "永久免費", "成人app", "海量漫画", "海量漫畫", "免费下载", "免費下載", "在线观看", "在線觀看"))
+    platform = any(word in value for word in ("全站免费", "全站免費", "永久免费", "永久免費", "成人app", "海量漫画", "海量漫畫", "免费下载", "免費下載", "在线观看", "在線觀看", "免费会员", "免費會員"))
     action = any(word in value for word in ("下载", "下載", "安装", "安裝", "进入", "進入", "领取", "領取", "注册", "註冊"))
+    if "erolabs" in value and ("play" in value or scan or action):
+        return "external-game-promotion"
     if scan and commerce:
         return "commerce-and-scan"
     if platform and (has_url or scan or action):

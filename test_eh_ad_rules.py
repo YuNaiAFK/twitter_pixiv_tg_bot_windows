@@ -209,3 +209,23 @@ class PartialAdTail3893498Tests(unittest.TestCase):
         self.assertEqual(sorted(int(c.args[0]) for c in fetch.call_args_list),list(range(9,19)))
         normal=next(r for r in rows if r["page"]==14)
         self.assertFalse(matches_sample((int(normal["dhash"],16),int(normal["ahash"],16)),samples))
+
+
+class Tail2934039Tests(unittest.TestCase):
+    def test_six_ads_removed_but_author_qr_page_preserved(self):
+        base=Path(__file__).parent
+        rows=json.loads((base/"ad_regression_tail_2934039.json").read_text())
+        by_page={str(row["page"]):row for row in rows}
+        def inspect(row,samples,*args):
+            return "sample" if matches_sample((int(row["dhash"],16),int(row["ahash"],16)),samples) else ""
+        fetch=Mock(side_effect=lambda url:by_page[url])
+        with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
+            report=scan_images([str(i) for i in range(1,24)],NS(tags={"other":["extraneous ads"]}),fetcher=fetch,inspector=inspect)
+        self.assertEqual(report.kept,[str(i) for i in range(1,18)])
+        self.assertEqual([p for p,r in report.removed],list(range(18,24)))
+        self.assertEqual(sorted(int(c.args[0]) for c in fetch.call_args_list),list(range(14,24)))
+    def test_promotion_wording_not_limited_to_old_domains(self):
+        for text in ("免费会员 最新动漫 http://example.com", "免費會員 掃碼觀看", "EROLABS PLAY", "https://mijppa2487.com/r9ek8", "www.sego88.com", "bcy01.com"):
+            self.assertTrue(text_ad_reason(text),text)
+        for text in ("作者後記 掃碼關注 https://fanbox.cc/author", "EROLABS 遊戲心得", "免費會員", "https://example.com"):
+            self.assertEqual(text_ad_reason(text),"",text)

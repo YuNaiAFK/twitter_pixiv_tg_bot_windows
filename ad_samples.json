@@ -108,6 +108,26 @@
     {
       "dhash": "b166e06129e0b9e4fda47da4ef2079e0bae0bb626f2273407be13df03d66b784",
       "ahash": "fc12ff00fcf0fff0fff00ff007f00ff80ff809f017f03bf801f800780ff01ff0"
+    },
+    {
+      "dhash": "9ba07c83748e768e1b383b2d7139196b3a6938731b1b3f333ea3133518f771ad",
+      "ahash": "df80fe01fe71be70fbc89bd9c3f8c3f883d803981818391803980018011fe3f"
+    },
+    {
+      "dhash": "e469cda1ed98e2396399698df1986732a6f0f27cd778e793a996af086f00ad00",
+      "ahash": "f007df3f0f1fc11fec3fffbffffffe7f1e603e77c045c207e007e00000"
+    },
+    {
+      "dhash": "c2e4f325f329f22de789b790e70035c037f0373c35b895c895e185d894f03576",
+      "ahash": "18157fb17ff103ff03ff11fe00fe007e01be00fe00fc00fc00fc007c0000"
+    },
+    {
+      "dhash": "3ce65cf8cef88e7c167c43d84b7541252da1b3a771e3e265d0c45b6c5b297231",
+      "ahash": "e7f2f7e777e433e813ce03cfdbfffb197f159e3fc2178207874e82401c00180"
+    },
+    {
+      "dhash": "18171555219002364e569b3609ab1a71308641cf01e667f43e231e664e275e0f",
+      "ahash": "fffffffff81ff001e702cfffe63fc03ddfe3e003e063f07f07fb03270303ff03"
     }
   ]
 }
