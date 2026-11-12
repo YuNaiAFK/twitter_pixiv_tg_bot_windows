@@ -132,11 +132,31 @@ async def indexed_links(client, peer, links, path):
             break
         if result.pts <= previous:
             raise ChannelCheckError("頻道增量進度無法確認")
+    # 工作階段可能已消耗刪除更新；索引命中不能直接視為仍存在。
+    # 僅批次讀取本次候選，不重掃完整歷史；讀取失敗沿用上層的停止發布行為。
+    candidates = [int(mid) for mid, stored in index["messages"].items() if links.intersection(stored)]
+    verified = None
+    for start in range(0, len(candidates), 100):
+        ids = candidates[start:start + 100]
+        messages = await client.get_messages(peer, ids=ids)
+        if len(messages) != len(ids):
+            raise ChannelCheckError("無法確認頻道候選訊息是否仍存在")
+        for mid, message in zip(ids, messages):
+            if message is not None and getattr(message, "id", None) != mid:
+                raise ChannelCheckError("頻道候選訊息編號不一致")
+            index["messages"].pop(str(mid), None)
+            found = message_links(message) if message is not None else set()
+            if found:
+                index["messages"][str(mid)] = sorted(found)
+                if verified is None and links.intersection(found):
+                    verified = mid
+        if verified is not None:
+            break
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
     temporary.replace(path)
-    return next((int(mid) for mid, stored in index["messages"].items() if links.intersection(stored)), None)
+    return verified
 
 
 class ChannelLinkChecker:
