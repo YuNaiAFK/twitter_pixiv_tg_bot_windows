@@ -109,8 +109,20 @@ def valid_page(url):
     urls = ehentai.telegraph_page_images(parts.path, timeout=8)
     if not urls:
         return False
-    report = ehentai.check_image_urls(urls, workers=16, timeout=6, deep=True, stop_after=1)
-    return report.ok and not report.stopped_early and report.checked == len(set(urls))
+    pending = list(dict.fromkeys(urls))
+    transient = {"ConnectError", "ConnectTimeout", "ReadTimeout", "ReadError", "RemoteProtocolError", "PoolTimeout"}
+    for attempt, workers in enumerate((16, 4, 2)):
+        report = ehentai.check_image_urls(pending, workers=workers, timeout=6 if attempt == 0 else 12,
+                                          deep=True, stop_after=0)
+        if report.stopped_early or report.checked != len(pending):
+            return False
+        if report.ok:
+            return True
+        if any(item.reason not in transient for item in report.broken):
+            return False
+        pending = list(dict.fromkeys(item.url for item in report.broken))
+        logger.info("exviewer 圖片暫時連線失敗：%d 張，第 %d 輪；降低並行重試", len(pending), attempt + 1)
+    return False
 
 
 async def valid_result(url):

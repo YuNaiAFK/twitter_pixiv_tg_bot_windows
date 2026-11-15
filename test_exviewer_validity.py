@@ -30,3 +30,18 @@ class PageValidationTests(unittest.IsolatedAsyncioTestCase):
         with patch("ehentai.telegraph_page_images") as read:
             self.assertFalse(await external.valid_result("https://elsewhere.test/work"))
             read.assert_not_called()
+
+
+class TransientValidationTests(unittest.TestCase):
+    def test_retry_only_failed_images_and_preserve_complete_coverage(self):
+        reports=[NS(ok=False,stopped_early=False,checked=2,broken=[NS(url="b",reason="ConnectError")]),NS(ok=True,stopped_early=False,checked=1,broken=[])]
+        with patch("ehentai.telegraph_page_images",return_value=["a","b"]),patch("ehentai.check_image_urls",side_effect=reports) as check:
+            self.assertTrue(external.valid_page("https://telegra.ph/test"))
+            self.assertEqual(check.call_args_list[1].args[0],["b"])
+            self.assertEqual(check.call_args_list[1].kwargs["workers"],4)
+    def test_permanent_failure_is_not_retried(self):
+        with patch("ehentai.telegraph_page_images",return_value=["a"]),patch("ehentai.check_image_urls",return_value=NS(ok=False,stopped_early=False,checked=1,broken=[NS(url="a",reason="HTTP 404")])) as check:
+            self.assertFalse(external.valid_page("https://telegra.ph/test"));self.assertEqual(check.call_count,1)
+    def test_repeated_transient_failure_still_rejected(self):
+        with patch("ehentai.telegraph_page_images",return_value=["a"]),patch("ehentai.check_image_urls",return_value=NS(ok=False,stopped_early=False,checked=1,broken=[NS(url="a",reason="ConnectError")])) as check:
+            self.assertFalse(external.valid_page("https://telegra.ph/test"));self.assertEqual(check.call_count,3)
