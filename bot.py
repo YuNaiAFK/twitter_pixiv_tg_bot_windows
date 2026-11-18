@@ -5227,36 +5227,7 @@ def public_thumbnail_url(thumb: str) -> str:
 
 async def edit_message_to_cover(status, gallery, caption: str,
                                 reply_markup=None, parse_mode=None, cover_url: str = "") -> bool:
-    """
-    Turn the status message into the gallery's cover photo. Returns success.
-
-    The cover is put *into the message the bot already sent*, by editing its media,
-    rather than posting a second message. Two messages for one result is what made
-    the reply look like it was repeating itself, and editing keeps the chat to one
-    message per request.
-
-    The image is referenced by **URL**, so Telegram fetches it and the bot downloads
-    nothing - a cover is decoration, and the pages themselves are only downloaded for
-    the archive actions.
-
-    **The thumbnail host has to be one Telegram can reach anonymously**, which is what
-    :func:`public_thumbnail_url` enforces. This was wrong: the code assumed the cover came
-    from ``ehgt.org``, but an exhentai gallery's cover is served from ``s.exhentai.org``,
-    where an anonymous request gets **403**:
-
-        https://s.exhentai.org/w/02/714/75349-4sjx86ns.webp   -> 403 (needs the session)
-        https://ehgt.org/w/02/714/75349-4sjx86ns.webp         -> 200 image/webp
-
-    The paths are identical - only the host differs - so the cover was silently missing on
-    every exhentai gallery, reported as "Failed to get http url content".
-
-    The keyboard is carried over, because `edit_media` replacing the message body
-    would otherwise drop the "重新生成" button that was just attached.
-
-    A failure is cosmetic, so it reports False and the caller carries on with a text
-    message: refusing to deliver a gallery because its cover would not load would be
-    the wrong trade.
-    """
+    """原地設定封面；網址傳送失敗時，下載並轉為相容 JPEG 後直接上傳。"""
     url = cover_url or public_thumbnail_url(gallery.thumb)
     if not url or status is None:
         return False
@@ -5268,7 +5239,20 @@ async def edit_message_to_cover(status, gallery, caption: str,
         )
         return True
     except TelegramError as exc:
-        logger.warning("封面編輯失敗：%s（%s）", url, exc)
+        logger.warning("封面網址傳送失敗，改用下載上傳：%s（%s）", url, exc)
+    try:
+        from eh_cover import download_cover
+        from telegram import InputFile
+        data = await asyncio.to_thread(download_cover, url)
+        await status.edit_media(
+            media=InputMediaPhoto(media=InputFile(data, filename="eh-cover.jpg", attach=True),
+                                  caption=caption or None, parse_mode=parse_mode),
+            reply_markup=reply_markup,
+        )
+        logger.info("封面已改用 JPEG 檔案原地上傳")
+        return True
+    except Exception as exc:
+        logger.warning("封面下載上傳失敗（%s）", type(exc).__name__)
         return False
 
 
