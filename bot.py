@@ -6590,10 +6590,10 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
     hundred images and takes minutes; a status line that never changes for minutes looks stuck.
     """
     settings = r2.r2_settings()
+    fallback = r2.b2_settings()
+    settings = settings or fallback
     if settings is None or not embed:
         return embed
-
-    fallback = r2.b2_settings()
     read_usage = r2.storage_usage if fallback is not None else r2.bucket_usage
     from eh_ad_rules import has_external_ads
     cached = [] if archive_only or has_external_ads(gallery) else cached_r2_urls(gallery.page_url, gallery, mode)
@@ -6645,8 +6645,8 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
             else:
                 await asyncio.sleep(2 ** lookup_failures)
 
-    allowance = r2.limit_bytes()
-    if used_bytes >= allowance and fallback is not None:
+    allowance = r2.B2_LIMIT_BYTES if settings.provider == "B2" else r2.limit_bytes()
+    if used_bytes >= allowance and fallback is not None and settings.provider == "R2":
         settings = fallback
         allowance = r2.B2_LIMIT_BYTES
         used_bytes, used_count = await asyncio.to_thread(read_usage, settings)
@@ -7054,14 +7054,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
                 timeout=float(TELEGRAPH_VERIFY_TIMEOUT),
             )
             if not page_images:
-                # The page could not be read. That is a problem at Telegraph, not with the
-                # gallery, and punishing a transient outage with a full re-sweep would be worse
-                # than reusing a page that is probably fine.
-                if not rule_version(gallery.page_url, gallery):
-                    logger.warning("讀不到 Telegraph 圖片清單，沿用原頁面：%s", candidate.url)
-                    reuse_page = candidate
-                else:
-                    logger.info("無法確認已去廣告的頁面內容，重新製作：%s", candidate.url)
+                raise ehentai.EhentaiError("暫時無法驗證既有 Telegraph 頁面，已保留原頁面，請稍後再試。")
             else:
                 report = await asyncio.to_thread(
                     ehentai.check_image_urls,
@@ -7075,6 +7068,13 @@ async def run_gallery_images(message, status, gallery, mode: str,
                     embed = page_images
                     logger.info("沿用先前建立的 Telegraph 頁面（%s）：%s",
                                 report.summary(), candidate.url)
+                elif not any(
+                    issue.reason in {"HTTP 401", "HTTP 403", "HTTP 404", "HTTP 410",
+                                     "長度為 0", "內容是空的", "內容不是圖片格式"}
+                    or issue.reason.startswith("不是圖片（")
+                    for issue in report.broken
+                ):
+                    raise ehentai.EhentaiError("暫時無法驗證既有頁面的圖片，已保留原頁面，請稍後再試。")
                 else:
                     damage = report
                     logger.info("Telegraph 頁面有圖片載入失敗，將修復（%s）：%s",
