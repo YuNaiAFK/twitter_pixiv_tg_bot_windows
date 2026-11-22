@@ -5841,6 +5841,15 @@ def build_gallery_info(gallery, telegraph_url: str = "", *, html: bool = False) 
     return "\n".join(lines)
 
 
+def eh_chat_allowed(user_id, chat_type):
+    """私聊 EH 額外要求個別授權；群組沿用原本的權限檢查。"""
+    if chat_type != "private" or user_is_admin(user_id):
+        return True
+    return str(user_id) in {
+        entry.strip() for entry in os.getenv("EH_PRIVATE_USER_IDS", "").split(",")
+    }
+
+
 async def handle_ehentai_gallery(message, url: str, user) -> bool:
     """
     Read a gallery's metadata and offer the four download choices.
@@ -6245,6 +6254,10 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
     message = update.effective_message
     user = update.effective_user
     if query is None or message is None or user is None:
+        return
+
+    if not eh_chat_allowed(user.id, getattr(getattr(message, "chat", None), "type", None)):
+        await query.answer("私聊 EH 解析僅限管理員或已授權的使用者。", show_alert=True)
         return
 
     if (query.data or "").startswith("eh|r2|"):
@@ -8721,6 +8734,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # An artwork link wins over a gallery link, matching the rule that a supported
     # media link takes precedence when several links share a message.
     if eh_url and not media_url:
+        if not eh_chat_allowed(user.id, message.chat.type):
+            await send_status(message, "私聊 EH 解析僅限管理員或已授權的使用者。")
+            return
         wait_left = apply_cooldown(user.id)
         if wait_left > 0:
             await send_status(

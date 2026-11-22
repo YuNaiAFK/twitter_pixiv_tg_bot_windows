@@ -140,6 +140,7 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
         exec(compile(ast.Module(body=[node],type_ignores=[]),"<cancel>","exec"),ns)
         message=NS(chat_id=1,message_id=8,chat=NS(type="private"),edit_reply_markup=AsyncMock(),edit_text=AsyncMock(),delete=AsyncMock())
         query=NS(data="eh|cancel",answer=AsyncMock())
+        ns["eh_chat_allowed"] = lambda *args: True
         await ns["handle_gallery_callback"](NS(callback_query=query,effective_message=message,effective_user=NS(id=1)),NS())
         message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
         message.edit_text.assert_not_called()
