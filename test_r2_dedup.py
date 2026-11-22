@@ -98,6 +98,12 @@ class R2DedupTests(unittest.TestCase):
         self.assertEqual(len(set(report.urls())), 1)
         self.assertEqual(len(report.urls()), len(urls))
 
+    def test_invalid_eh_source_is_not_uploaded(self):
+        self.images["stale"] = (b"Invalid request", "image/jpeg")
+        report = self.upload(["stale"], validate_source=True)
+        self.assertTrue(report.results[0].source_failed)
+        self.assertEqual(self.bucket.puts, [])
+
     def test_b2_omits_unsupported_condition_and_reuses_matching_content(self):
         self.settings.provider = "B2"
         self.images["source.jpg"] = (b"same data", "image/jpeg")

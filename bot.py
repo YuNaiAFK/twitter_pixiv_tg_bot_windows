@@ -6104,6 +6104,7 @@ async def run_regenerate(query, user, entry: dict) -> None:
         # Same conversion as publishing: the button embeds the same list, so without this
         # a regenerated page would be broken again on every page.
         embed = await public_embed_urls(embed, gallery, query.message)
+        upload_source_urls = list(embed)
         embed = await remove_gallery_ads(embed, gallery, progress_status,
             cache_dir=ad_temp_dir / "ad-downloads", download_cache=ad_download_cache)
 
@@ -6111,9 +6112,12 @@ async def run_regenerate(query, user, entry: dict) -> None:
         #
         # Without it the page was rebuilt with freshly swept hath.network links: they work and they
         # expire, so the page broke again hours later and the button only ever bought time.
+        parse_stop = threading.Event()
         embed = await host_on_r2(
             embed, gallery, mode, progress_status,
-            user_id=user.id, stop_event=threading.Event(), download_cache=ad_download_cache)
+            user_id=user.id, stop_event=parse_stop, download_cache=ad_download_cache,
+            refresh_source=lambda: refresh_eh_upload_sources(
+                gallery, progress_status, upload_source_urls, embed, parse_stop))
 
         # **Edit the existing page, so the URL does not change.**
         #
@@ -6608,7 +6612,7 @@ async def handle_r2_retry_decision(update: Update) -> None:
 
 
 async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | None = None,
-                     stop_event=None, download_cache=None) -> list:
+                     stop_event=None, download_cache=None, refresh_source=None) -> list:
     """
     Copy the page's images into R2 and return the URLs to embed instead.
 
@@ -6697,6 +6701,8 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
             link_preview_options=source_link_options())
         return embed
 
+    embed = list(embed)
+    refreshed_source = False
     output_urls = list(embed)
     pending_indices = list(range(len(embed)))
     failure_round = 0
@@ -6766,6 +6772,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                     budget=allowance,
                     stop_event=stop_event,
                     download_cache=download_cache,
+                    validate_source=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("R2 上傳失敗：%s", exc)
@@ -6781,6 +6788,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                                        link_preview_options=source_link_options())
                 raise R2UploadStopped("使用者停止了解析")
 
+            source_failures = []
             failed_indices = []
             quota_indices = []
             if report is None:
@@ -6795,11 +6803,31 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                         quota_indices.append(index)
                     elif result.error:
                         failed_indices.append(index)
+                        if result.source_failed:
+                            source_failures.append(index)
+                            logger.warning("EH 圖片來源失敗：gid=%s，保留清單第 %d 張（%s）",
+                                           getattr(gallery, "gid", "?"), index + 1, result.error)
                     else:
                         output_urls[index] = result.public_url or result.source_url
 
                 if report.budget_stopped:
                     budget_stopped = True
+
+            if source_failures and refresh_source is not None and not refreshed_source:
+                refreshed_source = True
+                await status.edit_text("部分來源圖片無法讀取，正在更新 EH 圖片網址……")
+                try:
+                    fresh = await refresh_source()
+                    if len(fresh) != len(embed):
+                        raise ValueError("圖片清單長度不同")
+                    for index in source_failures:
+                        embed[index] = fresh[index]
+                except Exception as exc:
+                    logger.warning("EH 圖片來源更新失敗（%s）", type(exc).__name__)
+                else:
+                    if not budget_stopped:
+                        pending_indices = failed_indices
+                        continue
 
             if budget_stopped and settings.provider == "B2":
                 raise ehentai.EhentaiError("B2 額度不足，未建立不完整頁面。")
@@ -6929,6 +6957,25 @@ async def public_embed_urls(embed: list[str], gallery, status,
         # how many before opening the page and wondering which are broken.
         logger.warning("有 %s 頁原圖無法轉成公開網址，頁面上會缺圖", missing)
     return resolved
+
+
+async def refresh_eh_upload_sources(gallery, status, original_urls, kept_urls, stop_event):
+    positions = []
+    cursor = 0
+    for url in kept_urls:
+        while cursor < len(original_urls) and original_urls[cursor] != url:
+            cursor += 1
+        if cursor == len(original_urls):
+            raise ValueError("無法對應去廣告後的圖片頁碼")
+        positions.append(cursor)
+        cursor += 1
+    fresh, _ = await gallery_page_urls(gallery, status, False, force=True, stop_event=stop_event)
+    if len(fresh) != len(original_urls):
+        raise ValueError("來源頁數改變，無法安全補傳")
+    fresh = await public_embed_urls(fresh, gallery, status)
+    if len(fresh) != len(original_urls):
+        raise ValueError("公開圖片清單不完整")
+    return [fresh[index] for index in positions]
 
 
 async def remove_gallery_ads(embed, gallery, status, *, stop_event=None, cache_dir=None, download_cache=None):
@@ -7062,6 +7109,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
         # The display URLs. The original-resolution page was removed.
         embed = display_urls
         embed = await public_embed_urls(embed, gallery, status, report=True)
+        upload_source_urls = list(embed)
         from eh_ad_filter import AdImageFetchError
         try:
             embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop,
@@ -7074,6 +7122,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
             display_urls, original_urls = await gallery_page_urls(
                 gallery, status, False, force=True, stop_event=parse_stop)
             embed = await public_embed_urls(display_urls, gallery, status, report=True)
+            upload_source_urls = list(embed)
             embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop,
                 cache_dir=temp_dir / "ad-downloads", download_cache=ad_download_cache)
 
@@ -7084,7 +7133,9 @@ async def run_gallery_images(message, status, gallery, mode: str,
         # exists to repair. Degrades to the original URLs whenever R2 is unavailable.
         embed = await host_on_r2(
             embed, gallery, mode, status, user_id=user.id, stop_event=parse_stop,
-            download_cache=ad_download_cache)
+            download_cache=ad_download_cache,
+            refresh_source=lambda: refresh_eh_upload_sources(
+                gallery, status, upload_source_urls, embed, parse_stop))
 
         try:
             if cached_entry is not None:

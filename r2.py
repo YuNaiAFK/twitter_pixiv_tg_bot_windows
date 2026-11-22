@@ -259,6 +259,7 @@ class UploadResult:
     content_type: str = ""
     error: str = ""
     skipped: bool = False
+    source_failed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -437,6 +438,7 @@ def upload_many(
     budget: int = 0,
     image_fetcher=None,
     download_cache=None,
+    validate_source: bool = False,
 ) -> UploadReport:
     """
     Download each URL and put it in R2, in parallel, keeping the original order.
@@ -488,7 +490,14 @@ def upload_many(
                 data, content_type = fetch_image(url, timeout=timeout, referer=referer,
                                                  cookies=cookies, http_client=download_client)
         except Exception as exc:  # noqa: BLE001
-            return index, UploadResult(url, error=f"{type(exc).__name__}: {exc}")
+            refreshable = (isinstance(exc, httpx.TransportError) or
+                           isinstance(exc, httpx.HTTPStatusError)
+                           and exc.response.status_code in {401, 403, 404, 410})
+            return index, UploadResult(url, error=type(exc).__name__, source_failed=refreshable)
+        if validate_source:
+            from ehentai import _looks_like_an_image
+            if not _looks_like_an_image(data[:32]):
+                return index, UploadResult(url, error="來源未回傳圖片", source_failed=True)
 
         # 新物件僅以內容識別；檔名、副檔名與 MIME 標頭不同，也不能重複存放相同位元組。
         key = content_key(data, prefix=key_prefix)
