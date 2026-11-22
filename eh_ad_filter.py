@@ -109,7 +109,12 @@ def inspect_image(data, samples, binary, tessdata):
             gray.thumbnail((1600, 2400))
             env = dict(os.environ, OMP_THREAD_LIMIT="1")
             text = ""
-            for region, psm in ((gray, "11"), (gray.crop((0, gray.height//2, gray.width, gray.height)), "6")):
+            # A stylised URL beneath a QR code can disappear in the full-page OCR.
+            passes = ((gray, "11", "chi_sim+eng"),
+                      (gray.crop((0, gray.height//2, gray.width, gray.height)), "6", "chi_sim+eng"),
+                      (ImageOps.autocontrast(gray.crop((0, gray.height*4//5, gray.width, gray.height))),
+                       "11", "eng"))
+            for region, psm, languages in passes:
                 target = Path(directory) / "ocr.png"
                 region.save(target)
                 result = subprocess.run([binary, str(target), "stdout", "--tessdata-dir", str(tessdata),
