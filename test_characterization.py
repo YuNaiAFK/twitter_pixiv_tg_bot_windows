@@ -1908,7 +1908,8 @@ def _regenerate_edits_the_stored_page() -> bool:
     real_fetch = bot.ehentai.fetch_gallery_images
     real_edit = bot.ehentai.edit_telegraph_page
     real_create = bot.ehentai.create_telegraph_page
-    real_embed = bot.public_embed_urls
+    real_embed = bot.host_official_1280
+    real_metadata = bot.ehentai.fetch_gallery
     real_update = bot.update_result_message
     real_remember = bot.remember_gallery
 
@@ -1923,8 +1924,8 @@ def _regenerate_edits_the_stored_page() -> bool:
         edited.append(("CREATE",))
         return page
 
-    async def fake_embed(urls, gal, message):
-        return urls
+    async def fake_embed(*a):
+        return ["https://img.example/d.jpg"]
 
     async def fake_update(message, text, **kwargs):
         text_seen.append(text)
@@ -1943,7 +1944,8 @@ def _regenerate_edits_the_stored_page() -> bool:
         bot.ehentai.fetch_gallery_images = fake_fetch
         bot.ehentai.edit_telegraph_page = fake_edit
         bot.ehentai.create_telegraph_page = fake_create
-        bot.public_embed_urls = fake_embed
+        bot.host_official_1280 = fake_embed
+        bot.ehentai.fetch_gallery = lambda *a, **k: gallery
         bot.update_result_message = fake_update
         bot.remember_gallery = lambda *a, **k: None
         try:
@@ -1953,7 +1955,8 @@ def _regenerate_edits_the_stored_page() -> bool:
             bot.ehentai.fetch_gallery_images = real_fetch
             bot.ehentai.edit_telegraph_page = real_edit
             bot.ehentai.create_telegraph_page = real_create
-            bot.public_embed_urls = real_embed
+            bot.host_official_1280 = real_embed
+            bot.ehentai.fetch_gallery = real_metadata
             bot.update_result_message = real_update
             bot.remember_gallery = real_remember
             bot._regenerate_cache.clear()
@@ -2084,14 +2087,18 @@ class _GalleryImagesHarness:
         # parse_mode is a real argument of the function being replaced, so the double has to
         # accept it - a **kwargs double would accept anything and the argument would never be
         # checked against the real signature.
-        async def fake_edit_cover(status, gallery, summary, keyboard=None, parse_mode=None):
+        async def fake_edit_cover(status, gallery, summary, keyboard=None, parse_mode=None, **kwargs):
             harness.texts.append(summary)
             return True
 
         def fake_remember_page(url, gal, mode_, page, embedded=None):
             harness.saved.append((mode_, page.url, page.path, list(embedded or [])))
 
-        harness.patch("gallery_page_urls", fake_gallery_page_urls)
+        async def fake_official_host(*a):
+            display, _ = fake_sweep()
+            return display
+
+        harness.patch("host_official_1280", fake_official_host)
         harness.patch("public_embed_urls", fake_embed)
         harness.patch("edit_message_to_cover", fake_edit_cover)
         harness.patch("remember_telegraph_page", fake_remember_page)
@@ -2712,59 +2719,19 @@ def _r2_recording_survives_a_telegraph_write() -> bool:
 
 
 def _every_telegraph_path_hosts_on_r2() -> bool:
-    """
-    Both ways a page is built must route the images through R2.
-
-    Checked by reading the source around each create/edit_telegraph_page call rather than by running
-    it: a page built with expiring links works perfectly at the moment it is built, so the fault only
-    appears hours later and no single run can observe it.
-    """
+    """New and regenerated pages both use the shared official archive path."""
     import inspect
-
-    source = inspect.getsource(bot)
-    lines = source.splitlines()
-
-    # Find each call that creates or edits a page, then look back for the R2 step that must precede
-    # it within the same function body.
-    sites = []
-    for index, line in enumerate(lines):
-        if "ehentai.edit_telegraph_page" in line or "ehentai.create_telegraph_page" in line:
-            sites.append(index)
-
-    if not sites:
-        note("no Telegraph call sites found at all")
-        return False
-
-    for index in sites:
-        # Walk back to the start of the enclosing statement block and look for the R2 call. The
-        # window is generous because the regenerate path has comments between the two.
-        window = "\n".join(lines[max(0, index - 40):index])
-        if "host_on_r2" not in window:
-            note(f"a Telegraph call at line {index + 1} has no host_on_r2 before it:\n"
-                 + "\n".join(f"    {l}" for l in lines[max(0, index - 6):index + 2]))
-            return False
-    return True
+    return all("await host_official_1280(" in inspect.getsource(fn)
+               for fn in (bot.run_gallery_images, bot.run_regenerate))
 
 
-def _host_on_r2_is_called_twice_not_once() -> bool:
-    """
-    Exactly two call sites: publishing and regenerating.
-
-    A count rather than a search, so that removing one is as visible as adding a path that forgets
-    it. Two is the number of ways a page is produced - run_gallery_images and run_regenerate.
-    """
+def _official_host_passes_local_files_to_storage() -> bool:
+    """No viewer URLs or expiring source URLs can reach the publication path."""
     import inspect
+    source = inspect.getsource(bot.host_official_1280)
+    return all(fragment in source for fragment in
+               ("resample=True", "download_cache=entries", "archive_only=True"))
 
-    source = inspect.getsource(bot)
-    calls = source.count("await host_on_r2(")
-    if calls != 2:
-        note(f"expected 2 call sites for host_on_r2, found {calls}")
-        return False
-
-    if "async def host_on_r2(" not in source:
-        note("host_on_r2 is called but not defined")
-        return False
-    return True
 
 
 def _the_gallery_keyboard_has_exactly_three_actions() -> bool:
@@ -5200,11 +5167,10 @@ check("a public CDN url is not mistaken for a session-bound one",
           "https://node.hath.network/h/abc-1280-1-wb")
       and not ehentai.is_session_bound_image("https://ehgt.org/w/02/240/x.webp"),
       "resolving these would be wasted requests")
-check("both embed paths convert session-bound urls",
+check("both embed paths use official 1280 archive images",
       # Publishing and 重新生成 embed the same list; fixing only the first would leave the
       # button producing a broken page again.
-      "public_embed_urls(" in inspect.getsource(bot.run_gallery_images)
-      and "public_embed_urls(" in inspect.getsource(bot.run_regenerate),
+      _every_telegraph_path_hosts_on_r2(),
       "the regenerate button must not rebuild a broken page")
 check("a list with nothing session-bound is passed through untouched",
       _public_embed_urls_passthrough(),
@@ -5330,11 +5296,11 @@ check("recording R2 urls keeps the sweep and the Telegraph page",
       _r2_recording_survives_a_telegraph_write(),
       "all three share one cache payload and each has to merge")
 
-check("every path that builds a Telegraph page hosts its images on R2",
+check("each Telegraph build hosts the official archive images",
       _every_telegraph_path_hosts_on_r2(),
       "regenerating without R2 rebuilt the page with links that expire again")
-check("there are exactly two R2 host call sites",
-      _host_on_r2_is_called_twice_not_once(),
+check("the official archive path passes local files to storage",
+      _official_host_passes_local_files_to_storage(),
       "a missing one is invisible until the page breaks hours later")
 
 check("the gallery keyboard offers exactly three actions, with one Telegraph mode",

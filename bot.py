@@ -6082,42 +6082,11 @@ async def run_regenerate(query, user, entry: dict) -> None:
     regenerated_link_changed = False
 
     ad_temp_dir = make_work_dir()
-    ad_download_cache = {}
     try:
         gallery = await asyncio.to_thread(
             ehentai.fetch_gallery, gallery.page_url, cookies_path=resolve_ehentai_cookies(),
             timeout=float(EHENTAI_TIMEOUT_SECONDS))
-        # Deliberately fetches fresh URLs rather than reading the sweep from the
-        # cache: the whole point of regenerating is that the cached links have
-        # expired. The fresh set is then written back, so the cache is current again.
-        display_urls, original_urls = await asyncio.to_thread(
-            ehentai.fetch_gallery_images,
-            gallery.page_url,
-            cookies_path=resolve_ehentai_cookies(),
-            timeout=float(EHENTAI_TIMEOUT_SECONDS),
-            workers=EHENTAI_VIEWER_WORKERS,
-        )
-        await asyncio.to_thread(remember_gallery, gallery.page_url, gallery,
-                                (display_urls, original_urls))
-        # The display URLs: there is only one Telegraph mode now.
-        embed = display_urls
-        # Same conversion as publishing: the button embeds the same list, so without this
-        # a regenerated page would be broken again on every page.
-        embed = await public_embed_urls(embed, gallery, query.message)
-        upload_source_urls = list(embed)
-        embed = await remove_gallery_ads(embed, gallery, progress_status,
-            cache_dir=ad_temp_dir / "ad-downloads", download_cache=ad_download_cache)
-
-        # **And the same R2 host as publishing, which this path was missing.**
-        #
-        # Without it the page was rebuilt with freshly swept hath.network links: they work and they
-        # expire, so the page broke again hours later and the button only ever bought time.
-        parse_stop = threading.Event()
-        embed = await host_on_r2(
-            embed, gallery, mode, progress_status,
-            user_id=user.id, stop_event=parse_stop, download_cache=ad_download_cache,
-            refresh_source=lambda: refresh_eh_upload_sources(
-                gallery, progress_status, upload_source_urls, embed, parse_stop))
+        embed = await host_official_1280(gallery, mode, progress_status, ad_temp_dir, user.id)
 
         # **Edit the existing page, so the URL does not change.**
         #
@@ -6612,7 +6581,7 @@ async def handle_r2_retry_decision(update: Update) -> None:
 
 
 async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | None = None,
-                     stop_event=None, download_cache=None, refresh_source=None) -> list:
+                     stop_event=None, download_cache=None, refresh_source=None, archive_only=False) -> list:
     """
     Copy the page's images into R2 and return the URLs to embed instead.
 
@@ -6631,7 +6600,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
     fallback = r2.b2_settings()
     read_usage = r2.storage_usage if fallback is not None else r2.bucket_usage
     from eh_ad_rules import has_external_ads
-    cached = [] if has_external_ads(gallery) else cached_r2_urls(gallery.page_url, gallery, mode)
+    cached = [] if archive_only or has_external_ads(gallery) else cached_r2_urls(gallery.page_url, gallery, mode)
     public_prefix = tuple(item.public_base.rstrip("/") + "/" for item in (settings, fallback) if item is not None)
     if (cached and len(cached) == len(embed)
             and all(isinstance(url, str) and url.startswith(public_prefix) for url in cached)):
@@ -6688,6 +6657,8 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
         await status.edit_text("R2 已達切換門檻，本次改用 Backblaze B2。")
     if used_bytes >= allowance and settings.provider == "B2":
         raise ehentai.EhentaiError("B2 已達容量保護門檻，未建立不完整頁面。")
+    if used_bytes >= allowance and archive_only:
+        raise ehentai.EhentaiError("R2 容量不足，未建立不完整頁面。")
     if used_bytes >= allowance:
         logger.warning("R2 免費額度已滿（%s），拒絕上傳：%s",
                        r2.budget_line(used_bytes, used_count), gallery.page_url)
@@ -6866,6 +6837,8 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                 reply_markup=stop_keyboard(gallery.gid, gallery.token),
             )
 
+        if budget_stopped and archive_only:
+            raise ehentai.EhentaiError("圖床容量不足，未建立不完整頁面。")
         if budget_stopped:
             try:
                 after, after_count = await asyncio.to_thread(read_usage, settings)
@@ -6978,7 +6951,7 @@ async def refresh_eh_upload_sources(gallery, status, original_urls, kept_urls, s
     return [fresh[index] for index in positions]
 
 
-async def remove_gallery_ads(embed, gallery, status, *, stop_event=None, cache_dir=None, download_cache=None):
+async def remove_gallery_ads(embed, gallery, status, *, stop_event=None, cache_dir=None, download_cache=None, fetcher=None):
     from eh_ad_rules import has_external_ads
     if not has_external_ads(gallery):
         return embed
@@ -7002,7 +6975,7 @@ async def remove_gallery_ads(embed, gallery, status, *, stop_event=None, cache_d
     try:
         report = await asyncio.to_thread(scan_images, embed, gallery,
             cookies_path=resolve_ehentai_cookies(), stop_event=stop_event, progress=progress,
-            cache_dir=cache_dir, download_cache=download_cache)
+            cache_dir=cache_dir, download_cache=download_cache, fetcher=fetcher)
         logger.info("EH 圖片內容去廣告：排除 %s；保留 %s 頁（gid=%s）", report.removed, len(report.kept), gallery.gid)
         await status.edit_text(f"已排除 {len(report.removed)} 頁廣告，保留 {len(report.kept)} 頁。正在繼續製作……", reply_markup=None)
         return report.kept
@@ -7012,26 +6985,51 @@ async def remove_gallery_ads(embed, gallery, status, *, stop_event=None, cache_d
             _running_downloads.pop(eh_stop_key(chat_id), None)
 
 
+async def host_official_1280(gallery, mode, status, temp_dir, user_id):
+    """Create hosted images from the official resample archive only."""
+    from eh_official_images import unpack
+
+    stop_event = threading.Event()
+    await status.edit_text("正在取得 EH 官方 1280 歸檔……",
+                           link_preview_options=source_link_options(),
+                           reply_markup=stop_keyboard(gallery.gid, gallery.token))
+    register_running_stop(status.chat_id, stop_event)
+    archive = archive_cache_path(gallery, False)
+    try:
+        if archive is None:
+            url, _, size = await asyncio.to_thread(resolve_official_archive, gallery, resample=True)
+            if stop_event.is_set():
+                raise R2UploadStopped("使用者停止了解析")
+            archive = temp_dir / "official-1280.zip"
+            await run_with_progress(
+                lambda report: download_official_archive(
+                    url, archive, referer=gallery.page_url, expected=size,
+                    stop_event=stop_event, progress=report),
+                status, prefix="正在下載 EH 官方 1280 歸檔……", gid=gallery.gid,
+                token=gallery.token, total=size or 1, min_interval=1.0,
+            )
+        if stop_event.is_set():
+            raise R2UploadStopped("使用者停止了解析")
+        await status.edit_text("正在解開 EH 官方 1280 歸檔……",
+                               reply_markup=stop_keyboard(gallery.gid, gallery.token))
+        entries = await asyncio.to_thread(unpack, archive, temp_dir / "official-images", stop_event)
+    finally:
+        running = _running_downloads.get(eh_stop_key(status.chat_id))
+        if running is not None and running[1] is stop_event:
+            _running_downloads.pop(eh_stop_key(status.chat_id), None)
+    embed = await remove_gallery_ads(
+        list(entries), gallery, status, stop_event=stop_event,
+        fetcher=lambda ref: entries[ref][0].read_bytes())
+    hosted = await host_on_r2(embed, gallery, mode, status, user_id=user_id,
+                              stop_event=stop_event, download_cache=entries, archive_only=True)
+    if len(hosted) != len(embed) or not hosted or any(not url.startswith(("http://", "https://")) for url in hosted):
+        raise ehentai.EhentaiError("官方歸檔圖片未全部存入圖床，沒有建立不完整頁面。")
+    return hosted
+
+
 async def run_gallery_images(message, status, gallery, mode: str,
                              temp_dir: Path, source_note: str, user) -> None:
-    """
-    Publish a Telegraph page embedding every page of the gallery, and post the
-    gallery's cover into the chat.
-
-    The page images are not sent to the chat: they are already on the Telegraph
-    page, and posting the same set again only duplicated the gallery and cluttered
-    the conversation. The "歸檔" actions are the way to obtain the actual files.
-    The **cover** is the exception - one image, fetched by URL by Telegram, which
-    gives the reply a face instead of opening with plain text.
-
-    "顯示圖" embeds the site's web-sized image (about 0.14 MB a page) and "原圖"
-    the full-resolution file (about 10 MB a page) — and that is a real difference
-    here, because Telegraph fetches every embedded image itself.
-
-    This mode downloads nothing. Only the URLs are collected, and Telegraph fetches
-    each embedded image itself - which is why the reply appears without waiting for
-    the gallery's bytes.
-    """
+    """Reuse an intact Telegraph page, or publish hosted images from the official 1280 ZIP."""
     # **A page published for this gallery before is reused when it still works.**
     #
     # The gallery cache is on disk, so this finds a page built days ago, not only one from this
@@ -7093,49 +7091,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
     telegraph_page = reuse_page
     telegraph_note = ""
     if reuse_page is None:
-        # The sweep alone. The "歸檔" modes download through the same helper afterwards,
-        # so a gallery already looked at costs no sweep there either.
-        # One flag for both slow phases of this parse; neither used to register anything.
-        parse_stop = threading.Event()
-        ad_download_cache = {}
-        display_urls, original_urls = await gallery_page_urls(
-            gallery, status, False, stop_event=parse_stop)
-
-        await status.edit_text(
-            f"已取得 {len(display_urls)} 頁，正在建立 Telegraph 頁面……",
-            link_preview_options=source_link_options(),
-        )
-
-        # The display URLs. The original-resolution page was removed.
-        embed = display_urls
-        embed = await public_embed_urls(embed, gallery, status, report=True)
-        upload_source_urls = list(embed)
-        from eh_ad_filter import AdImageFetchError
-        try:
-            embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop,
-                cache_dir=temp_dir / "ad-downloads", download_cache=ad_download_cache)
-        except AdImageFetchError:
-            if parse_stop.is_set():
-                raise
-            logger.info("去廣告圖片網址失效，重新取得一次圖片清單：gid=%s", gallery.gid)
-            await status.edit_text("圖片網址已失效，正在重新取得並再次檢查廣告……", reply_markup=None)
-            display_urls, original_urls = await gallery_page_urls(
-                gallery, status, False, force=True, stop_event=parse_stop)
-            embed = await public_embed_urls(display_urls, gallery, status, report=True)
-            upload_source_urls = list(embed)
-            embed = await remove_gallery_ads(embed, gallery, status, stop_event=parse_stop,
-                cache_dir=temp_dir / "ad-downloads", download_cache=ad_download_cache)
-
-        # **Copy them somewhere permanent before the page is built.**
-        #
-        # What goes into Telegraph is then an R2 object rather than a signed e-hentai link, so the
-        # page keeps working after the keystamp lapses - which is the failure the 重新生成 button
-        # exists to repair. Degrades to the original URLs whenever R2 is unavailable.
-        embed = await host_on_r2(
-            embed, gallery, mode, status, user_id=user.id, stop_event=parse_stop,
-            download_cache=ad_download_cache,
-            refresh_source=lambda: refresh_eh_upload_sources(
-                gallery, status, upload_source_urls, embed, parse_stop))
+        embed = await host_official_1280(gallery, mode, status, temp_dir, user.id)
 
         try:
             if cached_entry is not None:
