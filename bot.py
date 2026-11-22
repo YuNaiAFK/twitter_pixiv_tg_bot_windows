@@ -7048,12 +7048,20 @@ async def run_gallery_images(message, status, gallery, mode: str,
             # answer "are this page's images broken". The page's own <img> tags are what a
             # reader's browser will try to load, so those are what is examined - and one broken
             # image is enough to justify the repair, which is why the check stops at the first.
-            page_images = await asyncio.to_thread(
-                ehentai.telegraph_page_images,
-                candidate.path,
-                timeout=float(TELEGRAPH_VERIFY_TIMEOUT),
-            )
-            if not page_images:
+            try:
+                page_images = await asyncio.to_thread(
+                    ehentai.telegraph_page_images,
+                    candidate.path,
+                    timeout=float(TELEGRAPH_VERIFY_TIMEOUT),
+                    raise_if_missing=True,
+                )
+            except ehentai.TelegraphPageMissing:
+                logger.info("Telegraph 原頁面已不存在，將重新建立：%s", candidate.url)
+                cached_entry = None
+                page_images = []
+            if cached_entry is None:
+                pass  # Confirmed missing: create a new page rather than editing the dead URL.
+            elif not page_images:
                 raise ehentai.EhentaiError("暫時無法驗證既有 Telegraph 頁面，已保留原頁面，請稍後再試。")
             else:
                 report = await asyncio.to_thread(

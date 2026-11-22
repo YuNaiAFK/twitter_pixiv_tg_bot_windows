@@ -1433,7 +1433,12 @@ def check_image_urls(
     return report
 
 
-def telegraph_page_images(path: str, *, timeout: float = 20.0, http_client=None) -> list[str]:
+class TelegraphPageMissing(EhentaiError):
+    """Telegraph confirmed that the public page no longer exists."""
+
+
+def telegraph_page_images(path: str, *, timeout: float = 20.0, http_client=None,
+                          raise_if_missing: bool = False) -> list[str]:
     """
     The image URLs a published Telegraph page embeds, in page order.
 
@@ -1457,9 +1462,13 @@ def telegraph_page_images(path: str, *, timeout: float = 20.0, http_client=None)
     owns_client = http_client is None
     try:
         response = client.get(f"https://telegra.ph/{path.lstrip('/')}")
+        if raise_if_missing and response.status_code in {404, 410}:
+            raise TelegraphPageMissing(f"Telegraph 頁面不存在（HTTP {response.status_code}）")
         if response.status_code >= 400:
             return []
         page_html = response.text
+    except TelegraphPageMissing:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("讀取 Telegraph 頁面失敗（%s）：%s", path, exc)
         return []

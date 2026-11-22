@@ -13,3 +13,13 @@ class RelativePreviewTests(unittest.TestCase):
         self.assertEqual(ehentai.telegraph_page_images("page",http_client=NS(get=lambda url:NS(status_code=200,text=markup))),[])
     def test_removed_page_still_fails(self):
         self.assertEqual(ehentai.telegraph_page_images("gone",http_client=NS(get=lambda url:NS(status_code=404,text='<img src="/file/a.jpg">'))),[])
+
+    def test_confirmed_missing_is_distinct_from_temporary_failure(self):
+        for status in (404, 410):
+            client = NS(get=lambda url: NS(status_code=status))
+            with self.assertRaises(ehentai.TelegraphPageMissing):
+                ehentai.telegraph_page_images("gone", http_client=client, raise_if_missing=True)
+        for status in (429, 502, 503):
+            client = NS(get=lambda url: NS(status_code=status))
+            self.assertEqual(ehentai.telegraph_page_images(
+                "page", http_client=client, raise_if_missing=True), [])
