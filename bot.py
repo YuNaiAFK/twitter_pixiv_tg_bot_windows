@@ -514,6 +514,7 @@ class Authorization:
         # docstring. Renaming it would have been the tidy choice and would have made every
         # existing authorized.json load as an empty blocklist, silently unblocking exactly the
         # people an operator had listed.
+        self.eh_private_users: set[int] = set()
         self.blocked: set[int] = set(allowed or ())
         self.admins: set[int] = set(admins or ())
         # Group chat IDs. Telegram gives groups negative IDs, and supergroups are
@@ -562,6 +563,7 @@ class Authorization:
         state.blocked = blocked
         state.admins = ids("admins")
         state.groups = ids("groups")
+        state.eh_private_users = ids("eh_private_users")
         state.group_locked = bool(raw.get("group_locked", group_locked))
 
         # An empty admin set from a *valid* file is a permanent lockout, so it is refused
@@ -600,6 +602,7 @@ class Authorization:
             "blocked": sorted(self.blocked),
             "admins": sorted(self.admins),
             "groups": sorted(self.groups),
+            "eh_private_users": sorted(self.eh_private_users),
             "group_locked": self.group_locked,
         }
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -5841,11 +5844,35 @@ def build_gallery_info(gallery, telegraph_url: str = "", *, html: bool = False) 
     return "\n".join(lines)
 
 
+async def ehgrant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user, chat, message = update.effective_user, update.effective_chat, update.effective_message
+    if user is None or chat is None or chat.type != "private" or message is None:
+        return
+    if not user_is_admin(user.id):
+        return
+    target = parse_target_user(context)
+    if len(context.args) != 1 or target is None or not 0 < target < 2**63:
+        await message.reply_text("用法：/ehgrant <使用者數字 ID>（可請對方用 /id 查詢）")
+        return
+    if not AUTHORIZATION.user_allowed(target):
+        await message.reply_text("該使用者已被封鎖，請先用 /grant 解除封鎖。")
+        return
+    if eh_chat_allowed(target, "private"):
+        await message.reply_text("該使用者已有私聊 EH 解析權限。")
+        return
+    AUTHORIZATION.eh_private_users.add(target)
+    if not save_authorization():
+        AUTHORIZATION.eh_private_users.remove(target)
+        await message.reply_text("無法儲存授權，未變更權限。")
+        return
+    await message.reply_text(f"已授權 {target} 在私聊解析 EH。")
+
+
 def eh_chat_allowed(user_id, chat_type):
     """私聊 EH 額外要求個別授權；群組沿用原本的權限檢查。"""
     if chat_type != "private" or user_is_admin(user_id):
         return True
-    return str(user_id) in {
+    return user_id in AUTHORIZATION.eh_private_users or str(user_id) in {
         entry.strip() for entry in os.getenv("EH_PRIVATE_USER_IDS", "").split(",")
     }
 
@@ -9038,6 +9065,7 @@ async def post_init(application: Application):
         BotCommand("cancel_upload", "取消待製作的本機檔案"),
         BotCommand("authorized", "查看授權狀態"),
         BotCommand("blocked", "列出被封鎖的使用者"),
+        BotCommand("ehgrant", "授權使用者私聊解析 EH"),
         BotCommand("grant", "解除封鎖／授權群組（/grant <ID>）"),
         BotCommand("revoke", "封鎖使用者（/revoke <ID>）"),
         BotCommand("promote", "設為管理員（/promote <ID>）"),
@@ -9598,6 +9626,9 @@ def main():
     )
     application.add_handler(
         CommandHandler("grant", admin_only(grant_command))
+    )
+    application.add_handler(
+        CommandHandler("ehgrant", ehgrant_command)
     )
     application.add_handler(
         CommandHandler("revoke", admin_only(revoke_command))
