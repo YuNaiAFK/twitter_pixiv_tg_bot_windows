@@ -194,6 +194,12 @@ def scan_images(urls, gallery, *, cookies_path=None, stop_event=None, fetcher=No
                     progress(done, len(candidates))
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
+    # Manually confirmed tail: require the exact gallery revision, page count,
+    # and all five adjacent ads to have been detected by content first.
+    if (str(getattr(gallery, "gid", "")) == "1934020"
+            and getattr(gallery, "token", "") == "4e1147445e"
+            and len(items) == 31 and {page for page, _ in removed} == set(range(26, 31))):
+        removed.append((31, "confirmed-gallery-tail"))
     if not removed:
         raise AdFilterError("畫廊標示外部廣告，但未能可靠辨識廣告頁；本次未上傳，請提供廣告頁碼供確認。")
     removed_pages = {page for page, reason in removed}

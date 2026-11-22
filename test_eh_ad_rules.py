@@ -35,6 +35,21 @@ class AdRulesTests(unittest.TestCase):
         for text in ("notsscomic.club", "pilipili.site.example.com"):
             self.assertEqual(text_ad_reason(text), "")
 
+    def test_confirmed_tail_requires_exact_gallery_and_adjacent_matches(self):
+        pages = list(range(1, 32))
+        self.tagged.gid, self.tagged.token = 1934020, "4e1147445e"
+        with patch("eh_ad_filter.ocr_binary", return_value="ocr"):
+            for token, hits, expected in (
+                ("4e1147445e", range(26, 31), list(range(26, 32))),
+                ("different", range(26, 31), list(range(26, 31))),
+                ("4e1147445e", range(26, 30), list(range(26, 30))),
+            ):
+                self.tagged.token = token
+                report = scan_images(pages, self.tagged, fetcher=lambda page: page,
+                                     inspector=lambda page, *_: "sample" if page in hits else "")
+                self.assertEqual([page for page, _ in report.removed], expected)
+                self.assertIn(25, report.kept)
+
     def test_creator_qr_and_url_alone_are_not_ads(self):
         for text in ("掃碼關注作者", "https://example.com", "作者後記 https://pixiv.net/123 掃碼下載", "QR CODE"):
             self.assertEqual(text_ad_reason(text),"")
