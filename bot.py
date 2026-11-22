@@ -7010,7 +7010,7 @@ async def host_official_1280(gallery, mode, status, temp_dir, user_id):
                     url, archive, referer=gallery.page_url, expected=size,
                     stop_event=stop_event, progress=report),
                 status, prefix="正在下載 EH 官方 1280 歸檔……", gid=gallery.gid,
-                token=gallery.token, total=size or 1, min_interval=1.0,
+                token=gallery.token, total=size or 0, min_interval=1.0, transfer_bytes=True,
             )
         if stop_event.is_set():
             raise R2UploadStopped("使用者停止了解析")
@@ -8336,7 +8336,8 @@ async def run_gallery_archive(message, status, gallery, mode: str,
             prefix=f"正在下載官方歸檔（{label}）……",
             gid=gallery.gid,
             token=gallery.token,
-            total=size or 1,
+            total=size or 0,
+            transfer_bytes=True,
             # A single large file reports far less often than a page set, so the
             # progress bar should not wait as long between updates.
             min_interval=1.0,
@@ -8419,23 +8420,28 @@ async def run_gallery_archive(message, status, gallery, mode: str,
                            link_preview_options=source_link_options())
 
 
-def progress_bar(done: int, total: int, width: int = 10) -> str:
+def progress_bar(done: int, total: int, width: int = 10, *, elapsed: float | None = None) -> str:
     """
     Render '██████░░░░ 60% (12/20)' for a progress message.
 
     A bar rather than only a number, because the question a waiting user has is
     "roughly how much longer", and a filled bar answers that at a glance.
     """
+    transfer = elapsed is not None
+    size = f"{done / 1_000_000:.2f} MB"
+    speed = f"{(done / elapsed if elapsed else 0) / 1_000_000:.2f} MB/s"
     if total <= 0:
-        return f"{done} 頁"
+        return f"{size} · {speed}" if transfer else f"{done} 頁"
     done = max(0, min(done, total))
     filled = int(width * done / total)
     percent = int(100 * done / total)
-    return f"{'█' * filled}{'░' * (width - filled)} {percent}% ({done}/{total})"
+    bar = f"{'█' * filled}{'░' * (width - filled)} {percent}%"
+    return (f"{bar} ({size} / {total / 1_000_000:.2f} MB) · {speed}"
+            if transfer else f"{bar} ({done}/{total})")
 
 
 async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
-                            total: int, min_interval: float = 1.5):
+                            total: int, min_interval: float = 1.5, transfer_bytes: bool = False):
     """
     Run a blocking callable on a worker thread while showing its progress.
 
@@ -8470,8 +8476,11 @@ async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
         loop.call_soon_threadsafe(queue.put_nowait,
                                   (done, observed_total or total, available))
 
+    started = time.monotonic()
+
     def render(done, observed, available=None):
-        text = f"{prefix}\n{progress_bar(done, observed or total)}\n"
+        elapsed = time.monotonic() - started if transfer_bytes else None
+        text = f"{prefix}\n{progress_bar(done, observed or total, elapsed=elapsed)}\n"
         if available and available > (observed or total):
             # The gallery has more pages than this run will process, and saying so is the
             # difference between "done" and "you got 20 of 27".
@@ -8488,6 +8497,7 @@ async def run_with_progress(work, status, *, prefix: str, gid: str, token: str,
     except TelegramError:
         logger.debug("無法顯示初始進度，繼續下載", exc_info=True)
 
+    started = time.monotonic()
     task = asyncio.create_task(asyncio.to_thread(work, report))
 
     last_edit = 0.0
