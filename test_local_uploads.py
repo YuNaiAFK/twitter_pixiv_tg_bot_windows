@@ -112,43 +112,7 @@ class PreparationTests(unittest.TestCase):
         text = uploads.result_text('<作品 & "作者">', "https://telegra.ph/test")
         self.assertIn("&lt;作品 &amp;", text)
         self.assertEqual(text.count("<a "), 1)
-        self.assertIn('>即時預覽</a> ] / [ 作者 ] / [ E站 ]', text)
-
-    def test_page_date_linked_text_below_title_before_images(self):
-        nodes = json.loads(uploads.page_content("標題", ["https://img.example/1"],
-            "書庫 <原樣文字>", "https://library.example/?a=1&b=2", made_on="2026年11月9日"))
-        self.assertEqual(nodes[0]["children"], ["標題"])
-        self.assertEqual(nodes[1]["children"][0], "製作日期：2026年11月9日")
-        self.assertEqual(nodes[1]["children"][2], {"tag": "a",
-            "attrs": {"href": "https://library.example/?a=1&b=2"}, "children": ["書庫 <原樣文字>"]})
-        self.assertEqual(nodes[2]["tag"], "img")
-        plain = json.loads(uploads.page_content("標題", [], "普通文字"))
-        self.assertIn("普通文字", plain[1]["children"])
-
-    def test_profiles_persist_and_are_isolated_per_sender(self):
-        path = self.root / "profiles.json"
-        profiles = uploads.PageProfiles(path)
-        profiles.save(1, "page_text", "書庫")
-        profiles.save(1, "page_link", "https://library.example")
-        profiles.save(2, "page_text", "另一位作者")
-        restored = uploads.PageProfiles(path)
-        self.assertEqual(restored.get(1), {"page_text": "書庫", "page_link": "https://library.example"})
-        self.assertEqual(restored.get(2), {"page_text": "另一位作者", "page_link": ""})
-        restored.save(1, "page_link", "")
-        self.assertEqual(uploads.PageProfiles(path).get(1)["page_link"], "")
-        self.assertEqual(uploads.PageProfiles(path).get(2)["page_text"], "另一位作者")
-
-    def test_native_telegraph_author_line_uses_saved_text_and_link(self):
-        import ehentai
-        from unittest.mock import MagicMock
-        client = MagicMock()
-        client.post.return_value.json.return_value = {"ok": True, "result": {"access_token": "dummy"}}
-        with patch("httpx.Client") as factory, patch.object(ehentai, "_telegraph_post") as post:
-            factory.return_value.__enter__.return_value = client
-            uploads.create_page("作品", [], "我的書庫", "https://library.example")
-        self.assertEqual(post.call_args.kwargs["author_name"], "我的書庫")
-        self.assertEqual(post.call_args.kwargs["author_url"], "https://library.example")
-        self.assertIn("製作日期：", post.call_args.kwargs["content"])
+        self.assertTrue(text.startswith('預覽：<a href="https://telegra.ph/test">'))
 
     def test_local_r2_injection_reuses_duplicate_content(self):
         bucket = MemoryBucket()
@@ -199,7 +163,6 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.cancel = next(handler.callback for handler in self.handlers if "cancel_upload" in getattr(handler, "commands", []))
         self.collect = self.handlers[-1].callback
         self.choose = self.handlers[0].callback
-        self.receive_link = self.handlers[-2].callback
         self.settings = r2.R2Settings("account", "key", "secret", "bucket", "https://img.example")
         self.page = patch.object(uploads, "create_page", return_value=NS(url="https://telegra.ph/work"))
         self.create_page = self.page.start()
@@ -245,8 +208,8 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             self.create_page.assert_not_called()
         markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
         self.assertEqual(markup.inline_keyboard[0][0].text, "上傳並製作")
-        cancellation = self.callback(update, markup.inline_keyboard[0][1].callback_data)
-        await self.choose(cancellation, None)
+        self.assertEqual(sum(map(len, markup.inline_keyboard)), 1)
+        await self.cancel(update, None)
         self.assertFalse((self.root / "batch0").exists())
 
     async def test_non_admin_files_commands_and_buttons_are_silent(self):
@@ -325,91 +288,16 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.collect(first, None)
         await self.collect(second, None)
         panel = first.effective_message.reply_text.return_value
-        menu = panel.edit_text.call_args.kwargs["reply_markup"]
-        await self.choose(self.callback(first, menu.inline_keyboard[1][0].callback_data), None)
-        reply = self.update()
-        reply.effective_message.text = "https://artist.example"
-        await self.receive_link(reply, None)
         command = self.update()
         with patch.object(r2, "upload_many", side_effect=self.upload_ok):
             await self.publish(command, None)
         first.effective_message.reply_text.assert_awaited_once()
-        for update in (second, reply, command):
+        for update in (second, command):
             update.effective_message.reply_text.assert_not_called()
             update.effective_message.reply_photo.assert_not_called()
         panel.edit_media.assert_awaited_once()
-        self.assertGreater(panel.edit_text.await_count, 5)
+        self.assertGreater(panel.edit_text.await_count, 3)
         self.runtime["cleanup_request_messages"].assert_not_called()
-
-    async def test_links_are_optional_and_used_by_upload_button(self):
-        update = self.update("work.png")
-        await self.collect(update, None)
-        markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
-        for position, url in ((0, "https://artist.example/profile?a=1&b=2"),
-                              (1, "https://e-hentai.org/g/123/test/")):
-            await self.choose(self.callback(update, markup.inline_keyboard[1][position].callback_data), None)
-            reply = self.update()
-            reply.effective_message.text = url
-            await self.receive_link(reply, None)
-        published = self.callback(update, markup.inline_keyboard[0][0].callback_data)
-        with patch.object(r2, "upload_many", side_effect=self.upload_ok):
-            await self.choose(published, None)
-        caption = published.effective_message.reply_text.return_value.edit_media.call_args.kwargs["media"].caption
-        self.assertIn('href="https://artist.example/profile?a=1&amp;b=2">作者</a>', caption)
-        self.assertIn('href="https://e-hentai.org/g/123/test/">E站</a>', caption)
-
-    async def test_invalid_link_and_skip_leave_plain_text(self):
-        update = self.update("work.png")
-        await self.collect(update, None)
-        markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
-        callback = self.callback(update, markup.inline_keyboard[1][0].callback_data)
-        await self.choose(callback, None)
-        prompt_markup = callback.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
-        reply = self.update()
-        reply.effective_message.text = "javascript:alert(1)"
-        await self.receive_link(reply, None)
-        self.assertIn("http://", reply.effective_message.reply_text.return_value.edit_text.call_args.args[0])
-        await self.choose(self.callback(update, prompt_markup.inline_keyboard[0][0].callback_data), None)
-        published = self.update()
-        with patch.object(r2, "upload_many", side_effect=self.upload_ok):
-            await self.publish(published, None)
-        caption = published.effective_message.reply_text.return_value.edit_media.call_args.kwargs["media"].caption
-        self.assertEqual(caption.count("<a "), 1)
-        self.assertIn("[ 作者 ] / [ E站 ]", caption)
-
-    async def test_page_settings_reused_after_cancel_and_restart_then_clear(self):
-        update = self.update("work.png")
-        await self.collect(update, None)
-        markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
-        for position, value in ((0, "我的書庫"), (1, "https://library.example")):
-            await self.choose(self.callback(update, markup.inline_keyboard[2][position].callback_data), None)
-            reply = self.update()
-            reply.effective_message.text = value
-            await self.receive_link(reply, None)
-        await self.cancel(self.update(), None)
-        # 重新註冊模擬 bot 重啟，使用同一份磁碟設定。
-        new_handlers = []
-        new_app = NS(add_handler=new_handlers.append, post_shutdown=None)
-        uploads.register(new_app, self.runtime)
-        collect = new_handlers[-1].callback
-        publish = next(handler.callback for handler in new_handlers if "publish" in getattr(handler, "commands", []))
-        choose = new_handlers[0].callback
-        next_update = self.update("next.png")
-        await collect(next_update, None)
-        with patch.object(r2, "upload_many", side_effect=self.upload_ok):
-            await publish(self.update(), None)
-        self.create_page.assert_called_once_with("next", ["https://img.example/0"], "我的書庫", "https://library.example")
-        await collect(self.update("third.png"), None)
-        third = self.update("fourth.png")
-        await collect(third, None)
-        menu = third.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
-        callback = self.callback(third, menu.inline_keyboard[2][1].callback_data)
-        await choose(callback, None)
-        clear_menu = callback.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
-        await choose(self.callback(third, clear_menu.inline_keyboard[0][0].callback_data), None)
-        stored = uploads.PageProfiles(self.root / "local_upload_profiles.json").get(1)
-        self.assertEqual(stored, {"page_text": "我的書庫", "page_link": ""})
-        await new_app.post_shutdown(new_app)
 
     async def test_old_or_other_user_buttons_cannot_publish(self):
         update = self.update("work.png")
@@ -451,7 +339,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         callback = self.callback(command, menu.inline_keyboard[0][0].callback_data)
         with patch.object(r2, "upload_many", side_effect=self.upload_ok):
             await self.choose(callback, None)
-        self.create_page.assert_called_once_with("群組作品", ["https://img.example/0"], "", "")
+        self.create_page.assert_called_once_with("群組作品", ["https://img.example/0"])
         callback.effective_message.reply_text.return_value.edit_media.assert_awaited_once()
 
     async def test_group_rejects_image_reply_and_unauthorized_group(self):
@@ -465,27 +353,6 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         update.effective_message.reply_text.reset_mock()
         await self.publish(update, None)
         update.effective_message.reply_text.assert_not_called()
-
-    async def test_group_setting_requires_reply_to_prompt_from_initiator(self):
-        command = self.update(chat=-100)
-        command.effective_chat.type = "supergroup"
-        command.effective_message.reply_to_message = self.update("work.zip").effective_message
-        await self.publish(command, None)
-        menu = command.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
-        callback = self.callback(command, menu.inline_keyboard[2][0].callback_data)
-        await self.choose(callback, None)
-        reply = self.update(chat=-100)
-        reply.effective_chat.type = "supergroup"
-        reply.effective_message.text = "群組文字"
-        await self.receive_link(reply, None)
-        self.assertFalse((self.root / "local_upload_profiles.json").exists())
-        reply.effective_message.reply_to_message = NS(message_id=900)
-        reply.effective_user.id = 2
-        await self.receive_link(reply, None)
-        self.assertFalse((self.root / "local_upload_profiles.json").exists())
-        reply.effective_user.id = 1
-        await self.receive_link(reply, None)
-        self.assertEqual(uploads.PageProfiles(self.root / "local_upload_profiles.json").get(1)["page_text"], "群組文字")
 
     async def test_direct_images_publish_in_filename_order_and_cleanup(self):
         await self.collect(self.update("10.png", data=picture(color="blue")), None)
@@ -504,9 +371,9 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             await self.publish(update, None)
         self.assertGreater(seen[0][0], 240)
         self.assertGreater(seen[1][2], 240)
-        self.create_page.assert_called_once_with("10", ["https://img.example/0", "https://img.example/1"], "", "")
+        self.create_page.assert_called_once_with("10", ["https://img.example/0", "https://img.example/1"])
         sent = update.effective_message.reply_text.return_value.edit_media.call_args.kwargs["media"]
-        self.assertIn("即時預覽", sent.caption)
+        self.assertIn("預覽：", sent.caption)
         self.assertEqual(sent.parse_mode, "HTML")
         self.assertEqual(sent.media.filename, "00001.jpg")
         self.assertFalse((self.root / "batch0").exists())
@@ -519,7 +386,9 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.collect(update, None)
         with patch.object(r2, "upload_many", side_effect=self.upload_ok):
             await self.publish(self.update(), None)
-        self.create_page.assert_called_once_with("我的作品", ["https://img.example/0"], "", "")
+        self.create_page.assert_called_once_with("我的作品", ["https://img.example/0"])
+        media = update.effective_message.reply_text.return_value.edit_media.call_args.kwargs["media"]
+        self.assertEqual(media.caption, '預覽：<a href="https://telegra.ph/work">我的作品.cbz</a>')
 
     async def test_three_failures_stop_before_telegraph(self):
         await self.collect(self.update("work.png"), None)
