@@ -98,6 +98,14 @@ class R2DedupTests(unittest.TestCase):
         self.assertEqual(len(set(report.urls())), 1)
         self.assertEqual(len(report.urls()), len(urls))
 
+    def test_b2_omits_unsupported_condition_and_reuses_matching_content(self):
+        self.settings.provider = "B2"
+        self.images["source.jpg"] = (b"same data", "image/jpeg")
+        self.assertEqual(self.upload(["source.jpg"]).uploaded, 1)
+        self.assertNotIn("IfNoneMatch", self.bucket.puts[0])
+        self.assertEqual(self.upload(["source.jpg"]).reused, 1)
+        self.assertEqual(len(self.bucket.puts), 1)
+
     def test_two_gallery_jobs_share_duplicate_protection(self):
         barrier = threading.Barrier(2)
         data = b"shared between galleries"

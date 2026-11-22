@@ -324,7 +324,12 @@ def _make_client(settings: R2Settings, timeout: float):
             "boto3 未安裝，無法上傳到 R2（請執行 scripts/install-boto3.sh）"
         ) from exc
 
-    return boto3.session.Session().client(
+    compatibility = {}
+    if settings.provider == "B2":
+        compatibility = dict(s3={"addressing_style": "path"},
+                             request_checksum_calculation="when_required",
+                             response_checksum_validation="when_required")
+    client = boto3.session.Session().client(
         "s3",
         endpoint_url=settings.endpoint,
         aws_access_key_id=settings.access_key,
@@ -337,8 +342,16 @@ def _make_client(settings: R2Settings, timeout: float):
             connect_timeout=min(15.0, timeout),
             read_timeout=timeout,
             max_pool_connections=DEFAULT_WORKERS * 2,
+            **compatibility,
         ),
     )
+    if settings.provider == "B2":
+        # 手機的 B2 路徑會在等待 100 Continue 時中斷；不改動 TLS 驗證。
+        def remove_expect(request, **kwargs):
+            if "Expect" in request.headers:
+                del request.headers["Expect"]
+        client.meta.events.register("before-send.s3.PutObject", remove_expect)
+    return client
 
 
 def fetch_image(url: str, *, timeout: float = DEFAULT_TIMEOUT, referer: str = "",
@@ -519,7 +532,8 @@ def upload_many(
                     Body=data,
                     ContentType=result.content_type,
                     CacheControl=CACHE_CONTROL,
-                    IfNoneMatch="*",
+                    # B2 不支援此條件；仍先查同內容物件，並沿用程序內的去重鎖。
+                    **({} if settings.provider == "B2" else {"IfNoneMatch": "*"}),
                 )
             except Exception as exc:  # noqa: BLE001
                 if budget:
