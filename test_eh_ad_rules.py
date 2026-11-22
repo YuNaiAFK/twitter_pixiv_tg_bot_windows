@@ -29,6 +29,12 @@ class AdRulesTests(unittest.TestCase):
         with patch("eh_ad_filter.ocr_binary",return_value="ocr"):
             with self.assertRaises(AdFilterError):scan_images(["one","two","three","four"],self.tagged,fetcher=lambda u:b"x",inspector=lambda *args:"")
             with self.assertRaises(AdFilterError):scan_images(["one","two","three","four"],self.tagged,fetcher=Mock(side_effect=TimeoutError()))
+    def test_confirmed_sponsor_domains(self):
+        for text in ("SSCOMIC.CLUB", "pilipili . site", "https://www.pilipili.site/"):
+            self.assertEqual(text_ad_reason(text), "confirmed-ad-domain")
+        for text in ("notsscomic.club", "pilipili.site.example.com"):
+            self.assertEqual(text_ad_reason(text), "")
+
     def test_creator_qr_and_url_alone_are_not_ads(self):
         for text in ("掃碼關注作者", "https://example.com", "作者後記 https://pixiv.net/123 掃碼下載", "QR CODE"):
             self.assertEqual(text_ad_reason(text),"")

@@ -63,6 +63,9 @@ def text_ad_reason(text):
     known = ("mdaa11.com", "jm-3x.cc", "17mimei.live", "astonekm.net", "anime.bllaw-0.com",
              "aifun.ltd", "mbcz85.com", "gumw39.com",
              "mijppa2487.com", "sego88.com", "bcy01.com")
+    if re.search(r"(?<![a-z0-9.-])(?:www\.)?(?:sscomic\.club|pilipili\.site)(?![a-z0-9.-])",
+                 re.sub(r"\s*\.\s*", ".", text.casefold())):
+        return "confirmed-ad-domain"
     if any(domain in value for domain in known):
         return "confirmed-ad-domain"
     has_url = bool(re.search(r"(?:https?://|www\.)[a-z0-9]|[a-z0-9-]+\.(?:app|com|net|cc|xyz|live)(?:[/\s]|$)", value))
