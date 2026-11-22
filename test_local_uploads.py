@@ -208,8 +208,8 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             self.create_page.assert_not_called()
         markup = update.effective_message.reply_text.return_value.edit_text.call_args.kwargs["reply_markup"]
         self.assertEqual(markup.inline_keyboard[0][0].text, "上傳並製作")
-        self.assertEqual(sum(map(len, markup.inline_keyboard)), 1)
-        await self.cancel(update, None)
+        self.assertEqual([b.text for row in markup.inline_keyboard for b in row], ["上傳並製作", "取消"])
+        await self.choose(self.callback(update, markup.inline_keyboard[0][1].callback_data), None)
         self.assertFalse((self.root / "batch0").exists())
 
     async def test_non_admin_files_commands_and_buttons_are_silent(self):

@@ -245,10 +245,10 @@ def register(application, runtime):
     def keyboard(batch):
         def button(text, action):
             return InlineKeyboardButton(text, callback_data=f"lu|{batch.token}|{action}")
-        return InlineKeyboardMarkup([[button("上傳並製作", "publish")]])
+        return InlineKeyboardMarkup([[button("上傳並製作", "publish"), button("取消", "cancel")]])
 
     def summary(batch):
-        return f"已接收 {len(batch.records)} 個檔案，尚未上傳。請按「上傳並製作」。"
+        return f"已接收 {len(batch.records)} 個檔案，尚未上傳。請按「上傳並製作」，或按「取消」。"
 
     def sweep():
         for key, batch in list(batches.items()):
@@ -331,6 +331,10 @@ def register(application, runtime):
         if batch.busy or batch.pending:
             await query.answer("檔案仍在接收或製作中，請稍候。", show_alert=True)
             return
+        if action == "cancel":
+            await query.answer()
+            await query.edit_message_reply_markup(reply_markup=None)
+            return await cancel(update, context)
         if action != "publish":
             await query.answer("這個選項已停用。", show_alert=True)
             return
