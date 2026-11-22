@@ -108,6 +108,17 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "上限"):
             uploads.page_content("作品", ["https://img.example/" + "x" * 64000])
 
+    def test_create_page_omits_author_url_from_api_request(self):
+        with patch("httpx.Client") as factory:
+            client = factory.return_value.__enter__.return_value
+            client.post.side_effect = [
+                NS(json=lambda: {"ok": True, "result": {"access_token": "test"}}),
+                NS(json=lambda: {"ok": True, "result": {"path": "test", "url": "https://telegra.ph/test"}}),
+            ]
+            result = uploads.create_page("test", ["https://img.example/1.jpg"])
+            self.assertEqual(result.url, "https://telegra.ph/test")
+            self.assertNotIn("author_url", client.post.call_args.kwargs["data"])
+
     def test_reply_escapes_filename_only_preview_hyperlinked(self):
         text = uploads.result_text('<作品 & "作者">', "https://telegra.ph/test")
         self.assertIn("&lt;作品 &amp;", text)

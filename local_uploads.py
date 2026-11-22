@@ -127,7 +127,7 @@ def create_page(title, urls):
         if not account.get("ok"):
             raise ValueError("建立 Telegraph 帳號失敗")
         return ehentai._telegraph_post("createPage", access_token=account["result"]["access_token"],
-            title=title, author_name="本機檔案", content=content, timeout=60,
+            title=title, author_name="本機檔案", author_url="", content=content, timeout=60,
             http_client=client)
 
 
