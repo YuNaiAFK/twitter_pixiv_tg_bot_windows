@@ -6621,9 +6621,11 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
     if settings is None or not embed:
         return embed
 
+    fallback = r2.b2_settings()
+    read_usage = r2.storage_usage if fallback is not None else r2.bucket_usage
     from eh_ad_rules import has_external_ads
     cached = [] if has_external_ads(gallery) else cached_r2_urls(gallery.page_url, gallery, mode)
-    public_prefix = settings.public_base.rstrip("/") + "/"
+    public_prefix = tuple(item.public_base.rstrip("/") + "/" for item in (settings, fallback) if item is not None)
     if (cached and len(cached) == len(embed)
             and all(isinstance(url, str) and url.startswith(public_prefix) for url in cached)):
         logger.info("沿用已上傳到 R2 的 %d 張圖片", len(cached))
@@ -6655,13 +6657,13 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                                    link_preview_options=source_link_options())
             raise R2UploadStopped("使用者停止了解析")
         try:
-            used_bytes, used_count = await asyncio.to_thread(r2.bucket_usage, settings)
+            used_bytes, used_count = await asyncio.to_thread(read_usage, settings)
             break
         except r2.R2Error as exc:
             lookup_failures += 1
             logger.warning("讀取 R2 使用量失敗（第 %d 次）：%s", lookup_failures, exc)
             await status.edit_text(
-                f"⚠️ 無法讀取 R2 使用量（第 {lookup_failures}/{R2_FAILURES_BEFORE_PROMPT} 次），"
+                f"⚠️ 無法讀取 {settings.provider} 使用量（第 {lookup_failures}/{R2_FAILURES_BEFORE_PROMPT} 次），"
                 "正在自動重試……",
                 link_preview_options=source_link_options(),
             )
@@ -6672,6 +6674,13 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                 await asyncio.sleep(2 ** lookup_failures)
 
     allowance = r2.limit_bytes()
+    if used_bytes >= allowance and fallback is not None:
+        settings = fallback
+        allowance = r2.B2_LIMIT_BYTES
+        used_bytes, used_count = await asyncio.to_thread(read_usage, settings)
+        await status.edit_text("R2 已達切換門檻，本次改用 Backblaze B2。")
+    if used_bytes >= allowance and settings.provider == "B2":
+        raise ehentai.EhentaiError("B2 已達容量保護門檻，未建立不完整頁面。")
     if used_bytes >= allowance:
         logger.warning("R2 免費額度已滿（%s），拒絕上傳：%s",
                        r2.budget_line(used_bytes, used_count), gallery.page_url)
@@ -6715,7 +6724,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
             pending_urls = [embed[index] for index in pending_indices]
             progress_update = [None]
             await status.edit_text(
-                f"正在上傳 {len(pending_urls)} 張圖片到 R2……",
+                f"正在上傳 {len(pending_urls)} 張圖片到 {settings.provider}……",
                 link_preview_options=source_link_options(),
                 reply_markup=stop_keyboard(gallery.gid, gallery.token),
             )
@@ -6730,7 +6739,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                 try:
                     scheduled = asyncio.run_coroutine_threadsafe(
                         status.edit_text(
-                            f"正在上傳到 R2…… {done_count}/{total}",
+                            f"正在上傳到 {settings.provider}…… {done_count}/{total}",
                             link_preview_options=source_link_options(),
                             reply_markup=stop_keyboard(gallery.gid, gallery.token),
                         ),
@@ -6743,7 +6752,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
             report = None
             try:
                 report = await asyncio.to_thread(
-                    r2.upload_many,
+                    r2.upload_with_storage_budget if fallback is not None else r2.upload_many,
                     pending_urls,
                     settings=settings,
                     workers=int(R2_UPLOAD_WORKERS),
@@ -6770,6 +6779,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                 raise R2UploadStopped("使用者停止了解析")
 
             failed_indices = []
+            quota_indices = []
             if report is None:
                 failed_indices = pending_indices
             else:
@@ -6779,6 +6789,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                 for index, result in zip(pending_indices, report.results):
                     if result.error == "已達 R2 免費額度上限":
                         quota_blocked += 1
+                        quota_indices.append(index)
                     elif result.error:
                         failed_indices.append(index)
                     else:
@@ -6786,6 +6797,18 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
 
                 if report.budget_stopped:
                     budget_stopped = True
+
+            if budget_stopped and settings.provider == "B2":
+                raise ehentai.EhentaiError("B2 額度不足，未建立不完整頁面。")
+            if budget_stopped and fallback is not None and settings.provider == "R2":
+                settings = fallback
+                allowance = r2.B2_LIMIT_BYTES
+                committed_bytes, _ = await asyncio.to_thread(read_usage, settings)
+                pending_indices = sorted(failed_indices + quota_indices)
+                budget_stopped = False
+                failure_round = 0
+                await status.edit_text("R2 已達切換門檻，剩餘圖片改用 Backblaze B2。")
+                continue
 
             pending_indices = failed_indices
             if not pending_indices:
@@ -6814,7 +6837,7 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
 
         if budget_stopped:
             try:
-                after, after_count = await asyncio.to_thread(r2.bucket_usage, settings)
+                after, after_count = await asyncio.to_thread(read_usage, settings)
             except r2.R2Error:
                 after, after_count = committed_bytes, 0
             logger.warning("R2 免費額度上限已達，停止上傳：%s",

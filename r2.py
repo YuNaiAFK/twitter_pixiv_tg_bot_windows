@@ -123,11 +123,14 @@ class R2Settings:
     secret_key: str
     bucket: str
     public_base: str
+    endpoint_override: str = ""
+    region: str = "auto"
+    provider: str = "R2"
 
     @property
     def endpoint(self) -> str:
         """R2's S3 endpoint for this account. The account id is part of the hostname."""
-        return f"https://{self.account_id}.r2.cloudflarestorage.com"
+        return self.endpoint_override or f"https://{self.account_id}.r2.cloudflarestorage.com"
 
     def public_url(self, key: str) -> str:
         """The anonymous URL for an object, which is what gets embedded in a Telegraph page."""
@@ -167,6 +170,44 @@ def r2_settings() -> R2Settings | None:
         logger.warning("R2_PUBLIC_BASE 不是網址：%r；本次不啟用 R2", values["public_base"])
         return None
     return R2Settings(**values)
+
+
+def b2_settings() -> R2Settings | None:
+    from urllib.parse import urlsplit
+    import re
+
+    fields = {name: os.getenv("B2_" + name, "").strip()
+              for name in ("ENDPOINT", "BUCKET", "KEY_ID", "APPLICATION_KEY", "PUBLIC_BASE")}
+    if not any(fields.values()):
+        return None
+    url = urlsplit(fields["ENDPOINT"])
+    region = re.fullmatch(r"s3\.([a-z0-9-]+)\.backblazeb2\.com", url.netloc)
+    public = urlsplit(fields["PUBLIC_BASE"])
+    if (not all(fields.values()) or url.scheme != "https" or not region
+            or url.path not in ("", "/") or url.query or url.fragment
+            or public.scheme != "https" or not public.hostname or public.username
+            or public.password or public.query or public.fragment):
+        raise R2Error("B2 備援設定不完整或網址格式不正確")
+    return R2Settings("", fields["KEY_ID"], fields["APPLICATION_KEY"], fields["BUCKET"],
+                      fields["PUBLIC_BASE"], fields["ENDPOINT"].rstrip("/"), region[1], "B2")
+
+
+B2_LIMIT_BYTES = 9_500_000_000
+
+
+_storage_upload_lock = threading.Lock()
+
+
+def upload_with_storage_budget(urls, *, settings, budget, already_used=0, **kwargs):
+    # 同一 bot 內的 EH 與本機檔案任務不共用過期的容量快照。
+    with _storage_upload_lock:
+        used, _ = storage_usage(settings)
+        return upload_many(urls, settings=settings, budget=budget, already_used=used, **kwargs)
+
+
+def storage_usage(settings):
+    # 啟用備援時按整個桶計算，不只計入本 bot 的 galleries/ 路徑。
+    return bucket_usage(settings, prefix="")
 
 
 def content_key(data: bytes, *, extension: str = "", prefix: str = GALLERY_PREFIX) -> str:
@@ -289,7 +330,7 @@ def _make_client(settings: R2Settings, timeout: float):
         aws_access_key_id=settings.access_key,
         aws_secret_access_key=settings.secret_key,
         # R2 ignores the region but botocore requires one; "auto" is what Cloudflare documents.
-        region_name="auto",
+        region_name=settings.region,
         config=Config(
             signature_version="s3v4",
             retries={"max_attempts": 3, "mode": "standard"},

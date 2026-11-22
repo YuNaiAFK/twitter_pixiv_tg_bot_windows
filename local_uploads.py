@@ -550,6 +550,9 @@ def register(application, runtime):
                 settings = r2.r2_settings()
                 if settings is None:
                     raise ValueError("尚未設定 R2，無法製作本機檔案預覽")
+                fallback = r2.b2_settings()
+                read_usage = r2.storage_usage if fallback is not None else r2.bucket_usage
+                allowance = r2.limit_bytes()
                 entries = await asyncio.to_thread(prepare_inputs, batch.records, batch.root / "prepared")
                 batch.cover = entries[0][1]
                 lookup_failures = 0
@@ -557,7 +560,7 @@ def register(application, runtime):
                     if batch.stop.is_set():
                         raise ValueError("已停止製作")
                     try:
-                        used, _ = await asyncio.to_thread(r2.bucket_usage, settings)
+                        used, _ = await asyncio.to_thread(read_usage, settings)
                         break
                     except Exception:
                         lookup_failures += 1
@@ -570,17 +573,24 @@ def register(application, runtime):
                             lookup_failures = 0
                         else:
                             await asyncio.sleep(2 ** lookup_failures)
+                if used >= allowance and fallback is not None:
+                    settings = fallback
+                    allowance = r2.B2_LIMIT_BYTES
+                    used, _ = await asyncio.to_thread(read_usage, settings)
+                    await status.edit_text("R2 已達切換門檻，本次改用 Backblaze B2。")
                 urls = [None] * len(entries)
                 pending = list(range(len(entries)))
                 failures = 0
                 while pending:
                     if batch.stop.is_set():
                         raise ValueError("已停止製作，沒有建立 Telegraph 頁面")
-                    await status.edit_text(f"正在上傳 {len(pending)} 張 1280px 圖片到 R2……")
+                    await status.edit_text(f"正在上傳 {len(pending)} 張 1280px 圖片到 {settings.provider}……")
                     try:
-                        report = await asyncio.to_thread(r2.upload_many, pending, settings=settings,
+                        report = await asyncio.to_thread(
+                            r2.upload_with_storage_budget if fallback is not None else r2.upload_many,
+                            pending, settings=settings,
                             workers=runtime["R2_UPLOAD_WORKERS"], timeout=runtime["R2_UPLOAD_TIMEOUT"],
-                            already_used=used, budget=r2.limit_bytes(), stop_event=batch.stop,
+                            already_used=used, budget=allowance, stop_event=batch.stop,
                             image_fetcher=lambda index: (entries[index][1].read_bytes(), "image/jpeg"))
                     except Exception as exc:
                         logger.warning("本機圖片 R2 上傳失敗：%s", runtime["redact_secrets"](str(exc)))
@@ -596,7 +606,14 @@ def register(application, runtime):
                             urls[index] = result.public_url
                     pending = next_pending
                     if report.budget_stopped:
-                        raise ValueError("R2 額度不足，已停止製作，沒有建立不完整頁面")
+                        if fallback is not None and settings.provider == "R2":
+                            settings = fallback
+                            allowance = r2.B2_LIMIT_BYTES
+                            used, _ = await asyncio.to_thread(read_usage, settings)
+                            failures = 0
+                            await status.edit_text("R2 已達切換門檻，剩餘圖片改用 Backblaze B2。")
+                            continue
+                        raise ValueError(f"{settings.provider} 額度不足，已停止製作，沒有建立不完整頁面")
                     if pending:
                         failures += 1
                         await status.edit_text(f"R2 上傳失敗，尚有 {len(pending)} 張未完成（第 {failures}/3 次），正在重試。")
