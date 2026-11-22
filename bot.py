@@ -7046,8 +7046,8 @@ async def run_gallery_images(message, status, gallery, mode: str,
             #
             # Not the cached sample: that holds six URLs out of two hundred, and a sample cannot
             # answer "are this page's images broken". The page's own <img> tags are what a
-            # reader's browser will try to load, so those are what is examined - and one broken
-            # image is enough to justify the repair, which is why the check stops at the first.
+            # reader's browser will try to load. Check all results so a timeout
+            # arriving first cannot hide another image that is confirmed missing.
             try:
                 page_images = await asyncio.to_thread(
                     ehentai.telegraph_page_images,
@@ -7069,7 +7069,6 @@ async def run_gallery_images(message, status, gallery, mode: str,
                     page_images,
                     workers=int(TELEGRAPH_VERIFY_WORKERS),
                     timeout=float(TELEGRAPH_VERIFY_TIMEOUT),
-                    stop_after=1,
                 )
                 if report.ok:
                     reuse_page = candidate
