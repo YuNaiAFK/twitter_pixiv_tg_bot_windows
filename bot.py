@@ -5958,11 +5958,15 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
             "• 歸檔：把整個畫廊打包成 ZIP（過大時自動分批）",
         ] + notes)
 
-        await status.edit_text(
-            prompt,
-            link_preview_options=source_link_options(),
-            reply_markup=gallery_keyboard(gallery.gid, gallery.token, user.id),
-        )
+        options = dict(link_preview_options=source_link_options(),
+                       reply_markup=gallery_keyboard(gallery.gid, gallery.token, user.id))
+        try:
+            await status.edit_text(prompt, **options)
+        except BadRequest as exc:
+            if str(exc).casefold() not in {"message_id_invalid", "message to edit not found"}:
+                raise
+            logger.info("EH 進度訊息已無法編輯，改送解析選單")
+            status = await message.reply_text(prompt, **options)
         from eh_idle import arm
         arm(status.get_bot(), status.chat_id, status.message_id)
         return True
