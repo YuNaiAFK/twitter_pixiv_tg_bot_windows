@@ -6158,7 +6158,7 @@ async def run_regenerate(query, user, entry: dict) -> None:
     new_text = "\n".join(text_lines)
     if await update_result_message(
             query.message, new_text, parse_mode="HTML",
-            reply_markup=regenerate_keyboard(gallery.gid, gallery.token)):
+            reply_markup=None):
         await delete_message_quietly(progress_status, "Telegraph 重新生成進度")
         return
     # Nothing editable - a photo with no caption, or a refusal. A second message is worse
@@ -6229,14 +6229,6 @@ def remember_regenerate(chat_id: int, user_id: int, gallery, mode: str, page) ->
         "mode": mode,
         "page": page,
     }
-
-
-def regenerate_keyboard(gid: str, token: str) -> InlineKeyboardMarkup:
-    """The '重新生成' button shown with a finished Telegraph page."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("重新生成 Telegraph 頁面",
-                             callback_data=eh_button(f"eh|regen|{gid}|{token}")),
-    ]])
 
 
 def parse_gallery_callback(data: str) -> tuple[str, str, str] | None:
@@ -7178,9 +7170,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
     # sent, so the reply does not look like it is repeating itself. If the cover
     # cannot be shown the same message falls back to text - the caption carries the
     # source link either way.
-    keyboard = (regenerate_keyboard(gallery.gid, gallery.token)
-                if telegraph_url else None)
-    if await edit_message_to_cover(status, gallery, summary, keyboard, parse_mode="HTML",
+    if await edit_message_to_cover(status, gallery, summary, None, parse_mode="HTML",
                                    cover_url=embed[0] if embed else ""):
         if mode == "view" and telegraph_page is not None:
             from channel_publish import offer_eh_publish
@@ -7190,7 +7180,7 @@ async def run_gallery_images(message, status, gallery, mode: str,
     await status.edit_text(
         summary, parse_mode="HTML",
         link_preview_options=source_link_options(),
-        reply_markup=keyboard,
+        reply_markup=None,
     )
 
 

@@ -1743,8 +1743,7 @@ def _regenerate_button_carries_its_gallery() -> bool:
     The cache fix depends on these; if the callback data were ever trimmed, the lookup would start
     missing and every press would report an expired button.
     """
-    keyboard = bot.regenerate_keyboard("111", "aaaa")
-    data = keyboard.inline_keyboard[0][0].callback_data
+    data = bot.eh_button("eh|regen|111|aaaa")
     if len(data.encode("utf-8")) > 64:
         note(f"the callback data is {len(data.encode('utf-8'))} bytes, over Telegram's 64-byte cap")
         return False
