@@ -20,9 +20,9 @@ async def reuse(message, status, source_url, user_id, runtime):
         return False
     gid, token = match.groups()
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("官方壓縮包 · 1280", callback_data=f"eh|zip1280|{gid}|{token}"),
-        InlineKeyboardButton("官方壓縮包 · 原圖", callback_data=f"eh|ziporig|{gid}|{token}"),
-    ], [InlineKeyboardButton("取消", callback_data="eh|cancel")]])
+        InlineKeyboardButton("官方壓縮包 · 1280", callback_data=f"eh|zip1280|{gid}|{token}|u{user_id}"),
+        InlineKeyboardButton("官方壓縮包 · 原圖", callback_data=f"eh|ziporig|{gid}|{token}|u{user_id}"),
+    ], [InlineKeyboardButton("取消", callback_data=f"eh|cancel|u{user_id}")]])
     from channel_links import ChannelLinkChecker
     batched = isinstance(publisher.duplicate_check, ChannelLinkChecker)
     if batched:

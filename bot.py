@@ -5961,7 +5961,7 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
         await status.edit_text(
             prompt,
             link_preview_options=source_link_options(),
-            reply_markup=gallery_keyboard(gallery.gid, gallery.token),
+            reply_markup=gallery_keyboard(gallery.gid, gallery.token, user.id),
         )
         from eh_idle import arm
         arm(status.get_bot(), status.chat_id, status.message_id)
@@ -5983,7 +5983,17 @@ async def handle_ehentai_gallery(message, url: str, user) -> bool:
         return False
 
 
-def gallery_keyboard(gid: str, token: str) -> InlineKeyboardMarkup:
+from contextvars import ContextVar
+
+_eh_owner = ContextVar("eh_owner", default=None)
+
+
+def eh_button(data: str, owner=None) -> str:
+    owner = _eh_owner.get() if owner is None else owner
+    return data if owner is None else f"{data}|u{owner}"
+
+
+def gallery_keyboard(gid: str, token: str, owner=None) -> InlineKeyboardMarkup:
     """
     The four gallery actions, laid out as two rows.
 
@@ -6000,14 +6010,14 @@ def gallery_keyboard(gid: str, token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Telegraph · 顯示圖",
-                                 callback_data=f"eh|view|{gid}|{token}"),
+                                 callback_data=eh_button(f"eh|view|{gid}|{token}", owner)),
         ],
         [
-            InlineKeyboardButton("歸檔 · 1280", callback_data=f"eh|zip1280|{gid}|{token}"),
-            InlineKeyboardButton("歸檔 · 原圖", callback_data=f"eh|ziporig|{gid}|{token}"),
+            InlineKeyboardButton("歸檔 · 1280", callback_data=eh_button(f"eh|zip1280|{gid}|{token}", owner)),
+            InlineKeyboardButton("歸檔 · 原圖", callback_data=eh_button(f"eh|ziporig|{gid}|{token}", owner)),
         ],
         [
-            InlineKeyboardButton("取消", callback_data="eh|cancel"),
+            InlineKeyboardButton("取消", callback_data=eh_button("eh|cancel", owner)),
         ],
     ])
 
@@ -6184,7 +6194,7 @@ async def run_regenerate(query, user, entry: dict) -> None:
 def stop_keyboard(gid: str, token: str) -> InlineKeyboardMarkup:
     """A single '停止' button, shown while a gallery action is running."""
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("停止", callback_data=f"eh|stop|{gid}|{token}"),
+        InlineKeyboardButton("停止", callback_data=eh_button(f"eh|stop|{gid}|{token}")),
     ]])
 
 
@@ -6248,7 +6258,7 @@ def regenerate_keyboard(gid: str, token: str) -> InlineKeyboardMarkup:
     """The '重新生成' button shown with a finished Telegraph page."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("重新生成 Telegraph 頁面",
-                             callback_data=f"eh|regen|{gid}|{token}"),
+                             callback_data=eh_button(f"eh|regen|{gid}|{token}")),
     ]])
 
 
@@ -6291,7 +6301,17 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
         await handle_r2_retry_decision(update)
         return
 
-    parsed = parse_gallery_callback(query.data or "")
+    data = query.data or ""
+    body, _, owner = data.rpartition("|")
+    if owner.startswith("u") and owner[1:].isdigit():
+        if owner != f"u{user.id}":
+            await query.answer("只有發起解析的人可以操作。", show_alert=True)
+            return
+        data = body
+    elif getattr(getattr(message, "chat", None), "type", None) in {"group", "supergroup"}:
+        await query.answer("這是舊版按鈕，請重新傳送 EH 連結。", show_alert=True)
+        return
+    parsed = parse_gallery_callback(data)
     if parsed is None:
         await query.answer("這個按鈕已失效。", show_alert=False)
         return
@@ -6320,13 +6340,17 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
     cancel_idle(message.chat_id, message.message_id)
 
     if mode == "stop":
-        stopped = stop_running_download(message.chat_id)
+        stopped = stop_running_download((message.chat_id, user.id))
         await query.answer("已停止下載。" if stopped else "目前沒有進行中的下載。",
                            show_alert=not stopped)
         return
 
     if mode == "regen":
-        await handle_regenerate(update, query, user, gid, token)
+        owner_context = _eh_owner.set(user.id)
+        try:
+            await handle_regenerate(update, query, user, gid, token)
+        finally:
+            _eh_owner.reset(owner_context)
         return
 
     if mode == "cancel":
@@ -6343,7 +6367,11 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
         if not guard.ok:
             await query.answer(busy_message(user.id), show_alert=True)
             return
-        await run_gallery_action(query, message, user, mode, gallery_url, gid, token)
+        owner_context = _eh_owner.set(user.id)
+        try:
+            await run_gallery_action(query, message, user, mode, gallery_url, gid, token)
+        finally:
+            _eh_owner.reset(owner_context)
 
     return
 
@@ -6808,9 +6836,9 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
         return output_urls
     finally:
         if registered_stop:
-            entry = _running_downloads.get(chat_id)
+            entry = _running_downloads.get(eh_stop_key(chat_id))
             if entry is not None and entry[1] is stop_event:
-                _running_downloads.pop(chat_id, None)
+                _running_downloads.pop(eh_stop_key(chat_id), None)
             try:
                 await status.edit_reply_markup(reply_markup=None)
             except TelegramError:
@@ -6906,9 +6934,9 @@ async def remove_gallery_ads(embed, gallery, status, *, stop_event=None, cache_d
         await status.edit_text(f"已排除 {len(report.removed)} 頁廣告，保留 {len(report.kept)} 頁。正在繼續製作……", reply_markup=None)
         return report.kept
     finally:
-        running = _running_downloads.get(chat_id)
+        running = _running_downloads.get(eh_stop_key(chat_id))
         if running is not None and running[1] is stop_event:
-            _running_downloads.pop(chat_id, None)
+            _running_downloads.pop(eh_stop_key(chat_id), None)
 
 
 async def run_gallery_images(message, status, gallery, mode: str,
@@ -7562,7 +7590,7 @@ async def download_gallery_pages(gallery, temp_dir: Path, urls: list[str],
                     gallery.page_url, temp_dir, original=original,
                     stop_event=stop_event, total=expected, progress=report,
                     register=lambda process: register_running_download(
-                        chat_id, process, stop_event),
+                        eh_stop_key(chat_id), process, stop_event),
                 ),
                 status,
                 prefix="補齊缺少的頁面……",
@@ -7586,15 +7614,20 @@ async def download_gallery_pages(gallery, temp_dir: Path, urls: list[str],
 # Downloads that a "停止" button can interrupt, keyed by chat id: the button
 # belongs to one chat's request, and pressing stop in one chat must not kill
 # another chat's download.
-_running_downloads: dict[int, tuple[subprocess.Popen, "threading.Event"]] = {}
+_running_downloads: dict[int | tuple[int, int], tuple[subprocess.Popen, "threading.Event"]] = {}
 
 
-def register_running_download(chat_id: int, process: subprocess.Popen | None,
+def register_running_download(chat_id: int | tuple[int, int], process: subprocess.Popen | None,
                               stop_event=None) -> None:
     if process is None:
         _running_downloads.pop(chat_id, None)
     elif stop_event is not None:
         _running_downloads[chat_id] = (process, stop_event)
+
+
+def eh_stop_key(chat_id):
+    owner = _eh_owner.get()
+    return chat_id if owner is None else (chat_id, owner)
 
 
 def register_running_stop(chat_id: int, stop_event=None) -> None:
@@ -7609,13 +7642,14 @@ def register_running_stop(chat_id: int, stop_event=None) -> None:
     A stop_event is registered with no process, which is exactly how
     :func:`stop_running_download` tells the two kinds apart.
     """
+    chat_id = eh_stop_key(chat_id)
     if stop_event is None:
         _running_downloads.pop(chat_id, None)
     else:
         _running_downloads[chat_id] = (None, stop_event)
 
 
-def stop_running_download(chat_id: int) -> bool:
+def stop_running_download(chat_id: int | tuple[int, int]) -> bool:
     """
     Stop the download for a chat, if one is running. Returns whether anything was
     asked to stop.

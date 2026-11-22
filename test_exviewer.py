@@ -56,9 +56,9 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await external.reuse(message, status, URL, 1, runtime))
             self.assertIsNone(status.edit_text.call_args.kwargs["parse_mode"])
             keyboard = status.edit_text.call_args.kwargs["reply_markup"].inline_keyboard
-            self.assertEqual(keyboard[1][0].callback_data, "eh|cancel")
+            self.assertEqual(keyboard[1][0].callback_data, "eh|cancel|u1")
             buttons = keyboard[0]
-            self.assertEqual([button.callback_data for button in buttons], ["eh|zip1280|123|abc", "eh|ziporig|123|abc"])
+            self.assertEqual([button.callback_data for button in buttons], ["eh|zip1280|123|abc|u1", "eh|ziporig|123|abc|u1"])
             self.assertTrue(status.edit_text.call_args.kwargs["link_preview_options"].show_above_text)
             offer.assert_awaited_once_with(message, status, 1, runtime["EH_CHANNEL_PUBLISHER"], source_url=URL)
 
@@ -141,6 +141,15 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
         message=NS(chat_id=1,message_id=8,chat=NS(type="private"),edit_reply_markup=AsyncMock(),edit_text=AsyncMock(),delete=AsyncMock())
         query=NS(data="eh|cancel",answer=AsyncMock())
         ns["eh_chat_allowed"] = lambda *args: True
+        message.chat.type = "supergroup"
+        for data in ("eh|cancel|u2", "eh|stop|123|abc|u2", "eh|view|123|abc|u2", "eh|cancel"):
+            query.data = data
+            await ns["handle_gallery_callback"](NS(callback_query=query,effective_message=message,effective_user=NS(id=1)),NS())
+            self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+            message.edit_reply_markup.assert_not_awaited()
+        query.answer.reset_mock()
+        query.data = "eh|cancel|u1"
+
         await ns["handle_gallery_callback"](NS(callback_query=query,effective_message=message,effective_user=NS(id=1)),NS())
         message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
         message.edit_text.assert_not_called()
