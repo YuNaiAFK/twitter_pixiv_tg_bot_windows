@@ -141,12 +141,20 @@ class ExviewerTests(unittest.IsolatedAsyncioTestCase):
         message=NS(chat_id=1,message_id=8,chat=NS(type="private"),edit_reply_markup=AsyncMock(),edit_text=AsyncMock(),delete=AsyncMock())
         query=NS(data="eh|cancel",answer=AsyncMock())
         ns["eh_chat_allowed"] = lambda *args: True
+        ns["user_is_admin"] = lambda uid: uid == 9
         message.chat.type = "supergroup"
         for data in ("eh|cancel|u2", "eh|stop|123|abc|u2", "eh|view|123|abc|u2", "eh|cancel"):
             query.data = data
             await ns["handle_gallery_callback"](NS(callback_query=query,effective_message=message,effective_user=NS(id=1)),NS())
             self.assertTrue(query.answer.await_args.kwargs["show_alert"])
             message.edit_reply_markup.assert_not_awaited()
+        stopped = []
+        ns["parse_gallery_callback"] = lambda data: ("stop", "123", "abc")
+        ns["stop_running_download"] = lambda key: stopped.append(key) or True
+        query.data = "eh|stop|123|abc|u2"
+        await ns["handle_gallery_callback"](NS(callback_query=query,effective_message=message,effective_user=NS(id=9)),NS())
+        self.assertEqual(stopped, [(1, 2)])
+        ns["parse_gallery_callback"] = lambda data: ("cancel", "", "")
         query.answer.reset_mock()
         query.data = "eh|cancel|u1"
 

@@ -6040,7 +6040,7 @@ async def handle_regenerate(update: Update, query, user, gid: str, token: str) -
     # have to agree, and if they stop agreeing the symptom is "this button has expired", which
     # names nothing.
     entry = _regenerate_cache.get(
-        regenerate_cache_key(query.message.chat_id, user.id, gid, token))
+        regenerate_cache_key(query.message.chat_id, _eh_owner.get() or user.id, gid, token))
     if entry is None:
         await query.answer("這個按鈕已過期，請重新傳送畫廊連結。", show_alert=True)
         return
@@ -6247,7 +6247,7 @@ def remember_regenerate(chat_id: int, user_id: int, gallery, mode: str, page) ->
         # Drop the oldest entries; this is a convenience cache, not a store.
         for key in list(_regenerate_cache)[: _REGENERATE_LIMIT // 4]:
             _regenerate_cache.pop(key, None)
-    _regenerate_cache[regenerate_cache_key(chat_id, user_id, gallery.gid, gallery.token)] = {
+    _regenerate_cache[regenerate_cache_key(chat_id, _eh_owner.get() or user_id, gallery.gid, gallery.token)] = {
         "gallery": gallery,
         "mode": mode,
         "page": page,
@@ -6302,11 +6302,13 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     data = query.data or ""
+    owner_id = user.id
     body, _, owner = data.rpartition("|")
     if owner.startswith("u") and owner[1:].isdigit():
-        if owner != f"u{user.id}":
-            await query.answer("只有發起解析的人可以操作。", show_alert=True)
+        if owner != f"u{user.id}" and not user_is_admin(user.id):
+            await query.answer("只有解析發起者或 bot 管理員可以操作。", show_alert=True)
             return
+        owner_id = int(owner[1:])
         data = body
     elif getattr(getattr(message, "chat", None), "type", None) in {"group", "supergroup"}:
         await query.answer("這是舊版按鈕，請重新傳送 EH 連結。", show_alert=True)
@@ -6340,13 +6342,13 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
     cancel_idle(message.chat_id, message.message_id)
 
     if mode == "stop":
-        stopped = stop_running_download((message.chat_id, user.id))
+        stopped = stop_running_download((message.chat_id, owner_id))
         await query.answer("已停止下載。" if stopped else "目前沒有進行中的下載。",
                            show_alert=not stopped)
         return
 
     if mode == "regen":
-        owner_context = _eh_owner.set(user.id)
+        owner_context = _eh_owner.set(owner_id)
         try:
             await handle_regenerate(update, query, user, gid, token)
         finally:
@@ -6367,7 +6369,7 @@ async def handle_gallery_callback(update: Update, context: ContextTypes.DEFAULT_
         if not guard.ok:
             await query.answer(busy_message(user.id), show_alert=True)
             return
-        owner_context = _eh_owner.set(user.id)
+        owner_context = _eh_owner.set(owner_id)
         try:
             await run_gallery_action(query, message, user, mode, gallery_url, gid, token)
         finally:
@@ -6532,7 +6534,8 @@ async def request_r2_retry_decision(status, user_id: int, failed_count: int,
     future = loop.create_future()
     _pending_r2_decisions[request_id] = {
         "chat_id": status.chat_id,
-        "user_id": user_id,
+        "user_id": (_eh_owner.get() or user_id) if task_name == "e-hentai 解析" else user_id,
+        "allow_admin": task_name == "e-hentai 解析",
         "future": future,
     }
     prompt = (
@@ -6588,8 +6591,8 @@ async def handle_r2_retry_decision(update: Update) -> None:
     if pending is None or pending["chat_id"] != message.chat_id:
         await query.answer("這個選項已逾時。", show_alert=True)
         return
-    if pending["user_id"] != user.id:
-        await query.answer("只有發起這次解析的使用者可以選擇。", show_alert=True)
+    if pending["user_id"] != user.id and not (pending.get("allow_admin") and user_is_admin(user.id)):
+        await query.answer("你沒有權限處理這次重試選項。", show_alert=True)
         return
 
     future = pending["future"]
