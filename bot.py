@@ -4952,15 +4952,22 @@ def download_with_gallery_dl(url: str, output_dir: Path, platform: str | None = 
     begin_download_diagnosis()
     command = build_gallery_dl_command(url, output_dir, platform)
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=MAX_DOWNLOAD_SECONDS,
-        check=False,
-        shell=False,
-        env=gallery_dl_env(platform),
-    )
+    deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
+    env = gallery_dl_env(platform)
+    for attempt in range(3):
+        result = subprocess.run(
+            command, capture_output=True, text=True,
+            timeout=max(0.1, deadline - time.monotonic()),
+            check=False, shell=False, env=env,
+        )
+        details = ((result.stderr or "") + (result.stdout or "")).casefold()
+        if not (platform == "twitter" and result.returncode
+                and "initializing client transaction keys" in details
+                and "unexpected_eof_while_reading" in details
+                and attempt < 2 and deadline - time.monotonic() > 2 ** attempt + 1):
+            break
+        logger.warning("X 初始化時 TLS 連線中斷，正在重試（%d/2）", attempt + 1)
+        time.sleep(2 ** attempt)
 
     # **Recorded before the return code is checked, not after.**
     #
