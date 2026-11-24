@@ -195,7 +195,7 @@ R2 達 `R2_LIMIT_PERCENT`（預設 95%，以 10 GB 額度計即 9.5 GB）時，E
 | `/authorized`、`/blocked` | 查看授權與封鎖狀態 | bot 管理員 |
 | `/promote`、`/demote` | 調整 bot 管理員 | bot 管理員 |
 | `/lockgroup on`、`/lockgroup off` | 切換群組守門模式 | bot 管理員 |
-| `/cookies`、`/status` | 憑證與執行狀態 | bot 管理員 |
+| `/cookies`、`/status` | 憑證、服務狀態、圖床與快取容量 | bot 管理員 |
 | `/cache`、`/cache clear` | 查看／清除解析快取 | bot 管理員 |
 | `/audit`、`/restart` | 套件檢查／重啟 | bot 管理員 |
 
