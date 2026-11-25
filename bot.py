@@ -6734,8 +6734,10 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
 
             pending_urls = [embed[index] for index in pending_indices]
             progress_update = [None]
+            upload_started = time.monotonic()
             await status.edit_text(
-                f"正在上傳 {len(pending_urls)} 張圖片到 {settings.provider}……",
+                f"正在上傳圖片到 {settings.provider}……\n"
+                f"{progress_bar(0, len(pending_urls))} · 0.00 張/s",
                 link_preview_options=source_link_options(),
                 reply_markup=stop_keyboard(gallery.gid, gallery.token),
             )
@@ -6750,7 +6752,9 @@ async def host_on_r2(embed: list, gallery, mode: str, status, *, user_id: int | 
                 try:
                     scheduled = asyncio.run_coroutine_threadsafe(
                         status.edit_text(
-                            f"正在上傳到 {settings.provider}…… {done_count}/{total}",
+                            f"正在上傳到 {settings.provider}……\n"
+                            f"{progress_bar(done_count, total)} · "
+                            f"{done_count / max(0.1, now - upload_started):.2f} 張/s",
                             link_preview_options=source_link_options(),
                             reply_markup=stop_keyboard(gallery.gid, gallery.token),
                         ),
@@ -8856,28 +8860,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_status(message, "此機器人目前不允許你的帳號使用。")
         return
 
-    # Telegram links are identified separately and never sent to the downloader.
+    cooldown = None
+
+    def batch_cooldown():
+        nonlocal cooldown
+        if cooldown is None:
+            cooldown = apply_cooldown(user.id)
+        return cooldown
+
     telegram_urls = [url for url in urls if classify_telegram_link(url)]
-    media_url = next(
-        (url for url in urls if detect_media_platform(url)),
-        None,
-    )
-    # e-hentai galleries are recognised by URL shape rather than by
-    # detect_media_platform, because they go through their own metadata route
-    # instead of the media downloader.
-    eh_url = gallery_url(text)
+    seen = set()
+    for url in urls:
+        key = normalize_cache_key(url)
+        if key in seen or url in telegram_urls:
+            continue
+        seen.add(key)
+        await handle_one_link(message, user, url, batch_cooldown)
+    if telegram_urls:
+        await handle_telegram_links(message, list(dict.fromkeys(telegram_urls)))
 
-    if telegram_urls and not media_url and not eh_url:
-        await handle_telegram_links(message, telegram_urls)
-        return
 
-    # An artwork link wins over a gallery link, matching the rule that a supported
-    # media link takes precedence when several links share a message.
+async def handle_one_link(message, user, url, batch_cooldown):
+    eh_url = gallery_url(url)
+    media_url = url if detect_media_platform(url) else None
+
     if eh_url and not media_url:
         if not eh_chat_allowed(user.id, message.chat.type):
             await send_status(message, "私聊 EH 解析僅限管理員或已授權的使用者。")
             return
-        wait_left = apply_cooldown(user.id)
+        wait_left = batch_cooldown()
         if wait_left > 0:
             await send_status(
                 message, f"操作太快了，請約 {int(wait_left) + 1} 秒後再試。"
@@ -8938,7 +8949,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # does none. Applying it here would make a repeat wait ten seconds before showing
     # the answer it already has - the one case where waiting is pure loss.
     if cached_media is None:
-        wait_left = apply_cooldown(user.id)
+        wait_left = batch_cooldown()
         if wait_left > 0:
             await send_status(
                 message, f"操作太快了，請約 {int(wait_left) + 1} 秒後再試。"

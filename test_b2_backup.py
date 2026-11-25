@@ -1,3 +1,4 @@
+import time
 import ast
 import asyncio
 import logging
@@ -17,7 +18,7 @@ class BackupStorageTests(unittest.IsolatedAsyncioTestCase):
         primary = r2.R2Settings("account", "key", "secret", "r2", "https://r2.test")
         backup = r2.R2Settings("", "key", "secret", "b2", "https://b2.test", provider="B2")
         for start_full in (True, False):
-            ns = dict(r2=r2, ehentai=ehentai, asyncio=asyncio, logger=logging.getLogger(__name__),
+            ns = dict(time=time, progress_bar=lambda done, total: f'{done}/{total}', r2=r2, ehentai=ehentai, asyncio=asyncio, logger=logging.getLogger(__name__),
                       R2_UPLOAD_WORKERS=1, R2_UPLOAD_TIMEOUT=1,
                       cached_r2_urls=lambda *args: [], remember_r2_urls=Mock(),
                       source_link_options=lambda: None, stop_keyboard=lambda *args: None)
@@ -43,7 +44,7 @@ class BackupStorageTests(unittest.IsolatedAsyncioTestCase):
         tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
         fn = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "host_on_r2")
         primary = r2.R2Settings("account", "key", "secret", "r2", "https://r2.test")
-        ns = dict(r2=r2, ehentai=ehentai, asyncio=asyncio, logger=logging.getLogger(__name__),
+        ns = dict(time=time, progress_bar=lambda done, total: f'{done}/{total}', r2=r2, ehentai=ehentai, asyncio=asyncio, logger=logging.getLogger(__name__),
                   R2_UPLOAD_WORKERS=1, R2_UPLOAD_TIMEOUT=1, cached_r2_urls=lambda *a: [],
                   remember_r2_urls=Mock(), source_link_options=lambda: None, stop_keyboard=lambda *a: None)
         exec(compile(ast.Module(body=[fn], type_ignores=[]), "<host>", "exec"), ns)

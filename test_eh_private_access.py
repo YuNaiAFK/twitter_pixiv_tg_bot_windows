@@ -22,3 +22,23 @@ class EHPrivateAccessTests(unittest.TestCase):
                 self.assertTrue(allowed(3, chat_type))
         with patch.dict(os.environ, {"EH_PRIVATE_USER_IDS": ""}):
             self.assertFalse(allowed(2, "private"))
+
+class BatchDispatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_orders_unique_links_and_charges_cooldown_once(self):
+        from unittest.mock import AsyncMock, Mock
+        tree = ast.parse(Path(__file__).with_name("bot.py").read_text(encoding="utf-8-sig"))
+        node = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "handle_message")
+        processed = []
+        async def one(message, user, url, cooldown):
+            processed.append((url, cooldown()))
+        charge = Mock(return_value=0)
+        ns = dict(Update=object, ContextTypes=SimpleNamespace(DEFAULT_TYPE=object),
+                  extract_urls=str.split, gallery_url=lambda text: None, user_is_allowed=lambda *a: True,
+                  classify_telegram_link=lambda url: False, normalize_cache_key=str.lower,
+                  handle_one_link=one, handle_telegram_links=AsyncMock(), apply_cooldown=charge)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<batch>", "exec"), ns)
+        update = SimpleNamespace(effective_message=SimpleNamespace(text="eh pixiv EH x"),
+                                 effective_user=SimpleNamespace(id=1))
+        await ns["handle_message"](update, None)
+        self.assertEqual(processed, [("eh", 0), ("pixiv", 0), ("x", 0)])
+        charge.assert_called_once_with(1)
