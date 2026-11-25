@@ -1592,6 +1592,43 @@ async def update_result_message(message, text: str, *, reply_markup=None,
         return False
 
 
+async def send_archive_with_progress(message, status, path, filename, caption, size, *, interval=4):
+    """Keep the status moving until Telegram confirms receipt."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    async def update(tick):
+        offset = tick % 12
+        if offset > 6:
+            offset = 12 - offset
+        bar = "░" * offset + "█" * 3 + "░" * (7 - offset)
+        try:
+            await status.edit_text(
+                f"正在傳送官方歸檔到 Telegram……\n{bar}\n"
+                f"檔案：{size / 1_000_000:.2f} MB · 已等待 {int(loop.time() - started)} 秒",
+                link_preview_options=source_link_options(), reply_markup=None,
+            )
+        except TelegramError:
+            logger.debug("無法更新歸檔傳送進度", exc_info=True)
+
+    await update(0)
+    with path.open("rb") as archive:
+        task = asyncio.create_task(message.reply_document(
+            document=archive, filename=filename, caption=caption))
+        tick = 0
+        try:
+            while not task.done():
+                done, _ = await asyncio.wait({task}, timeout=interval)
+                if not done:
+                    tick += 1
+                    await update(tick)
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
 async def send_cached_archive(message, status, path: Path, gallery, label: str,
                               source_note: str) -> bool:
     """
@@ -1620,14 +1657,8 @@ async def send_cached_archive(message, status, path: Path, gallery, label: str,
     )
 
     try:
-        with path.open("rb") as archive:
-            await message.reply_document(
-                document=archive,
-                # The cached name carries a suffix for the type; the sender's name is
-                # rebuilt from the gallery so the user sees a sensible filename.
-                filename=cache_send_name(gallery, path, label),
-                caption=caption,
-            )
+        await send_archive_with_progress(
+            message, status, path, cache_send_name(gallery, path, label), caption, archive_bytes)
     except TelegramError as exc:
         logger.warning("歸檔快取傳送失敗：%s（%s）", path.name, exc)
         return False
@@ -8430,12 +8461,8 @@ async def run_gallery_archive(message, status, gallery, mode: str,
         )
 
     try:
-        with archive_path.open("rb") as archive:
-            await message.reply_document(
-                document=archive,
-                filename=archive_path.name,
-                caption=caption,
-            )
+        await send_archive_with_progress(
+            message, status, archive_path, archive_path.name, caption, archive_bytes)
     except TelegramError as exc:
         logger.warning("官方歸檔傳送失敗：%s（%s）", archive_path.name, exc)
         await status.edit_text(
